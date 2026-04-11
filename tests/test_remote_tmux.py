@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import subprocess
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import pytest
 
-from code_trip.remote_tmux import RemoteTmux, RemoteTmuxError, TmuxWindow
+from code_trip.remote_tmux import (
+    SIGNAL_FILE_PREFIX,
+    RemoteTmux,
+    RemoteTmuxError,
+    TmuxWindow,
+    WaitTimeout,
+)
 
 
 @pytest.fixture
@@ -138,3 +144,112 @@ def test_ssh_options_passed_through(mock_run):
     cmd = mock_run.call_args[0][0]
     assert "-o" in cmd
     assert "ConnectTimeout=5" in cmd
+
+
+# --- signal file path ---
+
+
+def test_signal_file_path():
+    assert RemoteTmux.signal_file_path("ticket-42") == f"{SIGNAL_FILE_PREFIX}ticket-42"
+
+
+# --- check_signal_file ---
+
+
+def test_check_signal_file_exists(tmux, mock_run):
+    mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+    assert tmux.check_signal_file("ticket-42") is True
+    cmd = mock_run.call_args[0][0]
+    assert "test -f" in cmd[-1]
+    assert "/tmp/claude-done-ticket-42" in cmd[-1]
+
+
+def test_check_signal_file_missing(tmux, mock_run):
+    mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="")
+    assert tmux.check_signal_file("ticket-42") is False
+
+
+# --- clear_signal_file ---
+
+
+def test_clear_signal_file(tmux, mock_run):
+    tmux.clear_signal_file("ticket-42")
+    cmd = mock_run.call_args[0][0]
+    assert "rm -f" in cmd[-1]
+    assert "/tmp/claude-done-ticket-42" in cmd[-1]
+
+
+# --- wait_for_claude ---
+
+
+@patch("code_trip.remote_tmux.time")
+def test_wait_for_claude_immediate(mock_time, tmux, mock_run):
+    """Signal file appears on first check after clearing."""
+    # First call: clear (rm -f), second call: check (test -f) → exists,
+    # third call: clear again (rm -f)
+    mock_run.side_effect = [
+        subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),  # clear
+        subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),  # check → found
+        subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),  # clear
+    ]
+    mock_time.monotonic.side_effect = [0.0, 0.5]  # start, first check (within deadline)
+
+    tmux.wait_for_claude("mysession", "ticket-42", timeout=10, poll_interval=0.1)
+
+    # Verify: clear, check, clear
+    assert mock_run.call_count == 3
+    mock_time.sleep.assert_not_called()
+
+
+@patch("code_trip.remote_tmux.time")
+def test_wait_for_claude_polls_then_finds(mock_time, tmux, mock_run):
+    """Signal file appears on second poll."""
+    mock_run.side_effect = [
+        subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),  # clear
+        subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr=""),  # check → not found
+        subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),  # check → found
+        subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),  # clear
+    ]
+    mock_time.monotonic.side_effect = [0.0, 1.0, 2.0]  # start, first check, second check
+
+    tmux.wait_for_claude("mysession", "ticket-42", timeout=10, poll_interval=1.0)
+
+    assert mock_run.call_count == 4
+    mock_time.sleep.assert_called_once_with(1.0)
+
+
+@patch("code_trip.remote_tmux.time")
+def test_wait_for_claude_timeout(mock_time, tmux, mock_run):
+    """Raises WaitTimeout when signal never appears."""
+    mock_run.side_effect = [
+        subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),  # clear
+        subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr=""),  # check → not found
+    ]
+    # Start at 0, first check at 1, next check would be past deadline
+    mock_time.monotonic.side_effect = [0.0, 1.0, 11.0]
+
+    with pytest.raises(WaitTimeout, match="did not finish within"):
+        tmux.wait_for_claude("mysession", "ticket-42", timeout=5, poll_interval=1.0)
+
+
+# --- is_claude_ready (fallback prompt detection) ---
+
+
+def test_is_claude_ready_prompt_present(tmux, mock_run):
+    mock_run.return_value.stdout = "\n\n> \n"
+    assert tmux.is_claude_ready("mysession", "ticket-42") is True
+
+
+def test_is_claude_ready_prompt_with_content(tmux, mock_run):
+    mock_run.return_value.stdout = "some output\n> \n"
+    assert tmux.is_claude_ready("mysession", "ticket-42") is True
+
+
+def test_is_claude_ready_no_prompt(tmux, mock_run):
+    mock_run.return_value.stdout = "Claude is thinking...\nProcessing files\n"
+    assert tmux.is_claude_ready("mysession", "ticket-42") is False
+
+
+def test_is_claude_ready_empty_pane(tmux, mock_run):
+    mock_run.return_value.stdout = "\n\n\n"
+    assert tmux.is_claude_ready("mysession", "ticket-42") is False

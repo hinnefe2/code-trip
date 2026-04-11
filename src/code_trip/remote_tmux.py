@@ -21,7 +21,11 @@ from __future__ import annotations
 
 import shlex
 import subprocess
+import time
 from dataclasses import dataclass, field
+
+
+SIGNAL_FILE_PREFIX = "/tmp/claude-done-"
 
 
 class RemoteTmuxError(Exception):
@@ -33,6 +37,10 @@ class RemoteTmuxError(Exception):
         super().__init__(message)
         self.returncode = returncode
         self.stderr = stderr
+
+
+class WaitTimeout(RemoteTmuxError):
+    """Raised when wait_for_claude exceeds its timeout."""
 
 
 @dataclass(frozen=True)
@@ -153,3 +161,91 @@ class RemoteTmux:
         if working_dir:
             tmux_cmd += f" -c {shlex.quote(working_dir)}"
         self._run_ssh(tmux_cmd, capture_output=False)
+
+    # --- Claude completion detection ---
+
+    @staticmethod
+    def signal_file_path(window: str) -> str:
+        """Return the expected signal file path for a tmux window."""
+        return f"{SIGNAL_FILE_PREFIX}{window}"
+
+    def check_signal_file(self, window: str) -> bool:
+        """Check whether the Claude Stop hook signal file exists.
+
+        Args:
+            window: tmux window name (must match the name used by the hook).
+
+        Returns:
+            True if the signal file exists on the remote host.
+        """
+        path = self.signal_file_path(window)
+        cmd = ["ssh", *self.ssh_options, self.host, f"test -f {shlex.quote(path)}"]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        return result.returncode == 0
+
+    def clear_signal_file(self, window: str) -> None:
+        """Remove the signal file so the next Stop hook can be detected.
+
+        Args:
+            window: tmux window name.
+        """
+        path = self.signal_file_path(window)
+        cmd = ["ssh", *self.ssh_options, self.host, f"rm -f {shlex.quote(path)}"]
+        subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+
+    def wait_for_claude(
+        self,
+        session: str,
+        window: str,
+        *,
+        timeout: float = 120,
+        poll_interval: float = 1.0,
+    ) -> None:
+        """Block until Claude finishes responding (signal file appears).
+
+        Clears any existing signal file first, then polls until a new one
+        appears or the timeout expires.
+
+        Args:
+            session: tmux session name (unused directly, kept for API symmetry).
+            window: tmux window name.
+            timeout: maximum seconds to wait (default 120).
+            poll_interval: seconds between checks (default 1.0).
+
+        Raises:
+            WaitTimeout: if the signal file does not appear within *timeout*.
+        """
+        # Clear stale signal file before waiting
+        self.clear_signal_file(window)
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.check_signal_file(window):
+                self.clear_signal_file(window)
+                return
+            time.sleep(poll_interval)
+
+        raise WaitTimeout(
+            f"Claude did not finish within {timeout}s in window {window!r}"
+        )
+
+    def is_claude_ready(self, session: str, window: str) -> bool:
+        """Fallback one-shot check: is Claude showing an input prompt?
+
+        Inspects the last non-empty line of capture-pane output for the ``>``
+        prompt character that Claude Code displays when waiting for input.
+
+        Args:
+            session: tmux session name.
+            window: window name or index.
+
+        Returns:
+            True if the pane appears to be at a Claude input prompt.
+        """
+        output = self.capture_pane(session, window, lines=5)
+        # Walk from the bottom to find the last non-empty line
+        for line in reversed(output.splitlines()):
+            stripped = line.strip()
+            if stripped:
+                return stripped.startswith(">")
+        return False
