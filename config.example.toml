@@ -1,0 +1,26 @@
+# code-trip orchestrator config — copy to config.toml and edit.
+
+[ssh]
+host = "user@remote-host"
+# options = ["-p", "2222"]   # extra ssh args (optional)
+
+[tmux]
+session = "claude"
+window = "main"
+
+[audio]
+sample_rate = 16000
+# device = 2            # mic device index from `python -m sounddevice` (optional)
+hotkey = "f13"          # pynput Key attribute name
+
+[openai]
+# api_key = "sk-..."    # falls back to OPENAI_API_KEY env var
+stt_model = "whisper-1"
+tts_model = "gpt-4o-mini-tts"
+tts_voice = "nova"
+tts_speed = 1.15
+summarizer_model = "gpt-4o-mini"
+verbosity = "detailed"  # brief | detailed | verbose
+
+[claude]
+wait_timeout = 300.0
