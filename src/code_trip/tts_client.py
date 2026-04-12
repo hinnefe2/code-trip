@@ -1,19 +1,27 @@
 """Text-to-speech via the OpenAI TTS API.
 
 Wraps the OpenAI ``/v1/audio/speech`` endpoint behind a simple
-``speak(text) -> None`` interface.  Synthesized audio is requested as WAV
-and played through ``aplay`` via a subprocess, which also gives us a
-cheap interruption mechanism: ``stop()`` kills the player process.
+``speak(text) -> None`` interface.  Audio is requested as WAV, decoded
+via the stdlib ``wave`` module, and played through ``sounddevice``
+(cross-platform: Linux/macOS/Windows).  :meth:`stop` interrupts
+playback mid-sentence.
 """
 
 from __future__ import annotations
 
+import io
 import os
-import subprocess
+import wave
 from dataclasses import dataclass, field
 
+import numpy as np
 import openai
 from openai import APIConnectionError, APIError, AuthenticationError
+
+try:
+    import sounddevice as sd
+except OSError:
+    sd = None  # type: ignore[assignment]  # PortAudio not installed; tests mock this
 
 # --- Module-level defaults ------------------------------------------------
 
@@ -22,9 +30,6 @@ DEFAULT_VOICE: str = "nova"
 DEFAULT_SPEED: float = 1.15
 DEFAULT_FORMAT: str = "wav"
 ENV_API_KEY: str = "OPENAI_API_KEY"
-
-# Player reads audio from stdin.  aplay auto-detects WAV format.
-PLAYER_CMD: list[str] = ["aplay", "-q", "-"]
 
 
 # --- Exceptions -----------------------------------------------------------
@@ -55,7 +60,6 @@ class TTSClient:
     speed: float = DEFAULT_SPEED
 
     _client: openai.OpenAI = field(default=None, init=False, repr=False)  # type: ignore[assignment]
-    _playback: subprocess.Popen | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         resolved_key = self.api_key or os.environ.get(ENV_API_KEY)
@@ -74,8 +78,7 @@ class TTSClient:
         thread to interrupt mid-sentence.
 
         Raises:
-            TTSClientError: if the text is empty, the API call fails,
-                or the player cannot be started.
+            TTSClientError: if the text is empty or the API call fails.
         """
         text = text.strip()
         if not text:
@@ -100,42 +103,28 @@ class TTSClient:
         if not audio:
             raise TTSClientError("Empty audio returned")
 
+        samples, sample_rate = _decode_wav(audio)
+
         # Stop anything still playing before starting new audio.
-        self.stop()
-
-        try:
-            self._playback = subprocess.Popen(
-                PLAYER_CMD,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except FileNotFoundError as exc:
-            raise TTSClientError(
-                f"Audio player not found: {PLAYER_CMD[0]}"
-            ) from exc
-
-        try:
-            assert self._playback.stdin is not None
-            self._playback.stdin.write(audio)
-            self._playback.stdin.close()
-            self._playback.wait()
-        except BrokenPipeError:
-            # Player exited early (e.g. stop() was called) — not an error.
-            pass
-        finally:
-            self._playback = None
+        sd.stop()
+        sd.play(samples, sample_rate)
+        sd.wait()
 
     def stop(self) -> None:
         """Interrupt any in-progress playback.  No-op if nothing is playing."""
-        proc = self._playback
-        if proc is None:
-            return
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=1.0)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-        self._playback = None
+        sd.stop()
+
+
+# --- helpers --------------------------------------------------------------
+
+
+def _decode_wav(audio: bytes) -> tuple[np.ndarray, int]:
+    """Decode WAV bytes into a numpy int16 array and sample rate."""
+    with wave.open(io.BytesIO(audio), "rb") as wf:
+        sample_rate = wf.getframerate()
+        channels = wf.getnchannels()
+        frames = wf.readframes(wf.getnframes())
+    samples = np.frombuffer(frames, dtype=np.int16)
+    if channels > 1:
+        samples = samples.reshape(-1, channels)
+    return samples, sample_rate
