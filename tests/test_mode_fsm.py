@@ -9,6 +9,7 @@ import pytest
 from code_trip import mode_fsm as mode_fsm_module
 from code_trip.mode_fsm import (
     TRANSITIONS,
+    Gesture,
     InvalidTransition,
     Key,
     Mode,
@@ -131,28 +132,42 @@ def test_handle_key_dispatches_to_registered_stub(fsm, monkeypatch):
     called = []
     monkeypatch.setitem(
         mode_fsm_module.KEY_BEHAVIORS,
-        (Mode.IDLE, Key.ACT),
+        (Mode.IDLE, Key.ACT, Gesture.SHORT),
         lambda f: called.append(f),
     )
-    fsm.handle_key(Key.ACT)
+    fsm.handle_key(Key.ACT, Gesture.SHORT)
     assert called == [fsm]
 
 
-def test_handle_key_unmapped_is_noop(fsm, monkeypatch):
+def test_handle_key_routes_by_gesture(fsm, monkeypatch):
+    short_calls: list = []
+    long_calls: list = []
     monkeypatch.setitem(
-        mode_fsm_module.KEY_BEHAVIORS, (Mode.IDLE, Key.NO), None
+        mode_fsm_module.KEY_BEHAVIORS,
+        (Mode.IDLE, Key.NAV, Gesture.SHORT),
+        lambda f: short_calls.append(f),
     )
-    # Pop the entry so .get() returns None.
-    mode_fsm_module.KEY_BEHAVIORS.pop((Mode.IDLE, Key.NO))
+    monkeypatch.setitem(
+        mode_fsm_module.KEY_BEHAVIORS,
+        (Mode.IDLE, Key.NAV, Gesture.LONG),
+        lambda f: long_calls.append(f),
+    )
+    fsm.handle_key(Key.NAV, Gesture.LONG)
+    assert long_calls == [fsm]
+    assert short_calls == []
+
+
+def test_handle_key_unmapped_is_noop(fsm):
+    key = (Mode.IDLE, Key.NO, Gesture.HOLD)
+    original = mode_fsm_module.KEY_BEHAVIORS.pop(key)
     try:
-        fsm.handle_key(Key.NO)  # should not raise
+        fsm.handle_key(Key.NO, Gesture.HOLD)  # should not raise
     finally:
-        mode_fsm_module.KEY_BEHAVIORS[(Mode.IDLE, Key.NO)] = (
-            mode_fsm_module._stub(Mode.IDLE, Key.NO)
-        )
+        mode_fsm_module.KEY_BEHAVIORS[key] = original
 
 
-def test_every_mode_key_pair_has_stub():
+def test_every_mode_key_gesture_triple_has_stub():
     for mode in Mode:
         for key in Key:
-            assert (mode, key) in mode_fsm_module.KEY_BEHAVIORS
+            for gesture in Gesture:
+                assert (mode, key, gesture) in mode_fsm_module.KEY_BEHAVIORS

@@ -53,6 +53,12 @@ class Key(enum.Enum):
     NO = "no"
 
 
+class Gesture(enum.Enum):
+    SHORT = "short"
+    LONG = "long"
+    HOLD = "hold"
+
+
 class InvalidTransition(Exception):
     """Raised when a caller attempts a transition not in the allowed table."""
 
@@ -83,18 +89,19 @@ MODE_ANNOUNCEMENTS: dict[Mode, str] = {
 # --- key-behavior stubs ---------------------------------------------------
 
 
-def _stub(mode: Mode, key: Key) -> Callable[["ModeFSM"], None]:
+def _stub(mode: Mode, key: Key, gesture: Gesture) -> Callable[["ModeFSM"], None]:
     def handler(_fsm: "ModeFSM") -> None:
-        logger.info("%s.%s pressed (stub)", mode.name, key.name)
+        logger.info("%s.%s.%s (stub)", mode.name, key.name, gesture.name)
 
-    handler.__name__ = f"_stub_{mode.name}_{key.name}"
+    handler.__name__ = f"_stub_{mode.name}_{key.name}_{gesture.name}"
     return handler
 
 
-KEY_BEHAVIORS: dict[tuple[Mode, Key], Callable[["ModeFSM"], None]] = {
-    (mode, key): _stub(mode, key)
+KEY_BEHAVIORS: dict[tuple[Mode, Key, Gesture], Callable[["ModeFSM"], None]] = {
+    (mode, key, gesture): _stub(mode, key, gesture)
     for mode in Mode
     for key in Key
+    for gesture in Gesture
 }
 
 
@@ -135,8 +142,8 @@ class ModeFSM:
         # Sub-state chime reuses the WORK chime so the mode stays audibly consistent.
         play_mode_chime(Mode.WORK.name)
 
-    def handle_key(self, key: Key) -> None:
-        handler = KEY_BEHAVIORS.get((self.current, key))
+    def handle_key(self, key: Key, gesture: Gesture = Gesture.SHORT) -> None:
+        handler = KEY_BEHAVIORS.get((self.current, key, gesture))
         if handler is None:
             return
         handler(self)
