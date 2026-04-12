@@ -63,6 +63,31 @@ def play_error() -> None:
     play_tone(220.0, 0.25)
 
 
+MODE_CHIME_FREQS: dict[str, float] = {
+    "IDLE": 440.0,
+    "BROWSE": 523.25,
+    "WORK": 587.33,
+    "REVIEW": 659.25,
+    "SHIP": 783.99,
+}
+
+
+def play_mode_chime(mode_name: str) -> None:
+    """Play a distinct two-tone chime for ``mode_name`` (e.g. ``"WORK"``)."""
+    try:
+        base = MODE_CHIME_FREQS[mode_name]
+    except KeyError as exc:
+        raise EarconError(f"Unknown mode chime: {mode_name}") from exc
+    try:
+        sd.play(
+            np.concatenate([_tone(base, 0.09), _tone(base * 1.5, 0.12)]),
+            samplerate=_SAMPLE_RATE,
+        )
+        sd.wait()
+    except Exception as exc:  # pragma: no cover - device-dependent
+        raise EarconError(f"Failed to play mode chime: {exc}") from exc
+
+
 class ThinkingEarcon:
     """Periodic beep played on a background thread while Claude is working."""
 
