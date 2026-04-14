@@ -10,13 +10,18 @@ from pathlib import Path
 from pynput import keyboard
 
 from code_trip.audio_recorder import AudioRecorder
+from code_trip.browse import BrowseController, register_browse_handlers
 from code_trip.config import Config
 from code_trip.earcon import ThinkingEarcon, play_completion, play_error
+from code_trip.mode_fsm import KEY_BEHAVIORS, Gesture, Key, Mode, ModeFSM
 from code_trip.push_to_talk import PushToTalk
 from code_trip.remote_tmux import RemoteTmux, RemoteTmuxError, WaitTimeout
+from code_trip.review import ReviewController, register_review_handlers
+from code_trip.ship import ShipController, register_ship_handlers
 from code_trip.stt_client import STTClient, STTClientError
 from code_trip.summarizer import Summarizer, SummarizerError, Verbosity
 from code_trip.tts_client import TTSClient, TTSClientError
+from code_trip.work import WorkController, register_work_handlers
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +95,49 @@ class Orchestrator:
             # _build_deps already wired the callback; nothing more to do.
             pass
         self._shutdown = threading.Event()
+        self._fsm = ModeFSM(tts=self._deps.tts)
+        self._browse = BrowseController(
+            tmux=self._deps.tmux,
+            tts=self._deps.tts,
+            session=config.tmux.session,
+            browse_window=config.tmux.browse_window,
+            wait_timeout=config.claude.wait_timeout,
+        )
+        register_browse_handlers(self._fsm, self._browse)
+        self._work = WorkController(
+            tmux=self._deps.tmux,
+            tts=self._deps.tts,
+            summarizer=self._deps.summarizer,
+            thinking=self._deps.thinking,
+            session=config.tmux.session,
+            window=config.tmux.window,
+            wait_timeout=config.claude.wait_timeout,
+        )
+        register_work_handlers(self._fsm, self._work)
+        self._review = ReviewController(
+            tmux=self._deps.tmux,
+            tts=self._deps.tts,
+            summarizer=self._deps.summarizer,
+            thinking=self._deps.thinking,
+            session=config.tmux.session,
+            window=config.tmux.window,
+            wait_timeout=config.claude.wait_timeout,
+        )
+        register_review_handlers(self._fsm, self._review)
+        self._ship = ShipController(
+            tmux=self._deps.tmux,
+            tts=self._deps.tts,
+            thinking=self._deps.thinking,
+            session=config.tmux.session,
+            window=config.tmux.window,
+            wait_timeout=config.claude.wait_timeout,
+        )
+        register_ship_handlers(self._fsm, self._ship)
+        self._work.on_escalate = lambda _fsm: self._review.enter()
+        self._review.on_ship = lambda _fsm: self._ship.enter()
+        self._install_browse_to_work_handoff()
+        # TODO: swap PushToTalk for KeypadListener to dispatch NAV/ACT/OK/NO
+        # gestures into self._fsm.handle_key. Until then, gestures aren't wired.
 
     def start(self) -> None:
         logger.info("Starting orchestrator")
@@ -104,6 +152,19 @@ class Orchestrator:
 
     # --- core loop --------------------------------------------------------
 
+    def _install_browse_to_work_handoff(self) -> None:
+        """Chain WORK:PLAN entry after BROWSE's ACT-short ticket selection."""
+        key = (Mode.BROWSE, Key.ACT, Gesture.SHORT)
+        original = KEY_BEHAVIORS[key]
+
+        def act_short(fsm: ModeFSM) -> None:
+            original(fsm)
+            if fsm.current is Mode.WORK and self._browse.selected is not None:
+                ticket = self._browse.selected
+                self._work.enter(ticket.id, ticket.title)
+
+        KEY_BEHAVIORS[key] = act_short
+
     def _handle_recording(self, audio_path: Path) -> None:
         cfg = self._config
         user_request: str | None = None
@@ -113,6 +174,19 @@ class Orchestrator:
         except STTClientError as exc:
             logger.exception("STT failed")
             self._report_error(f"Transcription failed: {exc}")
+            return
+
+        if self._fsm.current is Mode.BROWSE:
+            self._browse.handle_voice(user_request)
+            return
+        if self._fsm.current is Mode.WORK:
+            self._work.handle_voice(user_request)
+            return
+        if self._fsm.current is Mode.REVIEW:
+            self._review.handle_voice(user_request)
+            return
+        if self._fsm.current is Mode.SHIP:
+            self._ship.handle_voice(user_request)
             return
 
         try:

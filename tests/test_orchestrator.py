@@ -165,3 +165,95 @@ def test_tts_failure_reports_error(play_err, play_comp, orch, deps):
 def test_stop_sets_shutdown(orch):
     orch.stop()
     assert orch._shutdown.is_set()
+
+
+# --- mode-aware PTT dispatch ---------------------------------------------
+
+
+from code_trip.browse import Ticket
+from code_trip.mode_fsm import Gesture, Key, Mode, WorkSubMode
+
+
+def test_ptt_in_browse_routes_to_browse_handle_voice(orch, deps):
+    orch._fsm.current = Mode.BROWSE
+    orch._browse.handle_voice = MagicMock()
+    deps.stt.transcribe.return_value = "bug"
+
+    orch._handle_recording(_audio())
+
+    orch._browse.handle_voice.assert_called_once_with("bug")
+    deps.tmux.send_keys.assert_not_called()
+
+
+def test_ptt_in_work_routes_to_work_handle_voice(orch, deps):
+    orch._fsm.current = Mode.WORK
+    orch._fsm.work_sub = WorkSubMode.EXECUTING
+    orch._work.handle_voice = MagicMock()
+    deps.stt.transcribe.return_value = "refactor this"
+
+    orch._handle_recording(_audio())
+
+    orch._work.handle_voice.assert_called_once_with("refactor this")
+
+
+def test_ptt_in_review_routes_to_review_handle_voice(orch, deps):
+    orch._fsm.current = Mode.REVIEW
+    orch._review.handle_voice = MagicMock()
+    deps.stt.transcribe.return_value = "ignore it"
+
+    orch._handle_recording(_audio())
+
+    orch._review.handle_voice.assert_called_once_with("ignore it")
+    deps.tmux.send_keys.assert_not_called()
+
+
+def test_ptt_in_ship_routes_to_ship_handle_voice(orch, deps):
+    orch._fsm.current = Mode.SHIP
+    orch._ship.handle_voice = MagicMock()
+    deps.stt.transcribe.return_value = "make title shorter"
+
+    orch._handle_recording(_audio())
+
+    orch._ship.handle_voice.assert_called_once_with("make title shorter")
+    deps.tmux.send_keys.assert_not_called()
+
+
+def test_work_escalate_enters_review(orch, monkeypatch):
+    from code_trip import mode_fsm as fsm_mod
+
+    monkeypatch.setattr(fsm_mod, "play_mode_chime", MagicMock())
+    orch._fsm.current = Mode.WORK
+    orch._fsm.work_sub = WorkSubMode.EXECUTING
+    orch._review.enter = MagicMock()
+
+    orch._fsm.handle_key(Key.ACT, Gesture.SHORT)
+
+    assert orch._fsm.current is Mode.REVIEW
+    orch._review.enter.assert_called_once()
+
+
+def test_review_approve_enters_ship(orch, monkeypatch):
+    from code_trip import mode_fsm as fsm_mod
+
+    monkeypatch.setattr(fsm_mod, "play_mode_chime", MagicMock())
+    orch._fsm.current = Mode.REVIEW
+    orch._ship.enter = MagicMock()
+
+    orch._fsm.handle_key(Key.OK, Gesture.SHORT)
+
+    assert orch._fsm.current is Mode.SHIP
+    orch._ship.enter.assert_called_once()
+
+
+def test_browse_to_work_handoff_invokes_work_enter(orch, monkeypatch):
+    from code_trip import mode_fsm as fsm_mod
+
+    monkeypatch.setattr(fsm_mod, "play_mode_chime", MagicMock())
+    orch._fsm.current = Mode.BROWSE
+    orch._browse.tickets = [Ticket(id="SHOA-115", title="WORK mode")]
+    orch._work.enter = MagicMock()
+
+    orch._fsm.handle_key(Key.ACT, Gesture.SHORT)
+
+    assert orch._fsm.current is Mode.WORK
+    orch._work.enter.assert_called_once_with("SHOA-115", "WORK mode")

@@ -27,6 +27,7 @@ class SSHConfig:
 class TmuxConfig:
     session: str
     window: str
+    browse_window: str = "browse"
 
 
 @dataclass(frozen=True)
@@ -82,7 +83,11 @@ def load_config(path: Path | str) -> Config:
             host=ssh_raw["host"],
             options=tuple(ssh_raw.get("options", ())),
         )
-        tmux = TmuxConfig(session=tmux_raw["session"], window=tmux_raw["window"])
+        tmux = TmuxConfig(
+            session=tmux_raw["session"],
+            window=tmux_raw["window"],
+            browse_window=tmux_raw.get("browse_window", "browse"),
+        )
     except KeyError as exc:
         raise ConfigError(f"Missing required field: {exc.args[0]}") from exc
 

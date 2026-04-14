@@ -1,17 +1,18 @@
 """Mode state machine for the voice-driven orchestrator.
 
 Tracks which interaction mode the user is in (IDLE, BROWSE, WORK, REVIEW,
-SHIP) and, within WORK, a sub-state (PLAN, EXECUTING, REVIEWING). Each valid
+SHIP) and, within WORK, a sub-state (PLAN, EXECUTING). Each valid
 transition plays a distinct earcon chime and announces the new mode via TTS.
 
 Per-mode key behavior (PTT/NAV/ACT/OK/NO) is captured as stubs in this
-module; real handlers land in SHOA-113/115/116. Design intent per key and
-mode follows docs/voice-driven-claude-design.md §"Modal System":
+module; real handlers live in browse.py/work.py/review.py/ship.py. Design
+intent per key and mode follows docs/voice-driven-claude-design.md
+§"Modal System":
 
     IDLE    PTT: voice command  NAV: cycle worktrees  ACT: enter BROWSE
     BROWSE  PTT: filter/search  NAV: next/prev ticket ACT: select -> WORK
             OK:  read full desc NO:  exit to IDLE
-    WORK    PTT: talk to Claude NAV: cycle messages   ACT: run review
+    WORK    PTT: talk to Claude NAV: cycle messages   ACT: -> REVIEW
             OK:  approve action NO:  reject/retry
     REVIEW  PTT: feedback       NAV: step findings    ACT: rerun tools
             OK:  approve -> SHIP NO: back to WORK
@@ -42,7 +43,6 @@ class Mode(enum.Enum):
 class WorkSubMode(enum.Enum):
     PLAN = "plan"
     EXECUTING = "executing"
-    REVIEWING = "reviewing"
 
 
 class Key(enum.Enum):
@@ -73,8 +73,7 @@ TRANSITIONS: dict[Mode, frozenset[Mode]] = {
 
 WORK_SUB_TRANSITIONS: dict[WorkSubMode, frozenset[WorkSubMode]] = {
     WorkSubMode.PLAN: frozenset({WorkSubMode.EXECUTING}),
-    WorkSubMode.EXECUTING: frozenset({WorkSubMode.REVIEWING}),
-    WorkSubMode.REVIEWING: frozenset({WorkSubMode.PLAN, WorkSubMode.EXECUTING}),
+    WorkSubMode.EXECUTING: frozenset({WorkSubMode.PLAN}),
 }
 
 MODE_ANNOUNCEMENTS: dict[Mode, str] = {

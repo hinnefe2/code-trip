@@ -104,11 +104,13 @@ def test_work_sub_transition_plays_chime(fsm, chime):
     chime.assert_called_once_with(Mode.WORK.name)
 
 
-def test_work_sub_invalid_jump_rejected(fsm):
+def test_work_sub_invalid_jump_rejected(fsm, chime):
     _set_state(fsm, Mode.WORK)
+    fsm.transition_work_sub(WorkSubMode.EXECUTING)
     with pytest.raises(InvalidTransition):
-        fsm.transition_work_sub(WorkSubMode.REVIEWING)
-    assert fsm.work_sub is WorkSubMode.PLAN
+        # EXECUTING -> EXECUTING is not in the table.
+        fsm.transition_work_sub(WorkSubMode.EXECUTING)
+    assert fsm.work_sub is WorkSubMode.EXECUTING
 
 
 def test_work_sub_requires_work_mode(fsm):
@@ -120,7 +122,6 @@ def test_work_sub_requires_work_mode(fsm):
 def test_work_sub_cycle_back_to_plan(fsm, chime):
     _set_state(fsm, Mode.WORK)
     fsm.transition_work_sub(WorkSubMode.EXECUTING)
-    fsm.transition_work_sub(WorkSubMode.REVIEWING)
     fsm.transition_work_sub(WorkSubMode.PLAN)
     assert fsm.work_sub is WorkSubMode.PLAN
 
