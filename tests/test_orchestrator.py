@@ -43,10 +43,12 @@ def deps():
         summarizer=MagicMock(),
         tts=MagicMock(),
         thinking=MagicMock(),
+        intent_classifier=MagicMock(),
     )
     d.stt.transcribe.return_value = "list files"
     d.tmux.capture_pane.return_value = "ls output"
     d.summarizer.summarize.return_value = "Here are the files."
+    d.intent_classifier.classify.return_value = None
     return d
 
 
@@ -243,6 +245,152 @@ def test_review_approve_enters_ship(orch, monkeypatch):
 
     assert orch._fsm.current is Mode.SHIP
     orch._ship.enter.assert_called_once()
+
+
+# --- intent routing -------------------------------------------------------
+
+
+from code_trip.intent_classifier import (
+    Intent,
+    IntentClassifierError,
+    IntentResult,
+)
+from code_trip.summarizer import Verbosity
+
+
+def test_intent_list_tickets_from_idle_refreshes_browse(orch, deps, monkeypatch):
+    from code_trip import mode_fsm as fsm_mod
+
+    monkeypatch.setattr(fsm_mod, "play_mode_chime", MagicMock())
+    deps.intent_classifier.classify.return_value = IntentResult(Intent.LIST_TICKETS)
+    orch._browse.refresh = MagicMock()
+    orch._browse.announce_current = MagicMock()
+
+    orch._handle_recording(_audio())
+
+    assert orch._fsm.current is Mode.BROWSE
+    orch._browse.refresh.assert_called_once()
+    orch._browse.announce_current.assert_called_once()
+    deps.tmux.send_keys.assert_not_called()
+
+
+def test_intent_list_tickets_from_work_is_noop_with_explanation(orch, deps):
+    orch._fsm.current = Mode.WORK
+    deps.intent_classifier.classify.return_value = IntentResult(Intent.LIST_TICKETS)
+    orch._browse.refresh = MagicMock()
+    orch._work.handle_voice = MagicMock()
+
+    orch._handle_recording(_audio())
+
+    assert orch._fsm.current is Mode.WORK
+    orch._browse.refresh.assert_not_called()
+    orch._work.handle_voice.assert_not_called()
+    spoken = deps.tts.speak.call_args.args[0]
+    assert "can't" in spoken.lower()
+    assert "work" in spoken.lower()
+
+
+def test_intent_ship_it_from_review_enters_ship(orch, deps, monkeypatch):
+    from code_trip import mode_fsm as fsm_mod
+
+    monkeypatch.setattr(fsm_mod, "play_mode_chime", MagicMock())
+    orch._fsm.current = Mode.REVIEW
+    deps.intent_classifier.classify.return_value = IntentResult(Intent.SHIP_IT)
+    orch._ship.enter = MagicMock()
+
+    orch._handle_recording(_audio())
+
+    assert orch._fsm.current is Mode.SHIP
+    orch._ship.enter.assert_called_once()
+
+
+def test_intent_ship_it_from_idle_is_noop(orch, deps):
+    deps.intent_classifier.classify.return_value = IntentResult(Intent.SHIP_IT)
+    orch._ship.enter = MagicMock()
+
+    orch._handle_recording(_audio())
+
+    assert orch._fsm.current is Mode.IDLE
+    orch._ship.enter.assert_not_called()
+    deps.tmux.send_keys.assert_not_called()
+
+
+def test_intent_status_from_idle(orch, deps):
+    deps.intent_classifier.classify.return_value = IntentResult(Intent.STATUS)
+
+    orch._handle_recording(_audio())
+
+    spoken = deps.tts.speak.call_args.args[0]
+    assert "idle" in spoken.lower()
+    assert "no active ticket" in spoken.lower()
+
+
+def test_intent_status_with_active_ticket_in_work(orch, deps):
+    orch._fsm.current = Mode.WORK
+    orch._fsm.work_sub = WorkSubMode.PLAN
+    orch._browse.selected = Ticket(id="SHOA-117", title="Intent routing")
+    deps.intent_classifier.classify.return_value = IntentResult(Intent.STATUS)
+
+    orch._handle_recording(_audio())
+
+    spoken = deps.tts.speak.call_args.args[0]
+    assert "SHOA-117" in spoken
+    assert "Intent routing" in spoken
+    assert "plan" in spoken.lower()
+
+
+def test_intent_set_verbosity_updates_summarizer(orch, deps):
+    deps.intent_classifier.classify.return_value = IntentResult(
+        Intent.SET_VERBOSITY, arg="brief"
+    )
+
+    orch._handle_recording(_audio())
+
+    assert deps.summarizer.verbosity == Verbosity.BRIEF
+    deps.tts.speak.assert_called_once()
+    assert "brief" in deps.tts.speak.call_args.args[0].lower()
+
+
+def test_intent_switch_ticket_in_browse_enters_work(orch, deps, monkeypatch):
+    from code_trip import mode_fsm as fsm_mod
+
+    monkeypatch.setattr(fsm_mod, "play_mode_chime", MagicMock())
+    orch._fsm.current = Mode.BROWSE
+    orch._browse.tickets = [
+        Ticket(id="SHOA-1", title="One"),
+        Ticket(id="SHOA-2", title="Two"),
+    ]
+    deps.intent_classifier.classify.return_value = IntentResult(
+        Intent.SWITCH_TICKET, arg=2
+    )
+    orch._work.enter = MagicMock()
+
+    orch._handle_recording(_audio())
+
+    assert orch._fsm.current is Mode.WORK
+    orch._work.enter.assert_called_once_with("SHOA-2", "Two")
+
+
+def test_intent_classifier_error_falls_through_to_mode(orch, deps):
+    orch._fsm.current = Mode.BROWSE
+    deps.intent_classifier.classify.side_effect = IntentClassifierError("boom")
+    orch._browse.handle_voice = MagicMock()
+    deps.stt.transcribe.return_value = "find python"
+
+    orch._handle_recording(_audio())
+
+    orch._browse.handle_voice.assert_called_once_with("find python")
+
+
+def test_unknown_intent_falls_through_to_mode(orch, deps):
+    orch._fsm.current = Mode.WORK
+    deps.intent_classifier.classify.return_value = None
+    orch._work.handle_voice = MagicMock()
+    deps.stt.transcribe.return_value = "do the thing"
+
+    orch._handle_recording(_audio())
+
+    orch._work.handle_voice.assert_called_once_with("do the thing")
 
 
 def test_browse_to_work_handoff_invokes_work_enter(orch, monkeypatch):

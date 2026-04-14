@@ -13,7 +13,20 @@ from code_trip.audio_recorder import AudioRecorder
 from code_trip.browse import BrowseController, register_browse_handlers
 from code_trip.config import Config
 from code_trip.earcon import ThinkingEarcon, play_completion, play_error
-from code_trip.mode_fsm import KEY_BEHAVIORS, Gesture, Key, Mode, ModeFSM
+from code_trip.intent_classifier import (
+    Intent,
+    IntentClassifier,
+    IntentClassifierError,
+)
+from code_trip.mode_fsm import (
+    KEY_BEHAVIORS,
+    TRANSITIONS,
+    Gesture,
+    Key,
+    Mode,
+    ModeFSM,
+    WorkSubMode,
+)
 from code_trip.push_to_talk import PushToTalk
 from code_trip.remote_tmux import RemoteTmux, RemoteTmuxError, WaitTimeout
 from code_trip.review import ReviewController, register_review_handlers
@@ -39,6 +52,7 @@ class OrchestratorDeps:
     summarizer: Summarizer
     tts: TTSClient
     thinking: ThinkingEarcon
+    intent_classifier: IntentClassifier
 
 
 def _build_deps(config: Config, handler) -> OrchestratorDeps:
@@ -73,6 +87,10 @@ def _build_deps(config: Config, handler) -> OrchestratorDeps:
         voice=config.openai.tts_voice,
         speed=config.openai.tts_speed,
     )
+    intent_classifier = IntentClassifier(
+        model=config.openai.summarizer_model,
+        api_key=config.openai.api_key,
+    )
     return OrchestratorDeps(
         tmux=tmux,
         recorder=recorder,
@@ -81,6 +99,7 @@ def _build_deps(config: Config, handler) -> OrchestratorDeps:
         summarizer=summarizer,
         tts=tts,
         thinking=ThinkingEarcon(),
+        intent_classifier=intent_classifier,
     )
 
 
@@ -159,11 +178,14 @@ class Orchestrator:
 
         def act_short(fsm: ModeFSM) -> None:
             original(fsm)
-            if fsm.current is Mode.WORK and self._browse.selected is not None:
-                ticket = self._browse.selected
-                self._work.enter(ticket.id, ticket.title)
+            self._enter_work_for_selected()
 
         KEY_BEHAVIORS[key] = act_short
+
+    def _enter_work_for_selected(self) -> None:
+        if self._fsm.current is Mode.WORK and self._browse.selected is not None:
+            ticket = self._browse.selected
+            self._work.enter(ticket.id, ticket.title)
 
     def _handle_recording(self, audio_path: Path) -> None:
         cfg = self._config
@@ -174,6 +196,9 @@ class Orchestrator:
         except STTClientError as exc:
             logger.exception("STT failed")
             self._report_error(f"Transcription failed: {exc}")
+            return
+
+        if user_request and self._dispatch_intent(user_request):
             return
 
         if self._fsm.current is Mode.BROWSE:
@@ -243,6 +268,93 @@ class Orchestrator:
             play_completion()
         except Exception:
             logger.exception("Completion earcon failed")
+
+    # --- intent routing ---------------------------------------------------
+
+    def _dispatch_intent(self, transcript: str) -> bool:
+        """Classify *transcript* and run a local action. Return True if handled."""
+        try:
+            result = self._deps.intent_classifier.classify(transcript)
+        except IntentClassifierError:
+            logger.exception("Intent classifier failed; falling through")
+            return False
+        if result is None:
+            return False
+
+        intent = result.intent
+        if intent is Intent.LIST_TICKETS:
+            return self._intent_list_tickets()
+        if intent is Intent.SWITCH_TICKET:
+            return self._intent_switch_ticket(int(result.arg))  # type: ignore[arg-type]
+        if intent is Intent.STATUS:
+            return self._intent_status()
+        if intent is Intent.SHIP_IT:
+            return self._intent_ship_it()
+        if intent is Intent.SET_VERBOSITY:
+            return self._intent_set_verbosity(str(result.arg))
+        return False
+
+    def _try_transition(self, target: Mode, verb: str) -> bool:
+        if target not in TRANSITIONS[self._fsm.current]:
+            self._deps.tts.speak(
+                f"Can't {verb} from {self._fsm.current.name.lower()} mode."
+            )
+            return False
+        self._fsm.transition_to(target)
+        return True
+
+    def _intent_list_tickets(self) -> bool:
+        if not self._try_transition(Mode.BROWSE, "list tickets"):
+            return True
+        try:
+            self._browse.refresh()
+        except Exception as exc:
+            logger.exception("BROWSE refresh failed")
+            self._report_error(f"Could not list tickets: {exc}")
+            return True
+        self._browse.announce_current()
+        return True
+
+    def _intent_switch_ticket(self, n: int) -> bool:
+        if self._fsm.current is not Mode.BROWSE:
+            self._deps.tts.speak("Switch ticket only works in browse mode.")
+            return True
+        ticket = self._browse.select_index(n)
+        if ticket is None:
+            return True
+        if not self._try_transition(Mode.WORK, "switch ticket"):
+            return True
+        self._enter_work_for_selected()
+        return True
+
+    def _intent_status(self) -> bool:
+        ticket = self._browse.selected
+        mode_name = self._fsm.current.name.lower()
+        if self._fsm.current is Mode.WORK and self._fsm.work_sub is not None:
+            mode_name = f"work, {self._fsm.work_sub.name.lower()}"
+        if ticket is None:
+            self._deps.tts.speak(f"In {mode_name} mode. No active ticket.")
+        else:
+            self._deps.tts.speak(
+                f"In {mode_name} mode on {ticket.id}, {ticket.title}."
+            )
+        return True
+
+    def _intent_ship_it(self) -> bool:
+        if not self._try_transition(Mode.SHIP, "ship"):
+            return True
+        self._ship.enter()
+        return True
+
+    def _intent_set_verbosity(self, level: str) -> bool:
+        try:
+            verbosity = Verbosity(level)
+        except ValueError:
+            self._deps.tts.speak(f"Unknown verbosity {level}.")
+            return True
+        self._deps.summarizer.verbosity = verbosity
+        self._deps.tts.speak(f"Verbosity set to {level}.")
+        return True
 
     def _report_error(self, message: str) -> None:
         self._deps.thinking.stop()

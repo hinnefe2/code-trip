@@ -182,6 +182,18 @@ class BrowseController:
 
     # --- selection --------------------------------------------------------
 
+    def select_index(self, n: int) -> Ticket | None:
+        """Select the *n*-th ticket (1-based) from the current view."""
+        view = self._view()
+        if not view:
+            self.tts.speak("No tickets.")
+            return None
+        if n < 1 or n > len(view):
+            self.tts.speak(f"No ticket {n}.")
+            return None
+        self.index = n - 1
+        return self.select_current()
+
     def select_current(self) -> Ticket | None:
         ticket = self.current()
         if ticket is None:
