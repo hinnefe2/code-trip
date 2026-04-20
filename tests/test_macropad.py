@@ -28,18 +28,27 @@ KEYMAP = {
 @dataclass
 class Recorder:
     chords: list[str] = field(default_factory=list)
+    taps: list[str] = field(default_factory=list)
     audio: list[Path] = field(default_factory=list)
 
     def on_chord(self, name: str) -> None:
         self.chords.append(name)
 
+    def on_tap(self, name: str) -> None:
+        self.taps.append(name)
+
     def on_audio(self, path: Path) -> None:
         self.audio.append(path)
 
 
-def _make(monkeypatch: pytest.MonkeyPatch) -> tuple[Macropad, Recorder, MagicMock]:
+def _make(monkeypatch: pytest.MonkeyPatch) -> tuple[Macropad, Recorder, MagicMock, MagicMock]:
     rec = Recorder()
-    pad = Macropad(keymap=KEYMAP, on_audio=rec.on_audio, on_chord=rec.on_chord)
+    pad = Macropad(
+        keymap=KEYMAP,
+        on_audio=rec.on_audio,
+        on_chord=rec.on_chord,
+        on_tap=rec.on_tap,
+    )
     start_stub = MagicMock()
     finish_stub = MagicMock()
     monkeypatch.setattr(pad, "_start_recording", start_stub)
@@ -103,11 +112,35 @@ def test_released_nav_no_longer_modifies(monkeypatch):
     start.assert_called_once()
 
 
-def test_yes_without_nav_is_noop(monkeypatch):
+def test_yes_without_nav_fires_tap(monkeypatch):
     pad, rec, start, _ = _make(monkeypatch)
     pad._on_press(keyboard.Key.f15)
     assert rec.chords == []
+    assert rec.taps == ["yes"]
     start.assert_not_called()
+
+
+def test_no_without_nav_fires_tap(monkeypatch):
+    pad, rec, start, _ = _make(monkeypatch)
+    pad._on_press(keyboard.Key.f16)
+    assert rec.taps == ["no"]
+    start.assert_not_called()
+
+
+def test_act_without_nav_is_noop(monkeypatch):
+    pad, rec, start, _ = _make(monkeypatch)
+    pad._on_press(keyboard.Key.f14)
+    assert rec.chords == []
+    assert rec.taps == []
+    start.assert_not_called()
+
+
+def test_nav_modifier_suppresses_tap(monkeypatch):
+    pad, rec, *_ = _make(monkeypatch)
+    pad._on_press(keyboard.Key.f17)  # NAV
+    pad._on_press(keyboard.Key.f15)  # YES under NAV
+    assert rec.chords == ["nav+yes"]
+    assert rec.taps == []
 
 
 def test_key_repeat_ignored(monkeypatch):
@@ -223,6 +256,35 @@ def test_chord_ptt_speaks_active_app(monkeypatch):
 
     chords.handle_chord(ctx, "nav+ptt")
     ctx.tts.speak.assert_called_once_with("Google Chrome")
+
+
+def test_tap_yes_sends_digit_1(monkeypatch):
+    ctx = _ctx()
+    sent: list[KeyStroke] = []
+    monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
+
+    chords.handle_tap(ctx, "yes")
+    assert sent == [chords._TAP_YES]
+    assert sent[0].chords[0].key == "1"
+
+
+def test_tap_no_sends_escape(monkeypatch):
+    ctx = _ctx()
+    sent: list[KeyStroke] = []
+    monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
+
+    chords.handle_tap(ctx, "no")
+    assert sent == [chords._TAP_NO]
+    assert sent[0].chords[0].key == keyboard.Key.esc
+
+
+def test_tap_unknown_is_noop(monkeypatch):
+    ctx = _ctx()
+    sent: list[KeyStroke] = []
+    monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
+
+    chords.handle_tap(ctx, "bogus")
+    assert sent == []
 
 
 def test_chord_active_app_error_reported(monkeypatch):

@@ -8,6 +8,7 @@ currently held. Behavior:
   - PTT released            → close stream, write WAV, call ``on_audio``.
   - NAV held + PTT tap      → ``on_chord("nav+ptt")`` (no recording).
   - NAV held + YES/NO/ACT   → ``on_chord("nav+yes" | "nav+no" | "nav+act")``.
+  - YES or NO tapped alone  → ``on_tap("yes" | "no")``.
   - Everything else         → no-op.
 
 Callbacks run on the pynput listener thread; keep them fast or hand off
@@ -56,6 +57,7 @@ class Macropad:
     keymap: dict[str, keyboard.Key | keyboard.KeyCode]
     on_audio: Callable[[Path], None]
     on_chord: Callable[[str], None]
+    on_tap: Callable[[str], None] | None = None
     sample_rate: int = 16_000
     device: int | str | None = None
     output_dir: Path = field(default_factory=lambda: DEFAULT_OUTPUT_DIR)
@@ -110,6 +112,8 @@ class Macropad:
                 self._start_recording()
         elif name in ("yes", "no", "act") and nav_modifier:
             self._fire_chord(f"nav+{name}")
+        elif name in ("yes", "no") and self.on_tap is not None:
+            self._fire_tap(name)
 
     def _on_release(self, key: keyboard.Key | keyboard.KeyCode | None) -> None:
         name = self._reverse.get(key)
@@ -187,3 +191,10 @@ class Macropad:
             self.on_chord(name)
         except Exception:
             logger.exception("on_chord(%s) failed", name)
+
+    def _fire_tap(self, name: str) -> None:
+        try:
+            assert self.on_tap is not None
+            self.on_tap(name)
+        except Exception:
+            logger.exception("on_tap(%s) failed", name)

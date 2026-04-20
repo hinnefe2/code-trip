@@ -64,6 +64,17 @@ APP_NAV: dict[str, tuple[KeyStroke, KeyStroke]] = {
 }
 
 
+# Solo taps — typed into whatever app currently has focus.
+# YES answers Claude Code's default-accept prompt (option 1); NO sends Esc to cancel.
+_TAP_YES = KeyStroke(chords=(Chord(key="1"),))
+_TAP_NO = KeyStroke(chords=(Chord(key=keyboard.Key.esc),))
+
+TAP_STROKES: dict[str, KeyStroke] = {
+    "yes": _TAP_YES,
+    "no": _TAP_NO,
+}
+
+
 def handle_chord(ctx: "Context", name: str) -> None:
     if name == "nav+yes":
         _nav(ctx, forward=True)
@@ -75,6 +86,17 @@ def handle_chord(ctx: "Context", name: str) -> None:
         _speak_active_app(ctx)
     else:
         logger.warning("Unknown chord: %s", name)
+
+
+def handle_tap(ctx: "Context", name: str) -> None:
+    stroke = TAP_STROKES.get(name)
+    if stroke is None:
+        logger.warning("Unknown tap: %s", name)
+        return
+    try:
+        window.send_keystroke(stroke)
+    except Exception as exc:
+        _speak_error(ctx, f"Could not send keystroke: {exc}")
 
 
 def _nav(ctx: "Context", forward: bool) -> None:

@@ -9,7 +9,7 @@ import threading
 from pathlib import Path
 
 from code_trip2 import earcon
-from code_trip2.chords import handle_chord
+from code_trip2.chords import handle_chord, handle_tap
 from code_trip2.config import Config, load_config
 from code_trip2.macropad import Macropad, resolve_key
 from code_trip2.modes import Context, handle_voice
@@ -64,6 +64,12 @@ def run(config: Config) -> None:
         except Exception:
             logger.exception("chord %s failed", name)
 
+    def on_tap(name: str) -> None:
+        try:
+            handle_tap(ctx, name)
+        except Exception:
+            logger.exception("tap %s failed", name)
+
     macropad = Macropad(
         keymap={
             "ptt": resolve_key(config.ptt_key),
@@ -74,6 +80,7 @@ def run(config: Config) -> None:
         },
         on_audio=on_audio,
         on_chord=on_chord,
+        on_tap=on_tap,
         sample_rate=config.sample_rate,
         device=config.audio_device,
     )
