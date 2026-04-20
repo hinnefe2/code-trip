@@ -40,6 +40,8 @@ DEFAULT_OUTPUT_DIR = Path("/tmp/code-trip-audio")
 
 LOGICAL_KEYS = ("ptt", "act", "yes", "no", "nav")
 
+MIN_RECORDING_SECONDS = 0.2
+
 
 class MacropadError(Exception):
     pass
@@ -159,6 +161,14 @@ class Macropad:
             self._frames = []
 
         audio = np.concatenate(frames) if frames else np.empty(0, dtype="int16")
+        min_samples = int(MIN_RECORDING_SECONDS * self.sample_rate)
+        if audio.size < min_samples:
+            logger.warning(
+                "PTT recording too short (%.3fs); ignoring. Hold PTT for at least %.2fs.",
+                audio.size / self.sample_rate,
+                MIN_RECORDING_SECONDS,
+            )
+            return
         self.output_dir.mkdir(parents=True, exist_ok=True)
         path = self.output_dir / f"rec_{time.strftime('%Y%m%d-%H%M%S')}.wav"
         with wave.open(str(path), "wb") as wf:
