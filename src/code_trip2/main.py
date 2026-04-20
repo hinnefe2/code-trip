@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import signal
 import sys
 import threading
 from pathlib import Path
@@ -85,16 +86,21 @@ def run(config: Config) -> None:
         device=config.audio_device,
     )
 
+    def _handle_signal(signum: int, _frame: object) -> None:
+        logger.info("Received signal %d; shutting down.", signum)
+        shutdown.set()
+
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+
     logger.info(
-        "Starting code-trip. PTT=%s NAV=%s (hold NAV + key for chords).",
+        "Starting code-trip. PTT=%s NAV=%s (hold NAV + key for chords). Ctrl-C to quit.",
         config.ptt_key,
         config.nav_key,
     )
     macropad.start()
     try:
         shutdown.wait()
-    except KeyboardInterrupt:
-        pass
     finally:
         macropad.stop()
         thinking.stop()
