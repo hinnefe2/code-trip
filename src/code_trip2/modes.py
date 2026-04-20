@@ -3,6 +3,7 @@
 Modes reflect the *surface being interacted with*, not workflow phase:
 
 - IDLE        — no mode active; PTT routes by keyword (mode changes, status)
+- DICTATE     — paste transcript into the frontmost macOS app
 - NAVIGATING  — choosing tmux windows/panes
 - WORK        — voice ↔ remote Claude in the active pane
 - LINEAR      — ticket list via a dedicated pane running `claude -p ...`
@@ -20,7 +21,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from code_trip2 import earcon, remote
+from code_trip2 import earcon, remote, window
 from code_trip2.config import Config
 from code_trip2.session_log import SessionLogger
 from code_trip2.tts_client import TTSClient, TTSClientError
@@ -30,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 # --- Context ---------------------------------------------------------------
 
-MODES = ("IDLE", "NAVIGATING", "WORK", "LINEAR", "SLACK")
+MODES = ("IDLE", "DICTATE", "NAVIGATING", "WORK", "LINEAR", "SLACK")
 
 
 @dataclass
@@ -39,7 +40,7 @@ class Context:
     tts: TTSClient
     log: SessionLogger
     thinking: earcon.Thinking
-    mode: str = "IDLE"
+    mode: str = ""
     # WORK state
     active_window: str = ""
     # LINEAR state
@@ -47,6 +48,8 @@ class Context:
     ticket_index: int = 0
 
     def __post_init__(self) -> None:
+        if not self.mode:
+            self.mode = self.config.default_mode
         if not self.active_window:
             self.active_window = self.config.work_window
 
@@ -71,6 +74,8 @@ def handle_voice(ctx: Context, transcript: str) -> None:
 
     if ctx.mode == "WORK":
         _work_voice(ctx, t)
+    elif ctx.mode == "DICTATE":
+        _dictate_voice(ctx, t)
     elif ctx.mode == "NAVIGATING":
         _nav_voice(ctx, t)
     elif ctx.mode == "LINEAR":
@@ -87,10 +92,11 @@ def handle_voice(ctx: Context, transcript: str) -> None:
 
 _MODE_PHRASES: dict[str, tuple[str, ...]] = {
     "WORK": ("work mode", "switch to work", "start working"),
-    "NAVIGATING": ("navigate", "navigation mode", "switch windows"),
+    "DICTATE": ("dictation mode", "dictate mode", "switch to dictate"),
+    "NAVIGATING": ("navigation mode", "switch windows"),
     "LINEAR": ("linear mode", "list tickets", "show tickets", "my tickets"),
     "SLACK": ("slack mode", "check slack", "read slack"),
-    "IDLE": ("idle", "go idle", "exit mode"),
+    "IDLE": ("idle mode", "go idle", "exit mode"),
 }
 
 
@@ -133,6 +139,18 @@ def _try_global_commands(ctx: Context, t: str) -> bool:
         _speak(ctx, f"{ctx.mode.lower()} mode. Active window: {ctx.active_window}.")
         return True
     return False
+
+
+# --- DICTATE ---------------------------------------------------------------
+
+
+def _dictate_voice(ctx: Context, t: str) -> None:
+    try:
+        window.paste_text(t)
+    except window.WindowError as exc:
+        _report_error(ctx, f"Could not paste: {exc}")
+        return
+    ctx.log.event("turn", mode="DICTATE", transcript=t)
 
 
 # --- WORK ------------------------------------------------------------------

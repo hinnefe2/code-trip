@@ -104,3 +104,25 @@ def _send_chord(controller: keyboard.Controller, chord: Chord) -> None:
     finally:
         for m in reversed(chord.modifiers):
             controller.release(m)
+
+
+_PASTE_STROKE = KeyStroke(chords=(Chord(modifiers=(keyboard.Key.cmd,), key="v"),))
+
+
+def paste_text(text: str) -> None:
+    """Copy text to clipboard, then Cmd+V into the frontmost app (macOS)."""
+    if sys.platform != "darwin":
+        raise WindowError("paste_text is macOS-only")
+    if not text:
+        return
+    try:
+        subprocess.run(
+            ["pbcopy"],
+            input=text.encode("utf-8"),
+            check=True,
+            timeout=_OSASCRIPT_TIMEOUT,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        raise WindowError(f"Could not copy to clipboard: {exc}") from exc
+    time.sleep(0.05)
+    send_keystroke(_PASTE_STROKE)

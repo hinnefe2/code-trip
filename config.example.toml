@@ -1,8 +1,15 @@
 # code-trip orchestrator config — copy to config.toml and edit.
 
+[mode]
+# IDLE | DICTATE | WORK | NAVIGATING | LINEAR | SLACK
+# DICTATE pastes the STT transcript into the frontmost macOS app and
+# needs no ssh/tmux config. Other modes drive a remote Claude session.
+default = "DICTATE"
+
 [ssh]
-host = "user@remote-host"
-# options = ["-p", "2222"]   # extra ssh args (optional)
+# Required for WORK / NAVIGATING / LINEAR modes. Leave empty for DICTATE-only use.
+# host = "user@remote-host"
+# options = ["-p", "2222"]
 
 [tmux]
 session = "claude"

@@ -19,8 +19,8 @@ class ConfigError(Exception):
 
 @dataclass(frozen=True)
 class Config:
-    # ssh + tmux
-    ssh_host: str
+    # ssh + tmux (only needed for modes that drive a remote Claude)
+    ssh_host: str = ""
     ssh_options: tuple[str, ...] = ()
     tmux_session: str = "main"
     work_window: str = "work"
@@ -35,6 +35,8 @@ class Config:
     no_key: str = "f16"
     nav_key: str = "f17"
     app_cycle: tuple[str, ...] = ("kitty", "Google Chrome", "Slack")
+    # mode
+    default_mode: str = "IDLE"
     # openai
     api_key: str | None = None
     stt_model: str = "whisper-1"
@@ -59,14 +61,12 @@ def load_config(path: Path | str) -> Config:
     tmux = data.get("tmux", {})
     audio = data.get("audio", {})
     macropad = data.get("macropad", {})
+    mode = data.get("mode", {})
     openai = data.get("openai", {})
     claude = data.get("claude", {})
 
-    if "host" not in ssh:
-        raise ConfigError("Missing required field: ssh.host")
-
     return Config(
-        ssh_host=ssh["host"],
+        ssh_host=ssh.get("host", ""),
         ssh_options=tuple(ssh.get("options", ())),
         tmux_session=tmux.get("session", "main"),
         work_window=tmux.get("work_window", tmux.get("window", "work")),
@@ -79,6 +79,7 @@ def load_config(path: Path | str) -> Config:
         no_key=macropad.get("no_key", "f16"),
         nav_key=macropad.get("nav_key", "f17"),
         app_cycle=tuple(macropad.get("app_cycle", ("kitty", "Google Chrome", "Slack"))),
+        default_mode=mode.get("default", "IDLE"),
         api_key=openai.get("api_key") or os.environ.get("OPENAI_API_KEY"),
         stt_model=openai.get("stt_model", "whisper-1"),
         tts_model=openai.get("tts_model", "gpt-4o-mini-tts"),
