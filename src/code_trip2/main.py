@@ -9,8 +9,9 @@ import threading
 from pathlib import Path
 
 from code_trip2 import earcon
-from code_trip2.audio import PushToTalk, resolve_hotkey
+from code_trip2.chords import handle_chord
 from code_trip2.config import Config, load_config
+from code_trip2.macropad import Macropad, resolve_key
 from code_trip2.modes import Context, handle_voice
 from code_trip2.session_log import SessionLogger, default_session_path
 from code_trip2.stt_client import STTClient, STTClientError
@@ -28,6 +29,7 @@ def run(config: Config) -> None:
         "stt_model": config.stt_model,
         "tts_model": config.tts_model,
         "tts_voice": config.tts_voice,
+        "app_cycle": list(config.app_cycle),
     })
 
     stt = STTClient(api_key=config.api_key, model=config.stt_model)
@@ -56,21 +58,38 @@ def run(config: Config) -> None:
         logger.info("Transcribed: %s", transcript)
         handle_voice(ctx, transcript)
 
-    ptt = PushToTalk(
-        hotkey=resolve_hotkey(config.hotkey),
+    def on_chord(name: str) -> None:
+        try:
+            handle_chord(ctx, name)
+        except Exception:
+            logger.exception("chord %s failed", name)
+
+    macropad = Macropad(
+        keymap={
+            "ptt": resolve_key(config.ptt_key),
+            "act": resolve_key(config.act_key),
+            "yes": resolve_key(config.yes_key),
+            "no": resolve_key(config.no_key),
+            "nav": resolve_key(config.nav_key),
+        },
         on_audio=on_audio,
+        on_chord=on_chord,
         sample_rate=config.sample_rate,
         device=config.audio_device,
     )
 
-    logger.info("Starting code-trip. Hold %s to talk.", config.hotkey)
-    ptt.start()
+    logger.info(
+        "Starting code-trip. PTT=%s NAV=%s (hold NAV + key for chords).",
+        config.ptt_key,
+        config.nav_key,
+    )
+    macropad.start()
     try:
         shutdown.wait()
     except KeyboardInterrupt:
         pass
     finally:
-        ptt.stop()
+        macropad.stop()
         thinking.stop()
         log.close()
 

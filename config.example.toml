@@ -11,7 +11,17 @@ window = "main"
 [audio]
 sample_rate = 16000
 # device = 2            # mic device index from `python -m sounddevice` (optional)
-hotkey = "f13"          # pynput Key attribute name
+
+[macropad]
+# Physical macropad layout, left-to-right: PTT, ACT, YES, NO, NAV.
+# Values are pynput Key attribute names (typically f13-f17).
+ptt_key = "f13"
+act_key = "f14"
+yes_key = "f15"
+no_key  = "f16"
+nav_key = "f17"
+# Hold NAV + ACT to rotate through these frontmost apps:
+app_cycle = ["kitty", "Google Chrome", "Slack"]
 
 [openai]
 # api_key = "sk-..."    # falls back to OPENAI_API_KEY env var

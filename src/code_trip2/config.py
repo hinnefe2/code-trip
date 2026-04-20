@@ -28,7 +28,13 @@ class Config:
     # audio
     sample_rate: int = 16_000
     audio_device: int | str | None = None
-    hotkey: str = "f13"
+    # macropad
+    ptt_key: str = "f13"
+    act_key: str = "f14"
+    yes_key: str = "f15"
+    no_key: str = "f16"
+    nav_key: str = "f17"
+    app_cycle: tuple[str, ...] = ("kitty", "Google Chrome", "Slack")
     # openai
     api_key: str | None = None
     stt_model: str = "whisper-1"
@@ -52,6 +58,7 @@ def load_config(path: Path | str) -> Config:
     ssh = data.get("ssh", {})
     tmux = data.get("tmux", {})
     audio = data.get("audio", {})
+    macropad = data.get("macropad", {})
     openai = data.get("openai", {})
     claude = data.get("claude", {})
 
@@ -66,7 +73,12 @@ def load_config(path: Path | str) -> Config:
         linear_window=tmux.get("linear_window", "linear"),
         sample_rate=audio.get("sample_rate", 16_000),
         audio_device=audio.get("device"),
-        hotkey=audio.get("hotkey", "f13"),
+        ptt_key=macropad.get("ptt_key", "f13"),
+        act_key=macropad.get("act_key", "f14"),
+        yes_key=macropad.get("yes_key", "f15"),
+        no_key=macropad.get("no_key", "f16"),
+        nav_key=macropad.get("nav_key", "f17"),
+        app_cycle=tuple(macropad.get("app_cycle", ("kitty", "Google Chrome", "Slack"))),
         api_key=openai.get("api_key") or os.environ.get("OPENAI_API_KEY"),
         stt_model=openai.get("stt_model", "whisper-1"),
         tts_model=openai.get("tts_model", "gpt-4o-mini-tts"),
