@@ -6,6 +6,7 @@ import argparse
 import logging
 import signal
 import sys
+import termios
 import threading
 from pathlib import Path
 
@@ -19,6 +20,28 @@ from code_trip2.stt_client import STTClient, STTClientError
 from code_trip2.tts_client import TTSClient
 
 logger = logging.getLogger(__name__)
+
+
+def _suppress_echo() -> list | None:
+    """Disable tty echo so terminals like kitty don't dump F-key escape codes."""
+    try:
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        new = termios.tcgetattr(fd)
+        new[3] &= ~termios.ECHO
+        termios.tcsetattr(fd, termios.TCSADRAIN, new)
+        return old
+    except (termios.error, ValueError):
+        return None
+
+
+def _restore_echo(old: list | None) -> None:
+    if old is None:
+        return
+    try:
+        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old)
+    except (termios.error, ValueError):
+        pass
 
 
 def run(config: Config) -> None:
@@ -98,6 +121,7 @@ def run(config: Config) -> None:
         config.ptt_key,
         config.nav_key,
     )
+    old_term = _suppress_echo()
     macropad.start()
     try:
         shutdown.wait()
@@ -105,6 +129,7 @@ def run(config: Config) -> None:
         macropad.stop()
         thinking.stop()
         log.close()
+        _restore_echo(old_term)
 
 
 def main(argv: list[str] | None = None) -> int:
