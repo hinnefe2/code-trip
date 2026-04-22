@@ -50,7 +50,13 @@ class Config:
     wait_timeout: float = 300.0
 
 
+def _select(src: dict, *fields: str) -> dict:
+    """Pick fields from src only if present. Used when TOML keys == dataclass field names."""
+    return {k: src[k] for k in fields if k in src}
+
+
 def load_config(path: Path | str) -> Config:
+    """Load a TOML config, letting the Config dataclass supply any missing defaults."""
     path = Path(path)
     if not path.exists():
         raise ConfigError(f"Config file not found: {path}")
@@ -67,30 +73,51 @@ def load_config(path: Path | str) -> Config:
     mode = data.get("mode", {})
     stt = data.get("stt", {})
     stt_local = stt.get("local", {})
-    openai = data.get("openai", {})
+    openai_ = data.get("openai", {})
     claude = data.get("claude", {})
 
-    return Config(
-        ssh_host=ssh.get("host", ""),
-        ssh_options=tuple(ssh.get("options", ())),
-        tmux_session=tmux.get("session", "main"),
-        work_window=tmux.get("work_window", tmux.get("window", "work")),
-        linear_window=tmux.get("linear_window", "linear"),
-        sample_rate=audio.get("sample_rate", 16_000),
-        audio_device=audio.get("device"),
-        ptt_key=macropad.get("ptt_key", "f13"),
-        yes_key=macropad.get("yes_key", "f14"),
-        no_key=macropad.get("no_key", "f15"),
-        act_key=macropad.get("act_key", "f16"),
-        nav_key=macropad.get("nav_key", "f17"),
-        app_cycle=tuple(macropad.get("app_cycle", ("kitty", "Google Chrome", "Slack"))),
-        default_mode=mode.get("default", "IDLE"),
-        stt_provider=stt.get("provider", "openai"),
-        stt_local_hotkey=stt_local.get("hotkey", "home"),
-        api_key=openai.get("api_key") or os.environ.get("OPENAI_API_KEY"),
-        stt_model=openai.get("stt_model", "whisper-1"),
-        tts_model=openai.get("tts_model", "gpt-4o-mini-tts"),
-        tts_voice=openai.get("tts_voice", "nova"),
-        tts_speed=openai.get("tts_speed", 1.15),
-        wait_timeout=claude.get("wait_timeout", 300.0),
-    )
+    kw: dict[str, object] = {}
+
+    # ssh / tmux / audio — TOML keys differ from field names
+    if "host" in ssh:
+        kw["ssh_host"] = ssh["host"]
+    if "options" in ssh:
+        kw["ssh_options"] = tuple(ssh["options"])
+    if "session" in tmux:
+        kw["tmux_session"] = tmux["session"]
+    # "window" is a legacy alias for work_window
+    if "work_window" in tmux:
+        kw["work_window"] = tmux["work_window"]
+    elif "window" in tmux:
+        kw["work_window"] = tmux["window"]
+    if "linear_window" in tmux:
+        kw["linear_window"] = tmux["linear_window"]
+    if "sample_rate" in audio:
+        kw["sample_rate"] = audio["sample_rate"]
+    if "device" in audio:
+        kw["audio_device"] = audio["device"]
+
+    # macropad — TOML keys match field names
+    kw.update(_select(macropad, "ptt_key", "yes_key", "no_key", "act_key", "nav_key"))
+    if "app_cycle" in macropad:
+        kw["app_cycle"] = tuple(macropad["app_cycle"])
+
+    # mode / stt — renames
+    if "default" in mode:
+        kw["default_mode"] = mode["default"]
+    if "provider" in stt:
+        kw["stt_provider"] = stt["provider"]
+    if "hotkey" in stt_local:
+        kw["stt_local_hotkey"] = stt_local["hotkey"]
+
+    # openai — mostly direct match; api_key has env-var fallback
+    kw.update(_select(openai_, "stt_model", "tts_model", "tts_voice", "tts_speed"))
+    api_key = openai_.get("api_key") or os.environ.get("OPENAI_API_KEY")
+    if api_key:
+        kw["api_key"] = api_key
+
+    # claude
+    if "wait_timeout" in claude:
+        kw["wait_timeout"] = claude["wait_timeout"]
+
+    return Config(**kw)
