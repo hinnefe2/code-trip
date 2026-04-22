@@ -258,14 +258,14 @@ def test_chord_ptt_speaks_active_app(monkeypatch):
     ctx.tts.speak.assert_called_once_with("Google Chrome")
 
 
-def test_tap_yes_sends_digit_1(monkeypatch):
+def test_tap_yes_sends_enter(monkeypatch):
     ctx = _ctx()
     sent: list[KeyStroke] = []
     monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
 
     chords.handle_tap(ctx, "yes")
     assert sent == [chords._TAP_YES]
-    assert sent[0].chords[0].key == "1"
+    assert sent[0].chords[0].key == keyboard.Key.enter
 
 
 def test_tap_no_sends_escape(monkeypatch):

@@ -65,8 +65,8 @@ APP_NAV: dict[str, tuple[KeyStroke, KeyStroke]] = {
 
 
 # Solo taps — typed into whatever app currently has focus.
-# YES answers Claude Code's default-accept prompt (option 1); NO sends Esc to cancel.
-_TAP_YES = KeyStroke(chords=(Chord(key="1"),))
+# YES = Enter (default-accept in most prompts); NO = Esc (cancel).
+_TAP_YES = KeyStroke(chords=(Chord(key=keyboard.Key.enter),))
 _TAP_NO = KeyStroke(chords=(Chord(key=keyboard.Key.esc),))
 
 TAP_STROKES: dict[str, KeyStroke] = {
