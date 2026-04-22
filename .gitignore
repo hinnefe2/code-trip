@@ -134,6 +134,9 @@ celerybeat.pid
 # SageMath parsed files
 *.sage.py
 
+# Local config (may contain secrets; config.example.toml is the tracked template)
+config.toml
+
 # Environments
 .env
 .envrc
