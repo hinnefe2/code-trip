@@ -143,6 +143,30 @@ def test_nav_modifier_suppresses_tap(monkeypatch):
     assert rec.taps == []
 
 
+def test_act_plus_no_fires_chord(monkeypatch):
+    pad, rec, *_ = _make(monkeypatch)
+    pad._on_press(keyboard.Key.f14)  # ACT
+    pad._on_press(keyboard.Key.f16)  # NO under ACT
+    assert rec.chords == ["act+no"]
+    assert rec.taps == []
+
+
+def test_act_plus_yes_is_noop(monkeypatch):
+    pad, rec, *_ = _make(monkeypatch)
+    pad._on_press(keyboard.Key.f14)  # ACT
+    pad._on_press(keyboard.Key.f15)  # YES under ACT (no mapping)
+    assert rec.chords == []
+    assert rec.taps == []
+
+
+def test_nav_beats_act_when_both_held(monkeypatch):
+    pad, rec, *_ = _make(monkeypatch)
+    pad._on_press(keyboard.Key.f17)  # NAV
+    pad._on_press(keyboard.Key.f14)  # ACT under NAV → fires nav+act
+    pad._on_press(keyboard.Key.f16)  # NO under NAV+ACT → should be nav+no, not act+no
+    assert rec.chords == ["nav+act", "nav+no"]
+
+
 # --- forward-key (local STT) mode -----------------------------------------
 
 
@@ -337,6 +361,18 @@ def test_tap_no_sends_escape(monkeypatch):
     chords.handle_tap(ctx, "no")
     assert sent == [chords._TAP_NO]
     assert sent[0].chords[0].key == keyboard.Key.esc
+
+
+def test_chord_act_no_sends_ctrl_u(monkeypatch):
+    ctx = _ctx()
+    sent: list[KeyStroke] = []
+    monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
+
+    chords.handle_chord(ctx, "act+no")
+    assert sent == [chords._ACT_NO_CLEAR_LINE]
+    stroke = sent[0].chords[0]
+    assert stroke.key == "u"
+    assert stroke.modifiers == (keyboard.Key.ctrl,)
 
 
 def test_tap_unknown_is_noop(monkeypatch):

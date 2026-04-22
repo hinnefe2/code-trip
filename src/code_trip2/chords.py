@@ -69,6 +69,9 @@ APP_NAV: dict[str, tuple[KeyStroke, KeyStroke]] = {
 _TAP_YES = KeyStroke(chords=(Chord(key=keyboard.Key.enter),))
 _TAP_NO = KeyStroke(chords=(Chord(key=keyboard.Key.esc),))
 
+# ACT+NO = Ctrl+U (clear line to start in shell / readline inputs).
+_ACT_NO_CLEAR_LINE = KeyStroke(chords=(Chord(modifiers=(keyboard.Key.ctrl,), key="u"),))
+
 TAP_STROKES: dict[str, KeyStroke] = {
     "yes": _TAP_YES,
     "no": _TAP_NO,
@@ -84,8 +87,17 @@ def handle_chord(ctx: "Context", name: str) -> None:
         _cycle_app(ctx)
     elif name == "nav+ptt":
         _speak_active_app(ctx)
+    elif name == "act+no":
+        _send_stroke(ctx, _ACT_NO_CLEAR_LINE)
     else:
         logger.warning("Unknown chord: %s", name)
+
+
+def _send_stroke(ctx: "Context", stroke: KeyStroke) -> None:
+    try:
+        window.send_keystroke(stroke)
+    except Exception as exc:
+        _speak_error(ctx, f"Could not send keystroke: {exc}")
 
 
 def handle_tap(ctx: "Context", name: str) -> None:

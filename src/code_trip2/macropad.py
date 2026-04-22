@@ -11,8 +11,11 @@ currently held. Behavior:
                               ``ptt_forward_key``).
   - NAV held + PTT tap      → ``on_chord("nav+ptt")`` (no recording/forward).
   - NAV held + YES/NO/ACT   → ``on_chord("nav+yes" | "nav+no" | "nav+act")``.
+  - ACT held + NO           → ``on_chord("act+no")`` (clear-line Ctrl+U).
   - YES or NO tapped alone  → ``on_tap("yes" | "no")``.
   - Everything else         → no-op.
+
+  NAV takes precedence over ACT when both are held.
 
 Callbacks run on the pynput listener thread; keep them fast or hand off
 to another thread.
@@ -114,6 +117,7 @@ class Macropad:
         self._held.add(name)
 
         nav_modifier = "nav" in self._held and name != "nav"
+        act_modifier = "act" in self._held and name != "act"
         if name == "ptt":
             if nav_modifier:
                 self._fire_chord("nav+ptt")
@@ -123,6 +127,10 @@ class Macropad:
                 self._start_recording()
         elif name in ("yes", "no", "act") and nav_modifier:
             self._fire_chord(f"nav+{name}")
+        elif name == "no" and act_modifier:
+            self._fire_chord("act+no")
+        elif name in ("yes", "no") and act_modifier:
+            pass  # ACT held but no matching chord; swallow to avoid stray tap
         elif name in ("yes", "no") and self.on_tap is not None:
             self._fire_tap(name)
 
