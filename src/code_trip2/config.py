@@ -28,11 +28,11 @@ class Config:
     # audio
     sample_rate: int = 16_000
     audio_device: int | str | None = None
-    # macropad
+    # macropad — physical layout left-to-right: PTT, YES, NO, ACT, NAV
     ptt_key: str = "f13"
-    act_key: str = "f14"
-    yes_key: str = "f15"
-    no_key: str = "f16"
+    yes_key: str = "f14"
+    no_key: str = "f15"
+    act_key: str = "f16"
     nav_key: str = "f17"
     app_cycle: tuple[str, ...] = ("kitty", "Google Chrome", "Slack")
     # mode
@@ -79,9 +79,9 @@ def load_config(path: Path | str) -> Config:
         sample_rate=audio.get("sample_rate", 16_000),
         audio_device=audio.get("device"),
         ptt_key=macropad.get("ptt_key", "f13"),
-        act_key=macropad.get("act_key", "f14"),
-        yes_key=macropad.get("yes_key", "f15"),
-        no_key=macropad.get("no_key", "f16"),
+        yes_key=macropad.get("yes_key", "f14"),
+        no_key=macropad.get("no_key", "f15"),
+        act_key=macropad.get("act_key", "f16"),
         nav_key=macropad.get("nav_key", "f17"),
         app_cycle=tuple(macropad.get("app_cycle", ("kitty", "Google Chrome", "Slack"))),
         default_mode=mode.get("default", "IDLE"),
