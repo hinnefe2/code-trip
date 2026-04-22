@@ -37,6 +37,9 @@ class Config:
     app_cycle: tuple[str, ...] = ("kitty", "Google Chrome", "Slack")
     # mode
     default_mode: str = "IDLE"
+    # stt
+    stt_provider: str = "openai"        # "openai" | "local"
+    stt_local_hotkey: str = "home"      # pynput Key name forwarded while PTT is held
     # openai
     api_key: str | None = None
     stt_model: str = "whisper-1"
@@ -62,6 +65,8 @@ def load_config(path: Path | str) -> Config:
     audio = data.get("audio", {})
     macropad = data.get("macropad", {})
     mode = data.get("mode", {})
+    stt = data.get("stt", {})
+    stt_local = stt.get("local", {})
     openai = data.get("openai", {})
     claude = data.get("claude", {})
 
@@ -80,6 +85,8 @@ def load_config(path: Path | str) -> Config:
         nav_key=macropad.get("nav_key", "f17"),
         app_cycle=tuple(macropad.get("app_cycle", ("kitty", "Google Chrome", "Slack"))),
         default_mode=mode.get("default", "IDLE"),
+        stt_provider=stt.get("provider", "openai"),
+        stt_local_hotkey=stt_local.get("hotkey", "home"),
         api_key=openai.get("api_key") or os.environ.get("OPENAI_API_KEY"),
         stt_model=openai.get("stt_model", "whisper-1"),
         tts_model=openai.get("tts_model", "gpt-4o-mini-tts"),

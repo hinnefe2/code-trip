@@ -4,9 +4,12 @@ Replaces the old single-key ``PushToTalk``. One pynput listener watches
 all five logical keys (PTT, ACT, YES, NO, NAV) and tracks which are
 currently held. Behavior:
 
-  - PTT pressed alone       → start mic stream.
-  - PTT released            → close stream, write WAV, call ``on_audio``.
-  - NAV held + PTT tap      → ``on_chord("nav+ptt")`` (no recording).
+  - PTT pressed alone       → start mic stream (or press ``ptt_forward_key``
+                              if set, letting a local STT like Superwhisper
+                              handle the recording).
+  - PTT released            → close stream + call ``on_audio`` (or release
+                              ``ptt_forward_key``).
+  - NAV held + PTT tap      → ``on_chord("nav+ptt")`` (no recording/forward).
   - NAV held + YES/NO/ACT   → ``on_chord("nav+yes" | "nav+no" | "nav+act")``.
   - YES or NO tapped alone  → ``on_tap("yes" | "no")``.
   - Everything else         → no-op.
@@ -60,6 +63,7 @@ class Macropad:
     on_audio: Callable[[Path], None]
     on_chord: Callable[[str], None]
     on_tap: Callable[[str], None] | None = None
+    ptt_forward_key: keyboard.Key | keyboard.KeyCode | None = None
     sample_rate: int = 16_000
     device: int | str | None = None
     output_dir: Path = field(default_factory=lambda: DEFAULT_OUTPUT_DIR)
@@ -67,6 +71,8 @@ class Macropad:
     _stream: "sd.InputStream | None" = field(default=None, init=False, repr=False)
     _frames: list[np.ndarray] = field(default_factory=list, init=False, repr=False)
     _recording: bool = field(default=False, init=False, repr=False)
+    _forwarding: bool = field(default=False, init=False, repr=False)
+    _controller: keyboard.Controller | None = field(default=None, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _listener: keyboard.Listener | None = field(default=None, init=False, repr=False)
     _reverse: dict[object, str] = field(default_factory=dict, init=False, repr=False)
@@ -94,6 +100,7 @@ class Macropad:
             self._listener = None
         with self._lock:
             self._stop_stream_locked()
+        self._release_forward_if_held()
         self._held.clear()
 
     # --- key callbacks ----------------------------------------------------
@@ -110,6 +117,8 @@ class Macropad:
         if name == "ptt":
             if nav_modifier:
                 self._fire_chord("nav+ptt")
+            elif self.ptt_forward_key is not None:
+                self._press_forward()
             else:
                 self._start_recording()
         elif name in ("yes", "no", "act") and nav_modifier:
@@ -123,7 +132,10 @@ class Macropad:
             return
         self._held.discard(name)
         if name == "ptt":
-            self._finish_recording()
+            if self._forwarding:
+                self._release_forward_if_held()
+            else:
+                self._finish_recording()
 
     # --- audio ------------------------------------------------------------
 
@@ -193,6 +205,32 @@ class Macropad:
 
     def _audio_cb(self, indata: np.ndarray, frames: int, time_info: object, status: object) -> None:
         self._frames.append(indata.copy())
+
+    # --- forward-key (local STT) -----------------------------------------
+
+    def _get_controller(self) -> keyboard.Controller:
+        if self._controller is None:
+            self._controller = keyboard.Controller()
+        return self._controller
+
+    def _press_forward(self) -> None:
+        if self._forwarding or self.ptt_forward_key is None:
+            return
+        try:
+            self._get_controller().press(self.ptt_forward_key)
+            self._forwarding = True
+        except Exception:
+            logger.exception("Failed to press forward key")
+
+    def _release_forward_if_held(self) -> None:
+        if not self._forwarding or self.ptt_forward_key is None:
+            return
+        try:
+            self._get_controller().release(self.ptt_forward_key)
+        except Exception:
+            logger.exception("Failed to release forward key")
+        finally:
+            self._forwarding = False
 
     # --- chord ------------------------------------------------------------
 

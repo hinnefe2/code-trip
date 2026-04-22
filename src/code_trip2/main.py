@@ -56,7 +56,11 @@ def run(config: Config) -> None:
         "app_cycle": list(config.app_cycle),
     })
 
-    stt = STTClient(api_key=config.api_key, model=config.stt_model)
+    stt: STTClient | None = None
+    if config.stt_provider == "openai":
+        stt = STTClient(api_key=config.api_key, model=config.stt_model)
+    else:
+        logger.info("STT provider=%s; bypassing OpenAI STT.", config.stt_provider)
     tts = TTSClient(
         api_key=config.api_key,
         model=config.tts_model,
@@ -69,6 +73,9 @@ def run(config: Config) -> None:
     shutdown = threading.Event()
 
     def on_audio(path: Path) -> None:
+        if stt is None:
+            logger.warning("on_audio fired in non-openai STT mode; ignoring %s", path)
+            return
         try:
             transcript = stt.transcribe(path)
         except STTClientError as exc:
@@ -94,6 +101,9 @@ def run(config: Config) -> None:
         except Exception:
             logger.exception("tap %s failed", name)
 
+    ptt_forward_key = (
+        resolve_key(config.stt_local_hotkey) if config.stt_provider == "local" else None
+    )
     macropad = Macropad(
         keymap={
             "ptt": resolve_key(config.ptt_key),
@@ -105,6 +115,7 @@ def run(config: Config) -> None:
         on_audio=on_audio,
         on_chord=on_chord,
         on_tap=on_tap,
+        ptt_forward_key=ptt_forward_key,
         sample_rate=config.sample_rate,
         device=config.audio_device,
     )
@@ -116,9 +127,14 @@ def run(config: Config) -> None:
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
+    ptt_desc = (
+        f"{config.ptt_key} (forwards to {config.stt_local_hotkey})"
+        if ptt_forward_key is not None
+        else f"{config.ptt_key} (OpenAI STT)"
+    )
     logger.info(
         "Starting code-trip. PTT=%s NAV=%s (hold NAV + key for chords). Ctrl-C to quit.",
-        config.ptt_key,
+        ptt_desc,
         config.nav_key,
     )
     old_term = _suppress_echo()

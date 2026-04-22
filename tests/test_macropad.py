@@ -143,6 +143,67 @@ def test_nav_modifier_suppresses_tap(monkeypatch):
     assert rec.taps == []
 
 
+# --- forward-key (local STT) mode -----------------------------------------
+
+
+def _make_forward(monkeypatch: pytest.MonkeyPatch):
+    rec = Recorder()
+    controller = MagicMock()
+    pad = Macropad(
+        keymap=KEYMAP,
+        on_audio=rec.on_audio,
+        on_chord=rec.on_chord,
+        on_tap=rec.on_tap,
+        ptt_forward_key=keyboard.Key.home,
+    )
+    monkeypatch.setattr(pad, "_get_controller", lambda: controller)
+    start_stub = MagicMock()
+    finish_stub = MagicMock()
+    monkeypatch.setattr(pad, "_start_recording", start_stub)
+    monkeypatch.setattr(pad, "_finish_recording", finish_stub)
+    return pad, rec, controller, start_stub, finish_stub
+
+
+def test_forward_mode_presses_and_releases_key(monkeypatch):
+    pad, rec, controller, start, finish = _make_forward(monkeypatch)
+
+    pad._on_press(keyboard.Key.f13)
+    controller.press.assert_called_once_with(keyboard.Key.home)
+    start.assert_not_called()
+    assert pad._forwarding is True
+
+    pad._on_release(keyboard.Key.f13)
+    controller.release.assert_called_once_with(keyboard.Key.home)
+    finish.assert_not_called()
+    assert pad._forwarding is False
+
+
+def test_forward_mode_no_audio_callback(monkeypatch):
+    pad, rec, *_ = _make_forward(monkeypatch)
+    pad._on_press(keyboard.Key.f13)
+    pad._on_release(keyboard.Key.f13)
+    assert rec.audio == []
+
+
+def test_nav_plus_ptt_in_forward_mode_fires_chord_no_press(monkeypatch):
+    pad, rec, controller, *_ = _make_forward(monkeypatch)
+    pad._on_press(keyboard.Key.f17)  # NAV
+    pad._on_press(keyboard.Key.f13)  # PTT while NAV held
+    assert rec.chords == ["nav+ptt"]
+    controller.press.assert_not_called()
+    pad._on_release(keyboard.Key.f13)
+    controller.release.assert_not_called()
+
+
+def test_stop_releases_forwarded_key(monkeypatch):
+    pad, rec, controller, *_ = _make_forward(monkeypatch)
+    pad._on_press(keyboard.Key.f13)
+    assert pad._forwarding is True
+    pad.stop()
+    controller.release.assert_called_once_with(keyboard.Key.home)
+    assert pad._forwarding is False
+
+
 def test_key_repeat_ignored(monkeypatch):
     pad, rec, *_ = _make(monkeypatch)
     pad._on_press(keyboard.Key.f17)

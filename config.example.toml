@@ -30,6 +30,15 @@ nav_key = "f17"
 # Hold NAV + ACT to rotate through these frontmost apps:
 app_cycle = ["kitty", "Google Chrome", "Slack"]
 
+[stt]
+# "openai" (default): PTT records a WAV and sends it to Whisper.
+# "local":            PTT press-and-holds stt.local.hotkey so a local STT
+#                     tool (e.g. Superwhisper) handles the recording.
+provider = "openai"
+
+[stt.local]
+hotkey = "home"          # key to forward while PTT is held (pynput Key name)
+
 [openai]
 # api_key = "sk-..."    # falls back to OPENAI_API_KEY env var
 stt_model = "whisper-1"
