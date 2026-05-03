@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ import pytest
 from pynput import keyboard
 
 from code_trip2 import chords, window
+from code_trip2 import macropad as macropad_module
 from code_trip2.macropad import Macropad
 from code_trip2.window import Chord, KeyStroke
 
@@ -143,6 +145,38 @@ def test_nav_modifier_suppresses_tap(monkeypatch):
     assert rec.taps == []
 
 
+def test_nav_tap_alone_fires_tap_on_release(monkeypatch):
+    pad, rec, *_ = _make(monkeypatch)
+    pad._on_press(keyboard.Key.f17)
+    assert rec.taps == []  # nothing yet — tap fires on release
+    pad._on_release(keyboard.Key.f17)
+    assert rec.taps == ["nav"]
+    assert rec.chords == []
+
+
+def test_nav_chord_suppresses_nav_tap(monkeypatch):
+    pad, rec, *_ = _make(monkeypatch)
+    pad._on_press(keyboard.Key.f17)  # NAV
+    pad._on_press(keyboard.Key.f15)  # YES under NAV → nav+yes
+    pad._on_release(keyboard.Key.f15)
+    pad._on_release(keyboard.Key.f17)
+    assert rec.chords == ["nav+yes"]
+    assert rec.taps == []  # NAV was used as a modifier, no nav tap
+
+
+def test_nav_tap_across_multiple_presses(monkeypatch):
+    pad, rec, *_ = _make(monkeypatch)
+    # First NAV press: used as modifier — no tap
+    pad._on_press(keyboard.Key.f17)
+    pad._on_press(keyboard.Key.f15)
+    pad._on_release(keyboard.Key.f15)
+    pad._on_release(keyboard.Key.f17)
+    # Second NAV press: solo — tap should fire
+    pad._on_press(keyboard.Key.f17)
+    pad._on_release(keyboard.Key.f17)
+    assert rec.taps == ["nav"]
+
+
 def test_act_plus_no_fires_chord(monkeypatch):
     pad, rec, *_ = _make(monkeypatch)
     pad._on_press(keyboard.Key.f14)  # ACT
@@ -243,13 +277,45 @@ def test_unmapped_key_ignored(monkeypatch):
     start.assert_not_called()
 
 
+# --- darwin_intercept (macropad-key suppression) --------------------------
+
+
+def test_darwin_intercept_suppresses_macropad_key(monkeypatch):
+    pad, _rec, *_ = _make(monkeypatch)
+    f17_vk = keyboard.Key.f17.value.vk
+    monkeypatch.setattr(macropad_module, "CGEventGetIntegerValueField", lambda e, f: f17_vk)
+    monkeypatch.setattr(macropad_module, "kCGKeyboardEventKeycode", 0)
+    assert pad._darwin_intercept(0, object()) is None
+
+
+def test_darwin_intercept_passes_through_other_keys(monkeypatch):
+    pad, _rec, *_ = _make(monkeypatch)
+    space_vk = keyboard.Key.space.value.vk
+    sentinel = object()
+    monkeypatch.setattr(macropad_module, "CGEventGetIntegerValueField", lambda e, f: space_vk)
+    monkeypatch.setattr(macropad_module, "kCGKeyboardEventKeycode", 0)
+    assert pad._darwin_intercept(0, sentinel) is sentinel
+
+
+def test_suppress_vks_covers_all_macropad_keys():
+    pad = Macropad(keymap=KEYMAP, on_audio=lambda p: None, on_chord=lambda n: None)
+    expected = {k.value.vk for k in KEYMAP.values()}
+    assert pad._suppress_vks == expected
+
+
 # --- Chord handler ---------------------------------------------------------
 
 
-def _ctx(app_cycle=("kitty", "Google Chrome", "Slack")):
+def _ctx(app_cycle=("kitty", "Google Chrome", "Slack"), *, playing=False, queue=None):
     tts = MagicMock()
+    tts.is_playing.return_value = playing
     config = SimpleNamespace(app_cycle=app_cycle)
-    return SimpleNamespace(tts=tts, config=config)
+    return SimpleNamespace(
+        tts=tts,
+        config=config,
+        playback_queue=list(queue or []),
+        _playback_lock=threading.Lock(),
+    )
 
 
 def test_chord_yes_sends_chrome_next_tab(monkeypatch):
@@ -361,6 +427,16 @@ def test_tap_no_sends_escape(monkeypatch):
     chords.handle_tap(ctx, "no")
     assert sent == [chords._TAP_NO]
     assert sent[0].chords[0].key == keyboard.Key.esc
+
+
+def test_tap_nav_sends_down(monkeypatch):
+    ctx = _ctx()
+    sent: list[KeyStroke] = []
+    monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
+
+    chords.handle_tap(ctx, "nav")
+    assert sent == [chords._TAP_NAV]
+    assert sent[0].chords[0].key == keyboard.Key.down
 
 
 def test_chord_act_no_sends_ctrl_u(monkeypatch):

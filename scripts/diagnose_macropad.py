@@ -1,26 +1,33 @@
 #!/usr/bin/env python3
-"""Macropad diagnostic: confirm F13-F17 keys are firing and classify gestures.
+"""Macropad diagnostic: confirm the five macropad keys are firing and classify gestures.
 
-Listens for all five macropad keys and prints each press/release event with
-timing and gesture classification matching the thresholds used in KeypadListener.
+Reads the same key bindings as the main app so the labels always match what
+code-trip would actually dispatch. Pass --config to load your config.toml; if
+omitted, the dataclass defaults are used (F13-F17 = PTT/YES/NO/ACT/NAV).
 
 Usage:
-    uv run python scripts/diagnose_macropad.py
+    uv run python scripts/diagnose_macropad.py                 # defaults
+    uv run python scripts/diagnose_macropad.py --config config.toml
 
 Press Ctrl+C to exit and see a per-key event summary.
 """
 
 from __future__ import annotations
 
+import argparse
 import signal
 import sys
 import termios
 import threading
 import time
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from pathlib import Path
 
 from pynput import keyboard
+
+from code_trip2.config import Config, load_config
+from code_trip2.macropad import LOGICAL_KEYS, resolve_key
 
 
 def _suppress_echo() -> list | None:
@@ -42,19 +49,20 @@ def _restore_echo(old: list) -> None:
     except termios.error:
         pass
 
-# Gesture thresholds (must match KeypadConfig in code_trip/keypad.py)
+# Gesture thresholds — pure diagnostic heuristic, not used by the main app.
 LONG_THRESHOLD = 0.5   # seconds; >= this → LONG
 HOLD_THRESHOLD = 1.5   # seconds; >= this → HOLD
 
-KEY_LABELS: dict[keyboard.Key, str] = {
-    keyboard.Key.f13: "F13 (PTT)",
-    keyboard.Key.f14: "F14 (NAV)",
-    keyboard.Key.f15: "F15 (ACT)",
-    keyboard.Key.f16: "F16 (OK) ",
-    keyboard.Key.f17: "F17 (NO) ",
-}
 
-MACROPAD_KEYS = set(KEY_LABELS)
+def _config_labels(config: Config) -> dict[keyboard.Key, str]:
+    """Build {pynput Key: 'F13 (PTT)'-style label} from the Config bindings."""
+    labels: dict[keyboard.Key, str] = {}
+    name_width = max(len(n) for n in LOGICAL_KEYS)
+    for logical in LOGICAL_KEYS:
+        key_name: str = getattr(config, f"{logical}_key")
+        pk = resolve_key(key_name)
+        labels[pk] = f"{key_name.upper():<3} ({logical.upper():<{name_width}})"
+    return labels
 
 
 @dataclass
@@ -73,17 +81,29 @@ def _gesture(duration: float) -> str:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(prog="diagnose_macropad")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help="Path to config.toml. Omit to use dataclass defaults.",
+    )
+    args = parser.parse_args()
+
+    config = load_config(args.config) if args.config else Config()
+    key_labels = _config_labels(config)
+    macropad_keys = set(key_labels)
+
     old_term = _suppress_echo()
     states: dict[keyboard.Key, _KeyState] = {}
     counts: dict[str, int] = defaultdict(int)
     done = threading.Event()
 
     def on_press(key: keyboard.Key | keyboard.KeyCode | None) -> None:
-        if key not in MACROPAD_KEYS:
+        if key not in macropad_keys:
             return
         if key in states:
             return  # ignore key-repeat
-        label = KEY_LABELS[key]
+        label = key_labels[key]
         ts = time.strftime("%H:%M:%S")
 
         def fire_hold() -> None:
@@ -101,7 +121,7 @@ def main() -> None:
         print(f"  [{ts}] {label}  ↓ press")
 
     def on_release(key: keyboard.Key | keyboard.KeyCode | None) -> None:
-        if key not in MACROPAD_KEYS:
+        if key not in macropad_keys:
             return
         state = states.pop(key, None)
         if state is None:
@@ -109,7 +129,7 @@ def main() -> None:
         if state.hold_timer is not None:
             state.hold_timer.cancel()
 
-        label = KEY_LABELS[key]
+        label = key_labels[key]
         ts = time.strftime("%H:%M:%S")
         duration = time.monotonic() - state.press_time
 
@@ -127,8 +147,9 @@ def main() -> None:
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
-    print("Macropad diagnostic — press F13-F17, Ctrl+C to quit\n")
-    print(f"  Keys monitored: {', '.join(KEY_LABELS.values())}")
+    src = str(args.config) if args.config else "dataclass defaults"
+    print(f"Macropad diagnostic — bindings from: {src}. Ctrl+C to quit.\n")
+    print(f"  Keys monitored: {', '.join(key_labels.values())}")
     print(f"  Gesture thresholds: SHORT <{LONG_THRESHOLD}s | LONG {LONG_THRESHOLD}-{HOLD_THRESHOLD}s | HOLD >{HOLD_THRESHOLD}s\n")
 
     listener = keyboard.Listener(on_press=on_press, on_release=on_release)

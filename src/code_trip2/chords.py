@@ -66,8 +66,10 @@ APP_NAV: dict[str, tuple[KeyStroke, KeyStroke]] = {
 
 # Solo taps — typed into whatever app currently has focus.
 # YES = Enter (default-accept in most prompts); NO = Esc (cancel).
+# NAV = Down arrow (next item in lists / completion menus).
 _TAP_YES = KeyStroke(chords=(Chord(key=keyboard.Key.enter),))
 _TAP_NO = KeyStroke(chords=(Chord(key=keyboard.Key.esc),))
+_TAP_NAV = KeyStroke(chords=(Chord(key=keyboard.Key.down),))
 
 # ACT+NO = Ctrl+U (clear line to start in shell / readline inputs).
 _ACT_NO_CLEAR_LINE = KeyStroke(chords=(Chord(modifiers=(keyboard.Key.ctrl,), key="u"),))
@@ -75,6 +77,7 @@ _ACT_NO_CLEAR_LINE = KeyStroke(chords=(Chord(modifiers=(keyboard.Key.ctrl,), key
 TAP_STROKES: dict[str, KeyStroke] = {
     "yes": _TAP_YES,
     "no": _TAP_NO,
+    "nav": _TAP_NAV,
 }
 
 
@@ -101,6 +104,17 @@ def _send_stroke(ctx: "Context", stroke: KeyStroke) -> None:
 
 
 def handle_tap(ctx: "Context", name: str) -> None:
+    # Playback-aware: while audio is playing or chunks are queued, NAV/NO
+    # control playback instead of falling through to the focused app.
+    from code_trip2 import modes  # local import to avoid module-load cycle
+
+    if modes.is_playback_active(ctx):
+        if name == "nav":
+            modes.advance_playback(ctx)
+            return
+        if name == "no":
+            modes.stop_playback(ctx)
+            return
     stroke = TAP_STROKES.get(name)
     if stroke is None:
         logger.warning("Unknown tap: %s", name)

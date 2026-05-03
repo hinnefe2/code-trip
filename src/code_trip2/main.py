@@ -6,7 +6,6 @@ import argparse
 import logging
 import signal
 import sys
-import termios
 import threading
 from pathlib import Path
 
@@ -14,34 +13,12 @@ from code_trip2 import earcon
 from code_trip2.chords import handle_chord, handle_tap
 from code_trip2.config import Config, load_config
 from code_trip2.macropad import Macropad, resolve_key
-from code_trip2.modes import Context, handle_voice
+from code_trip2.modes import Context, handle_voice, stop_playback
 from code_trip2.session_log import SessionLogger, default_session_path
 from code_trip2.stt_client import STTClient, STTClientError
 from code_trip2.tts_client import TTSClient
 
 logger = logging.getLogger(__name__)
-
-
-def _suppress_echo() -> list | None:
-    """Disable tty echo so terminals like kitty don't dump F-key escape codes."""
-    try:
-        fd = sys.stdin.fileno()
-        old = termios.tcgetattr(fd)
-        new = termios.tcgetattr(fd)
-        new[3] &= ~termios.ECHO
-        termios.tcsetattr(fd, termios.TCSADRAIN, new)
-        return old
-    except (termios.error, ValueError):
-        return None
-
-
-def _restore_echo(old: list | None) -> None:
-    if old is None:
-        return
-    try:
-        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old)
-    except (termios.error, ValueError):
-        pass
 
 
 def run(config: Config) -> None:
@@ -54,6 +31,7 @@ def run(config: Config) -> None:
         "tts_model": config.tts_model,
         "tts_voice": config.tts_voice,
         "app_cycle": list(config.app_cycle),
+        "terminal_apps": list(config.terminal_apps),
     })
 
     stt: STTClient | None = None
@@ -72,7 +50,7 @@ def run(config: Config) -> None:
 
     shutdown = threading.Event()
 
-    def on_audio(path: Path) -> None:
+    def _process_audio(path: Path) -> None:
         if stt is None:
             logger.warning("on_audio fired in non-openai STT mode; ignoring %s", path)
             return
@@ -88,6 +66,16 @@ def run(config: Config) -> None:
             return
         logger.info("Transcribed: %s", transcript)
         handle_voice(ctx, transcript)
+
+    def on_audio(path: Path) -> None:
+        # Run STT + dispatch off the macropad listener thread so taps stay
+        # responsive while a turn is in flight (wait_done can take 5–15s).
+        threading.Thread(target=_process_audio, args=(path,), daemon=True).start()
+
+    def on_ptt_press() -> None:
+        # PTT-press while Claude is speaking should stop playback so the
+        # mic input isn't talking over TTS.
+        stop_playback(ctx)
 
     def on_chord(name: str) -> None:
         try:
@@ -115,6 +103,7 @@ def run(config: Config) -> None:
         on_audio=on_audio,
         on_chord=on_chord,
         on_tap=on_tap,
+        on_ptt_press=on_ptt_press,
         ptt_forward_key=ptt_forward_key,
         sample_rate=config.sample_rate,
         device=config.audio_device,
@@ -137,7 +126,6 @@ def run(config: Config) -> None:
         ptt_desc,
         config.nav_key,
     )
-    old_term = _suppress_echo()
     macropad.start()
     try:
         shutdown.wait()
@@ -145,7 +133,6 @@ def run(config: Config) -> None:
         macropad.stop()
         thinking.stop()
         log.close()
-        _restore_echo(old_term)
 
 
 def main(argv: list[str] | None = None) -> int:

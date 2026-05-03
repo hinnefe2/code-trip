@@ -1,13 +1,11 @@
 # code-trip orchestrator config — copy to config.toml and edit.
-
-[mode]
-# IDLE | DICTATE | WORK | NAVIGATING | LINEAR | SLACK
-# DICTATE pastes the STT transcript into the frontmost macOS app and
-# needs no ssh/tmux config. Other modes drive a remote Claude session.
-default = "DICTATE"
+#
+# Voice routes by frontmost macOS app: when a terminal_apps app is focused,
+# transcripts go to the active tmux pane (talk to Claude). Otherwise the
+# transcript is pasted into the focused app (DICTATE-style).
 
 [ssh]
-# Required for WORK / NAVIGATING / LINEAR modes. Leave empty for DICTATE-only use.
+# Required to drive a remote Claude session. Leave empty for paste-only use.
 # host = "user@remote-host"
 # options = ["-p", "2222"]
 
@@ -29,6 +27,9 @@ act_key = "f16"
 nav_key = "f17"
 # Hold NAV + ACT to rotate through these frontmost apps:
 app_cycle = ["kitty", "Google Chrome", "Slack"]
+# Apps where voice routes to the active tmux pane (talk to Claude).
+# Anything else falls through to DICTATE-style paste.
+terminal_apps = ["kitty"]
 
 [stt]
 # "openai" (default): PTT records a WAV and sends it to Whisper.
@@ -37,7 +38,7 @@ app_cycle = ["kitty", "Google Chrome", "Slack"]
 provider = "openai"
 
 [stt.local]
-hotkey = "home"          # key to forward while PTT is held (pynput Key name)
+hotkey = "delete"        # key to forward while PTT is held (pynput Key name)
 
 [openai]
 # api_key = "sk-..."    # falls back to OPENAI_API_KEY env var
@@ -45,8 +46,6 @@ stt_model = "whisper-1"
 tts_model = "gpt-4o-mini-tts"
 tts_voice = "nova"
 tts_speed = 1.15
-summarizer_model = "gpt-4o-mini"
-verbosity = "detailed"  # brief | detailed | verbose
 
 [claude]
 wait_timeout = 300.0

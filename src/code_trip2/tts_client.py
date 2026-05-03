@@ -60,6 +60,7 @@ class TTSClient:
     speed: float = DEFAULT_SPEED
 
     _client: openai.OpenAI = field(default=None, init=False, repr=False)  # type: ignore[assignment]
+    _playing: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         resolved_key = self.api_key or os.environ.get(ENV_API_KEY)
@@ -107,12 +108,20 @@ class TTSClient:
 
         # Stop anything still playing before starting new audio.
         sd.stop()
-        sd.play(samples, sample_rate)
-        sd.wait()
+        self._playing = True
+        try:
+            sd.play(samples, sample_rate)
+            sd.wait()
+        finally:
+            self._playing = False
 
     def stop(self) -> None:
         """Interrupt any in-progress playback.  No-op if nothing is playing."""
         sd.stop()
+
+    def is_playing(self) -> bool:
+        """True while ``speak()`` is blocked on playback."""
+        return self._playing
 
 
 # --- helpers --------------------------------------------------------------

@@ -35,11 +35,12 @@ class Config:
     act_key: str = "f16"
     nav_key: str = "f17"
     app_cycle: tuple[str, ...] = ("kitty", "Google Chrome", "Slack")
-    # mode
-    default_mode: str = "IDLE"
+    # Apps where voice routes to the active tmux pane (talk-to-Claude). Anything
+    # else falls through to DICTATE-style paste into the focused app.
+    terminal_apps: tuple[str, ...] = ("kitty",)
     # stt
     stt_provider: str = "openai"        # "openai" | "local"
-    stt_local_hotkey: str = "home"      # pynput Key name forwarded while PTT is held
+    stt_local_hotkey: str = "delete"    # pynput Key name forwarded while PTT is held
     # openai
     api_key: str | None = None
     stt_model: str = "whisper-1"
@@ -70,7 +71,6 @@ def load_config(path: Path | str) -> Config:
     tmux = data.get("tmux", {})
     audio = data.get("audio", {})
     macropad = data.get("macropad", {})
-    mode = data.get("mode", {})
     stt = data.get("stt", {})
     stt_local = stt.get("local", {})
     openai_ = data.get("openai", {})
@@ -101,10 +101,10 @@ def load_config(path: Path | str) -> Config:
     kw.update(_select(macropad, "ptt_key", "yes_key", "no_key", "act_key", "nav_key"))
     if "app_cycle" in macropad:
         kw["app_cycle"] = tuple(macropad["app_cycle"])
+    if "terminal_apps" in macropad:
+        kw["terminal_apps"] = tuple(macropad["terminal_apps"])
 
-    # mode / stt — renames
-    if "default" in mode:
-        kw["default_mode"] = mode["default"]
+    # stt — renames
     if "provider" in stt:
         kw["stt_provider"] = stt["provider"]
     if "hotkey" in stt_local:

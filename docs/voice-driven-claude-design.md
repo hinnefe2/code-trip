@@ -2,16 +2,44 @@
 
 ## Problem Statement
 
-Enable a developer workflow with Claude Code that works with **audio output only** (earbuds) and **voice + minimal physical buttons for input**, suitable for use while walking or otherwise away from a screen and full keyboard. The system should support the full ticket-to-PR lifecycle: browsing tickets, starting work in a git worktree, running Claude in plan mode, reviewing results, iterating, and pushing a draft PR.
+Enable a developer workflow with Claude Code that works with **audio output only** (earbuds) and **voice + minimal physical buttons for input**, suitable for use while walking or otherwise away from a screen and full keyboard. The long-term goal is to support the full ticket-to-PR lifecycle: browsing tickets, starting work in a git worktree, running Claude in plan mode, reviewing results, iterating, and pushing a draft PR.
 
 ## Design Principles
 
 1. **Audio-native, not audio-adapted.** Don't try to read a screen aloud. Design interactions that are *meant* to be heard.
 2. **Modal interaction.** Inspired by vim: different modes with different key meanings. Reduces the number of physical buttons needed.
 3. **Natural language over code.** Claude should summarize and explain, never read code aloud. Code lives in the worktree; the voice interface operates at the intent/status/decision level.
-4. **Minimal hardware.** Earbuds you already own + a small custom macro pad (3-5 keys).
+4. **Minimal hardware.** Earbuds you already own + a small custom macro pad (5 keys).
 5. **Leverage existing infra.** tmux is the source of truth. The voice interface is a remote control for your existing tmux workflow — same sessions, same panes, same Claude instances. When you sit down at a screen, everything is right where you left it.
 6. **Simple before fast.** Use request-response patterns everywhere. Optimize for latency only after the core loop works and you've identified actual bottlenecks.
+
+---
+
+## Current Status (2026-05)
+
+The system is partially built and usable end-to-end for the core voice loop.
+
+| Component | Status |
+|---|---|
+| 5-key BLE macro pad (ZMK on nice!nano, F13–F17) | **Built and in daily use** |
+| PTT recording + OpenAI Whisper STT | Working |
+| Local-STT mode (PTT forwards a hotkey to e.g. Superwhisper) | Working |
+| OpenAI TTS (`gpt-4o-mini-tts`) | Working |
+| Earcons (thinking pulse, completion, error, mode chime) | Working |
+| SSH + tmux remote control (send-keys / capture-pane) | Working |
+| Stop-hook completion detection (`/tmp/claude-done-<window>`) | Working (`scripts/setup-stop-hook.sh` installs it) |
+| NAV-modifier chord system (next/prev/cycle/identify in frontmost app) | Working |
+| ACT+NO chord (Ctrl+U clear-line) | Working |
+| Solo taps (YES→Enter, NO→Esc, NAV→Down) | Working |
+| Modes: IDLE, DICTATE, NAVIGATING, WORK, LINEAR | Working |
+| Per-session JSONL event log (`~/.code-trip/sessions/`) | Working |
+| Summarizer LLM (raw-pane → spoken English) | **Not yet implemented** — current pipeline only does ANSI/box-drawing strip + tail truncation |
+| Local Whisper / Piper TTS | Not yet implemented (cloud APIs only) |
+| REVIEW / SHIP modes (review tools, draft PR) | Not yet implemented |
+| SLACK mode | Stubbed |
+| Verbosity controls (brief / detailed / verbose) | Not yet implemented |
+
+The biggest gap relative to the original design is the **summarizer LLM**. The orchestrator currently feeds Claude's raw pane text — minus ANSI/box-drawing characters — directly to TTS. This works for short responses but is the obvious next thing to add for longer outputs.
 
 ---
 
@@ -24,10 +52,11 @@ Enable a developer workflow with Claude Code that works with **audio output only
 │  ┌──────────┐   ┌──────────────┐   ┌────────────────┐  │
 │  │ BLE Macro │   │  Orchestrator │   │  Audio Output  │  │
 │  │   Pad     │──▶│  (Python)     │──▶│  (TTS Engine)  │  │
-│  │ (3-5 keys)│   │              │   │                │  │
-│  └──────────┘   │  - Mode FSM   │   │  Piper (local) │  │
-│                  │  - SSH + tmux │   │  or OpenAI TTS │  │
-│  ┌──────────┐   │    commands   │   └────────────────┘  │
+│  │ (5 keys,  │   │              │   │                │  │
+│  │  F13–F17) │   │  - Mode FSM   │   │   OpenAI TTS   │  │
+│  └──────────┘   │  - SSH + tmux │   │   (Piper TBD)  │  │
+│                  │    commands   │   └────────────────┘  │
+│  ┌──────────┐   │               │                       │
 │  │ Earbuds  │   │  - STT batch  │                       │
 │  │ (mic)    │──▶│  - TTS batch  │                       │
 │  │          │◀──│  - State mgmt │                       │
@@ -64,7 +93,7 @@ The system runs as a **local Python orchestrator** on your laptop/phone that:
 - Manages modal state (which mode you're in, which worktree is active)
 - Communicates with the remote workspace over SSH
 - **Drives Claude Code interactively via tmux** — `send-keys` to type commands, `capture-pane` to read output
-- Sends Claude's output through a summarizer LLM, then to TTS for audio playback
+- Cleans Claude's output and (eventually) passes it through a summarizer LLM before TTS playback
 - **Layers onto your existing tmux workflow** — discovers existing sessions/windows, doesn't create a parallel world. When you sit down at a screen, the full conversation history is visible in the terminal.
 
 ---
@@ -73,48 +102,63 @@ The system runs as a **local Python orchestrator** on your laptop/phone that:
 
 ### Voice Input (Primary)
 
-**Push-to-talk with batch transcription:**
-- A dedicated button on the macro pad activates the microphone (hold to record)
-- On release, the recorded audio is transcribed and the text is sent to the orchestrator
+**Push-to-talk with batch transcription.** Hold PTT to record, release to transcribe and dispatch.
 
-**Stage 1 (API-based):** Send the recorded audio to the **OpenAI Whisper API** (`/v1/audio/transcriptions`) — one HTTP POST, one transcript back. Simple, accurate, no local model setup.
+The orchestrator supports two STT backends, selected via `[stt] provider` in `config.toml`:
 
-**Stage 2 (local models):** Replace with a **local Whisper model via `faster-whisper`** or similar runtime. Use the ~500MB English-only model (same class as what superwhisper uses on Mac) — good accuracy, no API costs, works offline. Transcription takes ~1-3s which is negligible since Claude's response takes longer anyway.
+- **`provider = "openai"` (default):** PTT records a WAV via `sounddevice` and posts it to the **OpenAI Whisper API** (`/v1/audio/transcriptions`). The transcript is then dispatched through the mode router (`handle_voice`).
+- **`provider = "local"`:** PTT does *not* record audio in-process. Instead, while PTT is held the orchestrator presses-and-holds a configurable forwarding key (default: `delete`, configured at `[stt.local] hotkey`). A local STT app like **Superwhisper** is bound to that key and inserts its transcript directly into the focused macOS app on release. This bypasses the orchestrator's mode router entirely and is useful for free-form dictation into any app.
+
+A **local Whisper model via `faster-whisper`** is still on the roadmap as a third option (orchestrator-internal, no Superwhisper dependency), but is not yet implemented.
 
 ### Macro Pad (Secondary Input)
 
-**Hardware: 5-key BLE macro pad built with ZMK firmware**
+**Hardware: 5-key BLE macro pad — built and in daily use.**
 
-Recommended build:
-- **Controller:** Seeed XIAO nRF52840 BLE (~$10)
-- **Switches:** 5x Cherry MX or Kailh Choc low-profile switches
-- **Battery:** 100-300mAh LiPo (weeks of battery life with ZMK's power management)
-- **Firmware:** ZMK (built via GitHub Actions, no local toolchain needed)
-- **Case:** 3D printed or a simple PCB sandwich
+Build:
+- **Controller:** nice!nano (nRF52840-based, ~$25)
+- **Switches:** 5x Kailh Choc low-profile switches
+- **Battery:** small LiPo (weeks of life with ZMK power management)
+- **Firmware:** ZMK (built via GitHub Actions, mapped to F13–F17)
+- **Case:** 3D printed
 
-The macro pad appears as a standard Bluetooth keyboard to the local machine. ZMK handles debouncing, power management, and BLE HID.
+The macro pad appears as a standard Bluetooth keyboard to the laptop. The orchestrator listens for the F-keys via `pynput` and — on macOS — installs a `Quartz` event-tap interceptor (`darwin_intercept`) that **drops the macropad keys at the OS level** so the focused app (e.g. kitty's CSI-u protocol) never sees them. Without this, holding NAV would spam escape sequences into the active terminal.
 
-**Key layout and function (mode-dependent):**
+**Physical layout (left-to-right):**
 
 ```
 ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐
-│ PTT │ │ NAV │ │ ACT │ │ OK  │ │ NO  │
-│     │ │ ↑↓  │ │     │ │ ✓   │ │ ✗   │
+│ PTT │ │ YES │ │ NO  │ │ ACT │ │ NAV │
+│ 🎤  │ │ ✓   │ │ ✗   │ │     │ │     │
 └─────┘ └─────┘ └─────┘ └─────┘ └─────┘
   F13     F14     F15     F16     F17
 ```
 
-| Key | Short press | Long press | Hold |
-|-----|------------|------------|------|
-| **PTT** (Push to Talk) | — | — | Mic active while held |
-| **NAV** | Next item | Previous item | Cycle modes |
-| **ACT** | Context-dependent action | Secondary action | — |
-| **OK** | Confirm / approve / continue | "Read that again" | — |
-| **NO** | Reject / skip / cancel | "Go back" | Abort current operation |
+The mapping from logical key (`ptt`/`yes`/`no`/`act`/`nav`) to physical F-key is configurable in `[macropad]`.
 
-ZMK maps these to F13-F17 (unused function keys), which the orchestrator listens for via `evdev` or `pynput`.
+**Solo taps** — typed into whatever app currently has focus, via a synthesized keystroke:
 
-**Alternative to building:** An off-the-shelf **Elgato Stream Deck Mini** (6 keys, USB) or even repurposing earbud button gestures (single tap, double tap, long press) for the 3 most critical actions (PTT, OK, NO).
+| Key | Solo behavior |
+|-----|---|
+| **PTT** | Hold → record audio (or forward `[stt.local] hotkey` if `provider="local"`) |
+| **YES** | Tap → `Enter` (default-accept in most prompts) |
+| **NO** | Tap → `Esc` (cancel) |
+| **NAV** | Tap → `↓` (next item in lists / completion menus). Fires only on release if NAV was *not* used as a chord modifier. |
+| **ACT** | No solo behavior; ACT only acts as a chord modifier |
+
+**Chord system.** Two modifier keys produce useful combos. NAV takes precedence over ACT when both are held.
+
+| Chord | Action |
+|-----|---|
+| **NAV + PTT** | Speak the frontmost macOS app's name via TTS (debugging / situational awareness) |
+| **NAV + YES** | App-specific "next" — e.g. kitty next pane (`Ctrl-b n`), Chrome next tab (`⌘⌥→`), Slack next unread (`⌥⇧↓`) |
+| **NAV + NO** | App-specific "previous" — e.g. kitty prev pane, Chrome prev tab, Slack history-back (`⌘[`) |
+| **NAV + ACT** | Rotate through `[macropad] app_cycle` (default: kitty, Chrome, Slack) by activating the next app in the list |
+| **ACT + NO** | `Ctrl-U` — clear-line for shell / readline inputs |
+
+The "next/prev" pair per app is defined in `chords.APP_NAV`; new apps are added by registering a `(yes_stroke, no_stroke)` pair. Pairs do not have to be symmetric — Slack deliberately combines "next unread" with "history back" because that's the useful walking workflow.
+
+**Why a chord system instead of "modes change key meanings".** The original design pushed mode-dependent key meanings (NAV does X in BROWSE, Y in WORK, Z in REVIEW). In practice, the more useful split turned out to be: **what app has focus on the laptop**, not what mode the orchestrator is in. The orchestrator's modes still exist (see Modal System below), but the day-to-day buttons drive the focused app rather than overlaying their own meaning.
 
 ---
 
@@ -122,35 +166,34 @@ ZMK maps these to F13-F17 (unused function keys), which the orchestrator listens
 
 ### TTS Engine
 
-**Start simple: one engine, batch synthesis.**
+**One engine, batch synthesis.** The system waits for Claude's full response before speaking, so there is no token-level streaming.
 
-Since the system waits for Claude's complete response before speaking, there is no need for token-level streaming TTS. Send the full response text to one TTS engine, get audio back, play it. No multi-engine fallback, no streaming library, no sentence boundary detection needed.
+**Implemented:** **OpenAI TTS API** with model `gpt-4o-mini-tts`, voice `nova`, speed `1.15x`. Audio is requested as WAV, decoded with stdlib `wave`, and played through `sounddevice`. `TTSClient.stop()` interrupts playback mid-sentence (used by the NO-while-speaking interruption path).
 
-**Stage 1 (API-based):** Use the **OpenAI TTS API** — one API call per response, ~$15/1M characters. Use `gpt-4o-mini-tts` model. Simple to integrate, good voice quality, no local setup.
-
-**Stage 2 (local models):** Replace with **Piper TTS (local, free)** — pipe text in, get WAV out, play with `mpv` or `aplay`. Fast enough on CPU (~1-2s for a paragraph). Zero API costs. Good quality with the right voice model.
+**Roadmap:** **Piper TTS (local, free)** as a drop-in replacement to eliminate API cost and network dependency. Not yet implemented.
 
 **Voice configuration:**
-- Slightly faster than normal speaking rate (1.1-1.2x) — experienced screen reader users listen at 2-3x but start slower
-- Distinct audio tones/earcons for mode changes, errors, completions (short wav files played via `mpv`)
+- Slightly faster than normal speaking rate (1.1–1.2x) — experienced screen reader users listen at 2–3x but start slower.
+- Distinct earcons for mode changes, errors, completions (synthesized in code, not WAV files — see below).
 
 ### Content Rendering Strategy
 
-This is the core design challenge. The system must transform Claude's output into something meaningful in audio.
-
-**Key principle: Claude Code runs normally — a separate summarizer model makes its output listenable.**
-
-Claude Code should not be constrained to produce audio-friendly output. Its work quality depends on being able to reason with code blocks, diffs, file paths, and structured formatting. Instead, the orchestrator passes Claude's raw output through a small, fast LLM that produces a spoken-English summary.
-
-**Two-stage pipeline:**
+**Original plan (still the right design):** Claude Code runs unconstrained, and a small fast LLM (Haiku or gpt-4o-mini) summarizes its raw pane output into spoken English before TTS:
 
 ```
 Claude Code (full output) → Summarizer LLM → TTS → Audio
 ```
 
-**Summarizer model:** Use a cheap, fast model — Haiku or gpt-4o-mini. The task is easy (restate technical output as speech), so a small model handles it well. Cost is negligible (fractions of a cent per summary).
+**Current implementation (placeholder):** The orchestrator's `clean_output()` performs only a mechanical strip:
 
-**Summarizer prompt:**
+1. Remove ANSI escape sequences and box-drawing characters.
+2. Drop Claude's trailing `>` input prompt block.
+3. Take the last ~60 non-empty lines, cap at 4000 characters.
+4. Send the result directly to TTS.
+
+This is fine for short responses ("Tests passed.") but produces unlistenable audio for anything substantive. **Adding the summarizer LLM is the highest-leverage next change** — the architecture already has a summarization seam (`clean_output` is a single function call inside `_work_voice`); the work is writing the prompt and wiring the API call.
+
+**Planned summarizer prompt:**
 
 ```
 You are converting developer tool output into spoken audio for a user wearing earbuds
@@ -168,20 +211,14 @@ Produce a concise spoken summary following these rules:
 - If the user needs to make a decision, state the options clearly
 ```
 
-The orchestrator can prepend context to help the summarizer (current mode, what was asked):
+The orchestrator can prepend context (current mode, what was asked) to help the summarizer:
 
 ```
 [Mode: WORK] [User asked: "run the tests"]
 <raw claude output here>
 ```
 
-**Why this is better than constraining Claude's system prompt:**
-- Claude Code works at full quality — no fighting its natural output format
-- The summarizer prompt can be tuned independently without risking work quality
-- Different modes can use different summarizer prompts (BROWSE wants ticket summaries, WORK wants action summaries)
-- Claude's raw output is preserved for later screen review
-
-**Content rendering guidelines** (for the summarizer, by content type):
+**Content rendering guidelines** (for the summarizer, once built):
 
 | Content Type | Summarizer Should Produce |
 |---|---|
@@ -194,127 +231,133 @@ The orchestrator can prepend context to help the summarizer (current mode, what 
 | **Git operations** | "Branch created. 3 commits ahead of main. Ready to push." |
 | **Code questions** | Natural language explanation, referencing functions by name but not their source |
 
-**Earcons (audio cues):**
+### Earcons
 
-Short, distinct sounds for common events, avoiding the need for speech:
+Earcons are **synthesized in code** as short sine-wave tones via `numpy` + `sounddevice` (not WAV files). All live in `code_trip2/earcon.py`:
 
-| Event | Sound |
-|---|---|
-| Mode change | Distinctive chime per mode (different pitch) |
-| Task complete | Rising two-tone |
-| Error occurred | Low buzz |
-| Waiting for input | Soft pulse |
-| Claude thinking | Subtle ticking (or silence — TBD based on preference) |
-| New item (in browse mode) | Soft click |
-
-These are simple WAV files played via `mpv --no-terminal` or `paplay`.
+| Event | Sound | Where |
+|---|---|---|
+| Claude thinking | 660 Hz pulse, repeats every 2.5s on a background thread (`Thinking.start()` / `.stop()`) | While `_work_voice` waits on the Stop hook |
+| Task complete | Rising two-tone (660 → 880 Hz) | After Claude's response is spoken |
+| Error | Low 220 Hz buzz | Wrapper around `_speak_error` / `_report_error` |
+| Mode change | Two-tone chime per mode (IDLE 440, NAVIGATING 523, WORK 587, LINEAR 659, SLACK 784 Hz, plus the perfect-fifth above) | `_enter_mode` |
 
 ---
 
 ## Modal System
 
-Inspired by vim's modal editing and screen reader navigation patterns.
+Modes reflect **the surface being interacted with**, not workflow phase. The router (`modes.handle_voice`) checks the transcript for a mode-switch phrase first, then for a global command, then dispatches to the per-mode handler. Mode entry is always announced: a chime + spoken `"<mode> mode"`.
+
+The current modes are: **IDLE**, **DICTATE**, **NAVIGATING**, **WORK**, **LINEAR**, **SLACK** (stub).
+
+The original design's REVIEW and SHIP modes are not yet implemented — they require automated review tools and `gh pr create` integration that haven't been built. They remain the right shape for the long-term ticket-to-PR vision.
+
+### Mode entry (voice phrases)
+
+| Phrase fragment | Enters mode |
+|---|---|
+| "work mode", "switch to work", "start working" | WORK |
+| "dictation mode", "dictate mode", "switch to dictate" | DICTATE |
+| "navigation mode", "switch windows" | NAVIGATING |
+| "linear mode", "list tickets", "show tickets", "my tickets" | LINEAR (also refreshes if "ticket" present) |
+| "slack mode", "check slack", "read slack" | SLACK |
+| "idle mode", "go idle", "exit mode" | IDLE |
+
+### Global commands (any mode)
+
+- **"status"** — speak `"<mode> mode. Active window: <window>."`
+- **"what" / "repeat" / "say that again"** — replay last TTS (history buffer not yet implemented; currently says "Nothing to repeat.")
 
 ### Mode: IDLE
 
-The home state. Earbuds are silent.
+The default mode at startup if `[mode] default = "IDLE"`. PTT input that doesn't match a mode-switch phrase falls through to **WORK** for that turn (auto-promote on first utterance).
 
-- **PTT + voice:** Natural language command, routed by intent:
-  - "List my tickets" → enters BROWSE mode
-  - "What's the status?" → reads status of active worktree
-  - "Switch to ticket 3" → changes active worktree
-- **NAV:** Cycle through active worktrees, hear ticket title for each
-- **ACT:** Enter BROWSE mode
+### Mode: DICTATE
 
-### Mode: BROWSE
+Pure local dictation — pastes the STT transcript into the frontmost macOS app via `pbcopy` + `⌘V`. Requires no SSH/tmux config, so it works on a laptop without a remote workspace.
 
-Navigate through open Linear tickets.
+This is the mode in `config.example.toml` because it's the lowest-friction starting point.
 
-- **NAV short:** Read next ticket (title + priority + assignee)
-- **NAV long:** Read previous ticket
-- **ACT:** Select current ticket → start work (create worktree, tmux window, enter WORK mode)
-- **OK:** Hear full ticket description
-- **NO:** Exit to IDLE
-- **PTT + voice:** Filter/search ("show me only bugs", "sort by priority")
+### Mode: NAVIGATING
 
-Behind the scenes: The orchestrator uses Claude Code's Linear MCP tools to fetch tickets, caches the list locally, and navigates through it.
+Voice control of the remote tmux window list.
+
+- **"list windows" / "what windows"** — speak the count and comma-separated names
+- **"switch to <name>" / "go to <name>" / "select <name>"** — `tmux select-window`, set `ctx.active_window`, auto-promote to WORK
+- **"new window <name>"** — `tmux new-window`, auto-promote to WORK
+- Anything else — fall back to listing windows
 
 ### Mode: WORK
 
-Active development on a ticket. Claude is running in the worktree.
+Voice ↔ Claude in the active tmux pane on the remote.
 
-- **PTT + voice:** Talk to Claude ("implement the auth fix", "run the tests", "what's your plan?")
-- **NAV:** Cycle through Claude's recent messages (re-read them)
-- **ACT:** Trigger automated review tools
-- **OK:** Approve Claude's current action / continue
-- **NO:** Reject / tell Claude to try differently
-- **NAV long hold:** Switch to different worktree (cycles through active ones)
+For each PTT turn:
 
-**Sub-states within WORK mode:**
+1. `tmux send-keys -t <session>:<active_window> "<transcript>" Enter`
+2. Start the thinking-pulse earcon on a background thread.
+3. Poll for the Stop-hook signal file `/tmp/claude-done-<window>` (timeout configurable via `[claude] wait_timeout`, default 300s).
+4. `tmux capture-pane -p -S -200` to grab the response.
+5. Run `clean_output()` (placeholder — to be replaced by summarizer LLM).
+6. Speak the result via TTS, play the completion earcon.
+7. Append a `turn` event to the JSONL session log with `{user, remote_output, spoken}`.
 
-- **WORK:PLAN** — Claude is presenting its plan. NAV steps through plan items. OK approves. NO rejects with voice feedback.
-- **WORK:EXECUTING** — Claude is making changes. Periodic status updates via TTS. OK is "keep going." NO is "stop and explain."
-- **WORK:REVIEWING** — Review results are being read. NAV cycles through issues. PTT + voice gives feedback on each.
+Errors at any step stop the thinking pulse, play the error earcon, and speak a brief explanation.
 
-### Mode: REVIEW
+### Mode: LINEAR
 
-Post-implementation review.
+Linear ticket list, fetched by running `claude -p "..."` in a dedicated tmux window (`[tmux] linear_window`, default `linear`). The prompt asks Claude to call the Linear MCP and return a JSON array of `{id, title, priority, assignee, branch}`. The orchestrator extracts the array with a regex, parses it, and caches it in `Context.tickets`.
 
-- **NAV:** Step through review findings one by one
-- **PTT + voice:** Give feedback on current finding ("fix that", "ignore it", "explain more")
-- **ACT:** Run review tools again
-- **OK:** Approve all remaining → enter SHIP mode
-- **NO:** Go back to WORK mode with review feedback
+Voice commands:
 
-### Mode: SHIP
+- **"refresh" / "reload" / "list"** — re-fetch tickets
+- **"next" / "previous"** — step the cursor; speak `"<n> of <N>. <id>. <title>. Priority <p>. Assigned to <a>."`
+- **"select <n>" / "select this" / "work on <n>"** — open a tmux window named after the ticket's `branch`, run `claude` in it, set it as `active_window`, auto-promote to WORK
+- Free-text — filter cached tickets by case-insensitive substring match on title or id
 
-Final steps before PR.
+### Mode: SLACK
 
-- **OK:** Push draft PR (Claude creates it with `gh pr create`)
-- **PTT + voice:** Adjust PR title/description
-- **NO:** Go back to REVIEW
-- After PR is pushed: reads back PR URL and returns to IDLE
+Stub. Speaks `"Slack mode is not yet implemented."` Future: read unread channels / threads aloud, send replies via dictation. The macropad chord system already provides Slack navigation via `nav+yes` / `nav+no` when Slack is the frontmost app, which covers most of the walking-workflow need without a dedicated voice mode.
 
-### Mode Transitions
+### Note: keys vs. modes
 
-```
-IDLE ──▶ BROWSE ──▶ WORK ──▶ REVIEW ──▶ SHIP ──▶ IDLE
-  ▲         │         ▲  ◀──────┘         │
-  └─────────┘         └──────────────────┘
-```
-
-NAV long-hold from any mode → mode selection (hear mode names, NAV to select, OK to enter).
+The macropad chords (NAV+YES, NAV+NO, NAV+ACT, ACT+NO) operate **independently of mode** — they always drive the focused macOS app, not the orchestrator's mode state. Mode transitions happen by **voice**, not by key.
 
 ---
 
 ## Orchestrator Design
 
-The orchestrator is a single Python process running locally. It is the brain of the system.
+The orchestrator is a single Python process running locally. It is the brain of the system. Source layout (`src/code_trip2/`):
 
-### Core Components
+```
+main.py          Entry point: load config, wire components, run the listener loop
+config.py        TOML loader + frozen Config dataclass (single source of defaults)
+macropad.py      One pynput Listener for all 5 keys + chord/tap/PTT state machine
+chords.py        Chord & tap handlers; per-app keystroke definitions (APP_NAV)
+modes.py         Context dataclass + handle_voice mode router + per-mode handlers
+remote.py        SSH + tmux helpers (send / capture / list/new/select-window / wait_done)
+window.py        macOS-only: active_app(), activate_app(), send_keystroke(), paste_text()
+stt_client.py    OpenAI Whisper wrapper
+tts_client.py    OpenAI TTS wrapper (gpt-4o-mini-tts)
+earcon.py        Synthesized tones + Thinking thread
+session_log.py   Per-session JSONL event log → ~/.code-trip/sessions/
+```
+
+### Core state
 
 ```python
-# Conceptual structure (not literal implementation)
-
-class VoiceClaudeOrchestrator:
-    mode: Mode                    # Current mode (IDLE, BROWSE, WORK, REVIEW, SHIP)
-    active_window: str | None     # Currently selected tmux window
-    ticket_cache: list[Ticket]    # Cached Linear tickets
-    message_history: list[str]    # Recent TTS outputs for replay
-    
-    # Input handlers
-    stt: STTClient                # Stage 1: OpenAI Whisper API; Stage 2: local faster-whisper
-    keypad: KeypadListener        # Listens for F13-F17 from BLE macro pad
-    
-    # Output handlers  
-    tts: TTSClient                # Stage 1: OpenAI TTS API; Stage 2: Piper local
-    summarizer: SummarizerLLM     # Haiku/gpt-4o-mini for audio rendering
-    earcons: EarconPlayer         # Short audio cues
-    
-    # Remote — tmux is the interface to everything
-    tmux_session: str             # Name of the tmux session on remote
-    last_capture: dict            # Map of window → last captured pane content
+@dataclass
+class Context:
+    config: Config                # TOML-loaded config
+    tts: TTSClient                # OpenAI TTS
+    log: SessionLogger            # JSONL event sink
+    thinking: earcon.Thinking     # Background thinking-pulse thread
+    mode: str = ""                # "IDLE" | "DICTATE" | "NAVIGATING" | "WORK" | "LINEAR" | "SLACK"
+    active_window: str = ""       # Currently selected tmux window for WORK mode
+    tickets: list[dict] = []      # LINEAR mode cache
+    ticket_index: int = 0         # LINEAR cursor
 ```
+
+`main.run()` builds the `Context`, instantiates the `Macropad` listener with three callbacks (`on_audio`, `on_chord`, `on_tap`), and waits on a shutdown event. The macropad runs on its own pynput thread; callbacks dispatch into the modes/chords modules.
 
 ### Claude Code Integration via tmux
 
@@ -353,7 +396,13 @@ ssh remote "tmux capture-pane -t mysession:ticket-1 -p -S -50"
 
 **Detecting "Claude is done":**
 
-Use **Claude Code's `Stop` hook** — a lifecycle hook that fires every time Claude finishes a response. Configure it in the remote workspace's `.claude/settings.json`:
+Use **Claude Code's `Stop` hook** — a lifecycle hook that fires every time Claude finishes a response. The orchestrator polls for a per-window signal file at `/tmp/claude-done-<window_name>`; install the hook on the remote with:
+
+```bash
+bash scripts/setup-stop-hook.sh /path/to/project
+```
+
+This writes the following into `.claude/settings.json`:
 
 ```json
 {
@@ -368,9 +417,7 @@ Use **Claude Code's `Stop` hook** — a lifecycle hook that fires every time Cla
 }
 ```
 
-The hook writes a signal file when Claude finishes. The orchestrator watches for this file (via SSH) instead of polling pane content. This is precise — no heuristics, no false positives from output that happens to look like a prompt.
-
-**Fallback for edge cases** (e.g., hook not configured, or checking on a session started before the voice interface): inspect `capture-pane` output for Claude's input prompt (the `>` character at the bottom of the pane). This is a simple string check, not polling — use it as a one-shot "is Claude waiting right now?" test when you switch to a window or reconnect.
+`remote.wait_done()` clears the signal file before sending the prompt and polls every 1s (timeout 300s by default) for it to reappear. This is precise — no heuristics, no false positives from output that happens to look like a prompt.
 
 **Worktree/window management:**
 
@@ -433,94 +480,83 @@ The system is request-response, not conversational. Expected round-trip:
 
 | Phase | Estimate |
 |---|---|
-| PTT release → STT transcript | ~1-2s |
-| tmux send-keys → Claude complete (Stop hook fires) | ~5-15s (depends on task complexity) |
-| capture-pane + summarizer LLM | ~1-2s (Haiku/gpt-4o-mini) |
-| Summary → TTS audio ready | ~1-2s |
-| **Total PTT-to-hearing-audio** | **~9-22s** |
+| PTT release → STT transcript (Whisper API) | ~1–2s |
+| `tmux send-keys` → Stop hook fires | ~5–15s (depends on task complexity) |
+| `capture-pane` + (planned) summarizer LLM | ~1–2s once added; ~0s today |
+| Text → TTS audio ready | ~1–2s |
+| **Total PTT-to-hearing-audio** | **~7–20s** |
 
-This is acceptable for a walking workflow where you're directing an AI agent, not having a real-time conversation. If specific phases become bottlenecks in practice, they can be optimized individually (e.g., switch to streaming TTS, use a faster STT provider).
+Acceptable for a walking workflow where you're directing an agent, not having a real-time conversation. The thinking-pulse earcon plays continuously while waiting on the Stop hook so you know the system is alive.
 
-**While waiting for Claude:** Play a subtle "thinking" earcon so you know the system received your input.
+### Interruption Handling — current state
 
-### Interruption Handling
+- ✅ `TTSClient.stop()` exists; can be wired to a NO-tap during playback (not yet wired — NO currently always sends an Esc keystroke).
+- ❌ PTT-while-TTS-playing interrupt: not yet wired.
+- ❌ SSH auto-reconnect on drop: not yet implemented; failed SSH calls just speak an error and abort the turn. Claude itself keeps running in tmux, so no work is lost — the next PTT turn picks up wherever Claude is.
 
-- **NO button while TTS is playing:** Immediately stop playback, discard remaining buffered text
-- **PTT while TTS is playing:** Stop playback, start recording (interrupt to speak)
-- **Connection drop:** Earcon alert. Orchestrator auto-reconnects SSH. Claude keeps running in tmux — no work lost. On reconnect, `capture-pane` picks up whatever happened while disconnected.
+### Repetition and Navigation — planned
 
-### Repetition and Navigation
+- ❌ "Read that again" / message-history buffer
+- ❌ NAV-step through recent messages
+- The voice command "repeat" / "what" is recognized but currently says "Nothing to repeat." until the buffer exists.
 
-- **OK long press:** "Read that again" — replays the last TTS output from the message history buffer
-- **NAV in any mode:** Step through recent messages (last 10 kept in memory)
-- **"What?" or "repeat"** as voice command: replays last message
+### Verbosity Control — planned
 
-### Verbosity Control
+Once the summarizer LLM is in place, screen-reader-style verbosity levels apply by tweaking the summarizer prompt:
 
-Inspired by screen reader verbosity levels:
+- **"brief"** — 1–2 sentences
+- **"detailed"** — full summary (default)
+- **"verbose"** — include filenames, line counts, test names
 
-- **PTT + "brief":** Responses capped at 1-2 sentences
-- **PTT + "detailed":** Full responses (default)
-- **PTT + "verbose":** Include file names, line counts, test names
-
-This adjusts the summarizer prompt dynamically (not Claude's — Claude runs unconstrained).
+`config.example.toml` already reserves a `[openai] verbosity` field for this; the code does not yet read it.
 
 ---
 
 ## Implementation Plan
 
-### Stage 1: Core Loop with APIs
+### Stage 1a: Proof of Concept — **Done**
 
-Get the end-to-end loop working using cloud APIs for STT and TTS. No local models, no custom hardware. Use laptop mic + keyboard shortcuts as stand-ins.
+- ✅ Listen for F13–F17 via `pynput`
+- ✅ Record audio on PTT hold (or forward a hotkey for local STT)
+- ✅ Send to OpenAI Whisper for transcription
+- ✅ Send transcript to Claude via `ssh remote "tmux send-keys ..."`
+- ✅ Detect completion via the Stop-hook signal file (no polling pane content)
+- ✅ Capture pane output and speak via OpenAI TTS
+- ❌ **Pending:** route capture through a summarizer LLM (currently only mechanical strip — see "Content Rendering Strategy")
 
-**Phase 1a: Proof of Concept**
+### Stage 1b: Modal System — **Mostly done**
 
-1. **Local Python script** that:
-   - Listens for a keyboard shortcut (e.g., F13 via `pynput`, or a regular hotkey)
-   - Records audio on key-hold, sends to **OpenAI Whisper API** for transcription
-   - Sends transcribed text to Claude via `ssh remote "tmux send-keys ..."`
-   - Polls `ssh remote "tmux capture-pane ..."` until Claude finishes responding
-   - Passes the captured output through a **summarizer LLM** (Haiku or gpt-4o-mini) to get audio-friendly text
-   - Sends the summary to **OpenAI TTS API**, plays the resulting audio
-2. **Summarizer prompt** — write and tune the prompt that converts Claude's raw terminal output to spoken English
-3. **Prerequisite:** An existing tmux session on the remote with Claude running interactively in at least one pane
-4. Test the core loop: hold key → speak → hear Claude's summarized response
+- ✅ Mode state machine: IDLE → DICTATE / NAVIGATING / WORK / LINEAR / SLACK
+- ✅ Earcons for mode transitions, completion, errors, and "thinking"
+- ✅ NAVIGATING mode (list / switch / new tmux window)
+- ✅ LINEAR mode via `claude -p` + Linear MCP, cached ticket list with cursor
+- ✅ DICTATE mode (paste STT into frontmost macOS app)
+- ✅ Per-session JSONL event log
+- ❌ REVIEW / SHIP modes (need automated review tools + `gh pr create` integration)
+- ❌ Verbosity controls (brief / detailed / verbose)
+- ❌ Message-history buffer for "repeat that"
 
-**Minimal dependencies:** `pynput`, `openai` (for Whisper + TTS), `anthropic` or `openai` (for summarizer). Everything is API calls + SSH/tmux commands — no local model setup, no special Claude flags.
+### Stage 2: Local Models — **Not started**
 
-**Phase 1b: Modal System**
+- ❌ Replace OpenAI Whisper with `faster-whisper`. (Note: a local-STT *escape hatch* already works via `[stt] provider = "local"`, which forwards a hotkey to Superwhisper — but that's an external tool, not orchestrator-internal.)
+- ❌ Replace OpenAI TTS with Piper.
+- The summarizer (once added) stays as a cloud API call.
 
-1. Implement the mode state machine (IDLE → BROWSE → WORK → REVIEW → SHIP)
-2. Add Linear ticket browsing via Claude Code's Linear MCP (run `claude -p "list my tickets"`)
-3. Add worktree management (create/switch/list)
-4. Add earcons for mode transitions and events
-5. Test the full ticket-to-PR workflow with keyboard shortcuts
+### Stage 3: Hardware — **Done**
 
-### Stage 2: Local Models
+- ✅ Five-key BLE macro pad on a **nice!nano** (nRF52840) controller, Kailh Choc switches, LiPo battery, ZMK firmware, F13–F17 keymap, 3D-printed case
+- ✅ BLE pairing + key detection verified with the orchestrator
+- ✅ macOS-side: `Quartz` event-tap interceptor drops macropad keys at the OS level so the focused app doesn't see them as text input
 
-Replace cloud API calls with local models to eliminate API costs and network dependency for STT/TTS.
+### Stage 4: Polish — **Partial**
 
-1. Replace OpenAI Whisper API with **`faster-whisper`** using the ~500MB English-only model (same class as superwhisper). No API costs, works offline.
-2. Replace OpenAI TTS API with **Piper TTS** (local, free). Pipe text in, get WAV out.
-3. Tune local model quality — voice selection for Piper, Whisper model size tradeoffs
-4. The summarizer LLM stays as an API call (it's cheap and there's no good local equivalent at the quality needed)
-
-### Stage 3: Hardware
-
-1. Order parts: XIAO nRF52840, 5x Kailh Choc switches, LiPo battery, diodes
-2. Wire switches directly to GPIO pins (5 keys = no matrix needed, direct wiring)
-3. Write ZMK shield config (devicetree + keymap) mapping to F13-F17
-4. Build with GitHub Actions, flash firmware
-5. 3D print or hand-wire a minimal case
-6. Test BLE pairing and key detection with the orchestrator
-
-### Stage 4: Polish
-
-1. Tune TTS voice, speed, and earcon sounds
-2. Add robust error handling and connection recovery
-3. Add verbosity controls
-4. Fine-tune the summarizer prompt based on real usage
-5. Optional: package as a systemd service that starts on login
+- ✅ TTS voice/speed tuned (`nova` at 1.15x)
+- ✅ Earcons tuned (synthesized in `earcon.py`, no WAV asset management)
+- ✅ Error handling: every remote / TTS / earcon call path has a fallback to a spoken error message
+- ❌ Verbosity controls
+- ❌ Connection recovery / reconnection logic for SSH drops
+- ❌ Summarizer prompt tuning (because the summarizer doesn't exist yet)
+- ❌ launchd/systemd service for autostart
 
 ---
 
@@ -538,16 +574,16 @@ Replace cloud API calls with local models to eliminate API costs and network dep
 | Piper TTS (local) | 2 | Free (open source) |
 | ZMK firmware | 3 | Free (open source) |
 
-### Hardware
+### Hardware (as built)
 
 | Component | Approx. Cost |
 |---|---|
-| Seeed XIAO nRF52840 BLE | $10 |
+| nice!nano (nRF52840) controller | $25 |
 | 5x Kailh Choc switches | $5 |
-| Small LiPo battery (150mAh) | $5 |
-| Diodes, wire, PCB or perfboard | $5 |
-| 3D printed case | $5 (or free if you have a printer) |
-| **Total macro pad** | **~$30** |
+| Small LiPo battery | $5 |
+| Wire, diodes | $5 |
+| 3D printed case | Free (own printer) |
+| **Total macro pad** | **~$40** |
 | Earbuds with mic (already owned) | $0 |
 
 ---
@@ -576,7 +612,6 @@ Replace cloud API calls with local models to eliminate API costs and network dep
 - [Cursorless](https://www.cursorless.org/) — structural voice code editing
 - [Piper TTS](https://github.com/rhasspy/piper) — fast local neural TTS
 - [ZMK Firmware](https://zmk.dev/) — wireless keyboard firmware
-- [XIAO nRF52840 macro pad guide](https://www.ubiqueiot.com/posts/xiao-nrf52840-zmk) — hardware build reference
 - [Claude Code headless mode](https://code.claude.com/docs/en/headless) — programmatic CLI usage
 - [Claude Code hooks](https://code.claude.com/docs/en/hooks) — lifecycle event hooks
 - [faster-whisper](https://github.com/SYSTRAN/faster-whisper) — fast local Whisper inference (CTranslate2)
@@ -599,8 +634,10 @@ Replace cloud API calls with local models to eliminate API costs and network dep
 
 3. **Local vs. cloud STT?** OpenAI Whisper API is simpler but requires internet. Local `faster-whisper` avoids API costs but adds latency and uses CPU. For walking outdoors (phone tethering), the Whisper API's bandwidth is negligible.
 
-4. **Multiple simultaneous worktrees?** The design supports it (NAV cycles through them), but cognitive load of tracking multiple tasks by audio alone may be high. Start with one active worktree and add multi-worktree support based on experience.
+4. **Multiple simultaneous worktrees?** Today, NAVIGATING mode handles the window list one switch at a time and WORK runs against `ctx.active_window`. Cycling through several active Claude sessions by audio alone (a la "NAV through worktrees") is plausible but cognitively heavy — start with single-active-window and add only if real usage demands it.
 
-5. **Safety:** Claude runs interactively in tmux, so its default permission mode applies. If Claude prompts for confirmation (e.g., before running a command), the orchestrator would need to detect the prompt via `capture-pane` and relay it as a voice question. Alternatively, configure Claude with `--permission-mode acceptEdits` in worktrees where you trust it. Mitigate risk with: review mode before shipping, automated review tools (linting, type checking, tests), and the ability to reject/undo.
+5. **Safety:** Claude runs interactively in tmux, so its default permission mode applies. If Claude prompts for confirmation (e.g., before running a command), the orchestrator currently has no way to detect the prompt and relay it as a voice question — it just times out on the Stop hook. Workarounds: configure Claude with `--permission-mode acceptEdits` in trusted worktrees, or add a fallback that scans `capture-pane` for the prompt pattern.
 
-6. **Notification while idle?** Should the system proactively notify when a long-running Claude task completes? Probably yes — a completion earcon + brief status when Claude finishes, even if you haven't asked.
+6. **Notification while idle?** Should the system proactively notify when a long-running Claude task completes (i.e. a Stop-hook fired in a window other than the active one)? Probably yes — a completion earcon + brief status. Not yet implemented.
+
+7. **Summarizer model choice.** Haiku vs. gpt-4o-mini vs. local — once the summarizer is added, this matters less than getting the prompt right. Defer to "whatever's cheapest and fast enough" until the prompt is dialed in.

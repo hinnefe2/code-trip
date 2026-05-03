@@ -11,6 +11,8 @@ currently held. Behavior:
                               ``ptt_forward_key``).
   - NAV held + PTT tap      → ``on_chord("nav+ptt")`` (no recording/forward).
   - NAV held + YES/NO/ACT   → ``on_chord("nav+yes" | "nav+no" | "nav+act")``.
+  - NAV tapped alone        → ``on_tap("nav")`` (fires on release if NAV was
+                              not used as a modifier).
   - ACT held + NO           → ``on_chord("act+no")`` (clear-line Ctrl+U).
   - YES or NO tapped alone  → ``on_tap("yes" | "no")``.
   - Everything else         → no-op.
@@ -39,12 +41,18 @@ try:
 except OSError:
     sd = None  # type: ignore[assignment]
 
+try:
+    from Quartz import CGEventGetIntegerValueField, kCGKeyboardEventKeycode
+except ImportError:  # non-darwin or Quartz unavailable
+    CGEventGetIntegerValueField = None
+    kCGKeyboardEventKeycode = None
+
 logger = logging.getLogger(__name__)
 
 
 DEFAULT_OUTPUT_DIR = Path("/tmp/code-trip-audio")
 
-LOGICAL_KEYS = ("ptt", "act", "yes", "no", "nav")
+LOGICAL_KEYS = ("ptt", "yes", "no", "act", "nav")
 
 MIN_RECORDING_SECONDS = 0.2
 
@@ -66,6 +74,7 @@ class Macropad:
     on_audio: Callable[[Path], None]
     on_chord: Callable[[str], None]
     on_tap: Callable[[str], None] | None = None
+    on_ptt_press: Callable[[], None] | None = None
     ptt_forward_key: keyboard.Key | keyboard.KeyCode | None = None
     sample_rate: int = 16_000
     device: int | str | None = None
@@ -80,22 +89,39 @@ class Macropad:
     _listener: keyboard.Listener | None = field(default=None, init=False, repr=False)
     _reverse: dict[object, str] = field(default_factory=dict, init=False, repr=False)
     _held: set[str] = field(default_factory=set, init=False, repr=False)
+    _nav_chorded: bool = field(default=False, init=False, repr=False)
+    _suppress_vks: set[int] = field(default_factory=set, init=False, repr=False)
 
     def __post_init__(self) -> None:
         missing = set(LOGICAL_KEYS) - set(self.keymap)
         if missing:
             raise MacropadError(f"Missing keymap entries: {sorted(missing)}")
         self._reverse = {pk: name for name, pk in self.keymap.items()}
+        for k in self.keymap.values():
+            val = getattr(k, "value", k)
+            vk = getattr(val, "vk", None)
+            if vk is not None:
+                self._suppress_vks.add(vk)
 
     def start(self) -> None:
         if self._listener is not None:
             raise MacropadError("Already listening")
-        self._listener = keyboard.Listener(
-            on_press=self._on_press,
-            on_release=self._on_release,
-        )
+        kwargs: dict = {"on_press": self._on_press, "on_release": self._on_release}
+        if CGEventGetIntegerValueField is not None:
+            kwargs["darwin_intercept"] = self._darwin_intercept
+        self._listener = keyboard.Listener(**kwargs)
         self._listener.daemon = True
         self._listener.start()
+
+    def _darwin_intercept(self, event_type: object, event: object) -> object | None:
+        # Drop macropad keys at the OS event tap so the focused app never sees
+        # them (kitty's CSI-u protocol would otherwise spam escape sequences
+        # while NAV/PTT is held).
+        try:
+            vk = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)
+        except Exception:
+            return event
+        return None if vk in self._suppress_vks else event
 
     def stop(self) -> None:
         if self._listener is not None:
@@ -116,15 +142,26 @@ class Macropad:
             return
         self._held.add(name)
 
+        if name == "nav":
+            self._nav_chorded = False
+        elif "nav" in self._held:
+            self._nav_chorded = True
+
         nav_modifier = "nav" in self._held and name != "nav"
         act_modifier = "act" in self._held and name != "act"
         if name == "ptt":
             if nav_modifier:
                 self._fire_chord("nav+ptt")
-            elif self.ptt_forward_key is not None:
-                self._press_forward()
             else:
-                self._start_recording()
+                if self.on_ptt_press is not None:
+                    try:
+                        self.on_ptt_press()
+                    except Exception:
+                        logger.exception("on_ptt_press failed")
+                if self.ptt_forward_key is not None:
+                    self._press_forward()
+                else:
+                    self._start_recording()
         elif name in ("yes", "no", "act") and nav_modifier:
             self._fire_chord(f"nav+{name}")
         elif name == "no" and act_modifier:
@@ -144,6 +181,9 @@ class Macropad:
                 self._release_forward_if_held()
             else:
                 self._finish_recording()
+        elif name == "nav":
+            if not self._nav_chorded and self.on_tap is not None:
+                self._fire_tap("nav")
 
     # --- audio ------------------------------------------------------------
 

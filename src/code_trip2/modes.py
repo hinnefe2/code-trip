@@ -1,16 +1,21 @@
-"""Modes and voice dispatch.
+"""Voice routing + chunked audio playback.
 
-Modes reflect the *surface being interacted with*, not workflow phase:
+Routing layers (checked in order):
 
-- IDLE        — no mode active; PTT routes by keyword (mode changes, status)
-- DICTATE     — paste transcript into the frontmost macOS app
-- NAVIGATING  — choosing tmux windows/panes
-- WORK        — voice ↔ remote Claude in the active pane
-- LINEAR      — ticket list via a dedicated pane running `claude -p ...`
-- SLACK       — stubbed
+1. Global commands — status, repeat / what, stop / cancel.
+2. Voice phrases — tmux window navigation; Linear ticket browsing.
+3. App-focus dispatch — if the frontmost macOS app is in
+   ``config.terminal_apps``, the transcript goes to the active tmux pane
+   (talk-to-Claude). Otherwise it pastes into the focused app.
 
-Only one entry point matters today: ``handle_voice(ctx, transcript)``.
-Keyed gestures (NAV/OK/NO/ACT) will be added when the macro pad is ready.
+There is no semantic mode FSM. State that used to live on a "mode"
+(active tmux window, ticket cursor) lives on :class:`Context` as plain
+fields.
+
+Long Claude responses are split into ~1–3-sentence chunks and played
+sequentially on a worker thread. Macropad taps consult
+:func:`is_playback_active` to decide whether to advance / stop playback
+or fall through to the focused-app keystroke.
 """
 
 from __future__ import annotations
@@ -18,8 +23,8 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 from dataclasses import dataclass, field
-from typing import Any
 
 from code_trip2 import earcon, remote, window
 from code_trip2.config import Config
@@ -31,8 +36,6 @@ logger = logging.getLogger(__name__)
 
 # --- Context ---------------------------------------------------------------
 
-MODES = ("IDLE", "DICTATE", "NAVIGATING", "WORK", "LINEAR", "SLACK")
-
 
 @dataclass
 class Context:
@@ -40,16 +43,25 @@ class Context:
     tts: TTSClient
     log: SessionLogger
     thinking: earcon.Thinking
-    mode: str = ""
-    # WORK state
+    # Active tmux window for talk-to-Claude turns (kept across turns).
     active_window: str = ""
-    # LINEAR state
+    # Linear ticket cache + cursor.
     tickets: list[dict] = field(default_factory=list)
     ticket_index: int = 0
+    # Last prompt sent to the active pane — anchor for finding Claude's
+    # response in the captured pane text.
+    last_sent_prompt: str = ""
+    # Chunked playback state.
+    playback_queue: list[str] = field(default_factory=list)
+    last_response_chunks: list[str] = field(default_factory=list)
+    _playback_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False
+    )
+    _playback_thread: "threading.Thread | None" = field(
+        default=None, init=False, repr=False
+    )
 
     def __post_init__(self) -> None:
-        if not self.mode:
-            self.mode = self.config.default_mode
         if not self.active_window:
             self.active_window = self.config.work_window
 
@@ -62,86 +74,106 @@ class Context:
 
 
 def handle_voice(ctx: Context, transcript: str) -> None:
-    """Route a PTT transcript based on the current mode."""
+    """Route a PTT transcript: globals → voice phrases → app focus."""
     t = transcript.strip()
     if not t:
         return
 
-    if _try_mode_switch(ctx, t):
-        return
     if _try_global_commands(ctx, t):
         return
-
-    if ctx.mode == "WORK":
-        _work_voice(ctx, t)
-    elif ctx.mode == "DICTATE":
-        _dictate_voice(ctx, t)
-    elif ctx.mode == "NAVIGATING":
-        _nav_voice(ctx, t)
-    elif ctx.mode == "LINEAR":
-        _linear_voice(ctx, t)
-    elif ctx.mode == "SLACK":
-        _speak(ctx, "Slack mode is not yet implemented.")
-    else:
-        # IDLE: no mode → assume WORK for this turn
-        _enter_mode(ctx, "WORK")
-        _work_voice(ctx, t)
-
-
-# --- mode switching --------------------------------------------------------
-
-_MODE_PHRASES: dict[str, tuple[str, ...]] = {
-    "WORK": ("work mode", "switch to work", "start working"),
-    "DICTATE": ("dictation mode", "dictate mode", "switch to dictate"),
-    "NAVIGATING": ("navigation mode", "switch windows"),
-    "LINEAR": ("linear mode", "list tickets", "show tickets", "my tickets"),
-    "SLACK": ("slack mode", "check slack", "read slack"),
-    "IDLE": ("idle mode", "go idle", "exit mode"),
-}
-
-
-def _try_mode_switch(ctx: Context, t: str) -> bool:
-    low = t.lower()
-    for mode, phrases in _MODE_PHRASES.items():
-        if any(p in low for p in phrases):
-            _enter_mode(ctx, mode)
-            # "list tickets" should also refresh on entry
-            if mode == "LINEAR" and "ticket" in low:
-                _linear_refresh(ctx)
-            return True
-    return False
-
-
-def _enter_mode(ctx: Context, mode: str) -> None:
-    if mode not in MODES:
+    if _try_voice_phrase(ctx, t):
         return
-    if ctx.mode == mode:
-        return
-    prev, ctx.mode = ctx.mode, mode
-    ctx.log.event("mode", **{"from": prev, "to": mode})
+    _dispatch_by_focus(ctx, t)
+
+
+def _dispatch_by_focus(ctx: Context, t: str) -> None:
     try:
-        earcon.mode_chime(mode)
-    except earcon.EarconError:
-        logger.exception("Mode chime failed")
-    _speak(ctx, f"{mode.lower()} mode")
+        app = window.active_app()
+    except window.WindowError as exc:
+        logger.warning("active_app failed (%s); defaulting to WORK branch.", exc)
+        _work_voice(ctx, t)
+        return
+
+    if app in ctx.config.terminal_apps:
+        _work_voice(ctx, t)
+    else:
+        _dictate_voice(ctx, t)
 
 
 # --- global commands -------------------------------------------------------
 
 
 def _try_global_commands(ctx: Context, t: str) -> bool:
-    low = t.lower()
-    if low in ("what", "repeat", "say that again"):
-        # No history buffer yet; tell user.
-        _speak(ctx, "Nothing to repeat.")
+    low = t.lower().strip(" .!?")
+    if (
+        low == "what"
+        or low.startswith("repeat")
+        or "say that again" in low
+        or "say it again" in low
+    ):
+        if ctx.last_response_chunks:
+            with ctx._playback_lock:
+                ctx.playback_queue = list(ctx.last_response_chunks)
+            _start_playback_worker(ctx)
+        else:
+            _speak(ctx, "Nothing to repeat.")
+        return True
+    if low in ("stop", "cancel", "stop talking", "shut up", "be quiet"):
+        stop_playback(ctx)
         return True
     if low.startswith("status"):
-        _speak(ctx, f"{ctx.mode.lower()} mode. Active window: {ctx.active_window}.")
+        try:
+            app = window.active_app()
+        except window.WindowError:
+            app = "unknown"
+        _speak(ctx, f"App {app}. Window {ctx.active_window}.")
         return True
     return False
 
 
-# --- DICTATE ---------------------------------------------------------------
+# --- voice phrases ---------------------------------------------------------
+
+
+def _try_voice_phrase(ctx: Context, t: str) -> bool:
+    low = t.lower()
+
+    if any(p in low for p in (
+        "list tickets", "show tickets", "my tickets",
+        "refresh tickets", "reload tickets",
+    )):
+        _linear_refresh(ctx)
+        return True
+    if ctx.tickets:
+        bare = low.strip(" .!?")
+        if bare in ("next", "next ticket"):
+            _linear_step(ctx, +1)
+            return True
+        if bare in ("previous", "prev", "back", "previous ticket"):
+            _linear_step(ctx, -1)
+            return True
+        m = re.match(r"(?:select|work on|start)\s+(?:ticket\s+)?(\d+|this)", low)
+        if m:
+            token = m.group(1)
+            idx = ctx.ticket_index if token == "this" else int(token) - 1
+            _linear_select(ctx, idx)
+            return True
+
+    if "list windows" in low or "what windows" in low:
+        _announce_windows(ctx)
+        return True
+    m = re.match(r"(?:switch(?:\s+to)?|go\s+to)\s+(.+?)[\.\s]*$", low)
+    if m:
+        _select_window(ctx, m.group(1).strip())
+        return True
+    m = re.match(r"new\s+window\s+(.+?)[\.\s]*$", low)
+    if m:
+        _new_window(ctx, m.group(1).strip())
+        return True
+
+    return False
+
+
+# --- DICTATE branch --------------------------------------------------------
 
 
 def _dictate_voice(ctx: Context, t: str) -> None:
@@ -150,21 +182,26 @@ def _dictate_voice(ctx: Context, t: str) -> None:
     except window.WindowError as exc:
         _report_error(ctx, f"Could not paste: {exc}")
         return
-    ctx.log.event("turn", mode="DICTATE", transcript=t)
+    ctx.log.event("turn", branch="dictate", transcript=t)
 
 
-# --- WORK ------------------------------------------------------------------
+# --- WORK branch -----------------------------------------------------------
 
 
 def _work_voice(ctx: Context, t: str) -> None:
     host, opts = ctx.ssh
     win = ctx.active_window
     cfg = ctx.config
+
+    # Drop any in-flight playback before sending a new turn.
+    stop_playback(ctx)
+
     try:
         remote.send(host, opts, cfg.tmux_session, win, t)
     except remote.RemoteError as exc:
         _report_error(ctx, f"Could not reach Claude: {exc}")
         return
+    ctx.last_sent_prompt = t
 
     ctx.thinking.start()
     raw: str | None = None
@@ -178,99 +215,199 @@ def _work_voice(ctx: Context, t: str) -> None:
             _report_error(ctx, f"Lost connection to Claude: {exc}")
             return
         try:
-            raw = remote.capture(host, opts, cfg.tmux_session, win, lines=200)
+            raw = remote.capture(host, opts, cfg.tmux_session, win, lines=2000)
         except remote.RemoteError as exc:
             _report_error(ctx, f"Could not read Claude's response: {exc}")
             return
     finally:
         ctx.thinking.stop()
 
-    spoken = clean_output(raw or "")
-    _speak(ctx, spoken or "No output.")
-    try:
-        earcon.completion()
-    except earcon.EarconError:
-        pass
-    ctx.log.event("turn", mode="WORK", user=t, remote_output=raw, spoken=spoken)
+    spoken = clean_output(raw or "", anchor=t)
+    ctx.log.event("turn", branch="work", user=t, remote_output=raw, spoken=spoken)
+    if not spoken:
+        _speak(ctx, "No output.")
+        return
+    _speak_chunked(ctx, spoken)
 
 
-# Strip ANSI + box-drawing, collapse whitespace, truncate code blocks.
+# --- output cleanup --------------------------------------------------------
+
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
 _BOX_RE = re.compile(r"[╭╮╰╯│─┌┐└┘├┤┬┴┼━┃┏┓┗┛┣┫┳┻╋]")
+_ANCHOR_PREFIX_LEN = 30
 
 
-def clean_output(raw: str) -> str:
-    """Minimal Python-side cleanup of Claude's terminal output.
+def clean_output(raw: str, anchor: str | None = None) -> str:
+    """Extract Claude's most recent message from captured pane text.
 
-    Goal: extract the most recent assistant message from the captured
-    pane. Claude Code prints output above its input prompt (the trailing
-    `>` line). We strip ANSI / box-drawing chars, drop the input prompt
-    block, and return the last non-empty segment.
+    With ``anchor``, find the **last** line containing the first
+    ``_ANCHOR_PREFIX_LEN`` chars of the anchor (the user prompt) and
+    return everything after that line — that's Claude's response,
+    independent of pane height. Without an anchor (or when the anchor
+    isn't found), fall back to the last 60 non-empty lines.
     """
     if not raw:
         return ""
     s = _ANSI_RE.sub("", raw)
     s = _BOX_RE.sub("", s)
-    # Drop trailing "> " prompt lines
     lines = [ln.rstrip() for ln in s.splitlines()]
     while lines and (not lines[-1].strip() or lines[-1].strip().startswith(">")):
         lines.pop()
-    # Take the tail: last ~60 non-empty lines
-    tail = [ln for ln in lines if ln.strip()][-60:]
-    cleaned = "\n".join(tail).strip()
-    # Collapse runs of blank lines (already stripped) and long whitespace runs
+
+    if anchor:
+        body = _slice_after_anchor(lines, anchor)
+    else:
+        body = [ln for ln in lines if ln.strip()][-60:]
+
+    cleaned = "\n".join(body).strip()
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
-    # Cap total length
-    if len(cleaned) > 4000:
-        cleaned = cleaned[-4000:]
     return cleaned
 
 
-# --- NAVIGATING ------------------------------------------------------------
+def _slice_after_anchor(lines: list[str], anchor: str) -> list[str]:
+    needle = anchor.strip()[:_ANCHOR_PREFIX_LEN]
+    if not needle:
+        return [ln for ln in lines if ln.strip()][-60:]
+    last_idx = -1
+    for i, ln in enumerate(lines):
+        if needle in ln:
+            last_idx = i
+    if last_idx < 0:
+        logger.warning("Anchor %r not found in capture; falling back to tail.", needle)
+        return [ln for ln in lines if ln.strip()][-60:]
+    return [ln for ln in lines[last_idx + 1 :] if ln.strip()]
 
 
-def _nav_voice(ctx: Context, t: str) -> None:
-    """Voice commands for window navigation.
+# --- chunked playback ------------------------------------------------------
 
-    Recognized patterns (keyword-based):
-      - "list windows" / "what windows"
-      - "switch to <name>" / "go to <name>"
-      - "new window <name>"
-    Anything else: speak the window list.
-    """
-    low = t.lower()
+_SENT_END = re.compile(r"(?<=[.!?])\s+")
+_PARA_BREAK = re.compile(r"\n\s*\n")
+_DEFAULT_CHUNK_CHARS = 200
+_DEFAULT_CHUNK_SENTENCES = 3
+
+
+def chunk_text(
+    text: str,
+    *,
+    max_chars: int = _DEFAULT_CHUNK_CHARS,
+    max_sentences: int = _DEFAULT_CHUNK_SENTENCES,
+) -> list[str]:
+    """Split text into ~1–3-sentence chunks, respecting paragraph breaks."""
+    text = text.strip()
+    if not text:
+        return []
+    chunks: list[str] = []
+    for para in (p.strip() for p in _PARA_BREAK.split(text)):
+        if not para:
+            continue
+        # Join terminal soft-wrapped lines within a paragraph.
+        para = re.sub(r"\s*\n\s*", " ", para)
+        sentences = [s.strip() for s in _SENT_END.split(para) if s.strip()]
+        if not sentences:
+            continue
+        cur = ""
+        cur_count = 0
+        for s in sentences:
+            candidate = (cur + " " + s).strip() if cur else s
+            if cur and (len(candidate) > max_chars or cur_count >= max_sentences):
+                chunks.append(cur)
+                cur = s
+                cur_count = 1
+            else:
+                cur = candidate
+                cur_count += 1
+        if cur:
+            chunks.append(cur)
+    return chunks
+
+
+def _speak_chunked(ctx: Context, text: str) -> None:
+    chunks = chunk_text(text)
+    if not chunks:
+        return
+    with ctx._playback_lock:
+        ctx.last_response_chunks = list(chunks)
+        ctx.playback_queue = list(chunks)
+    _start_playback_worker(ctx)
+
+
+def _start_playback_worker(ctx: Context) -> None:
+    with ctx._playback_lock:
+        existing = ctx._playback_thread
+        if existing is not None and existing.is_alive():
+            # An existing worker will pick up the new queue items.
+            return
+        if not ctx.playback_queue:
+            return
+        thread = threading.Thread(target=_playback_loop, args=(ctx,), daemon=True)
+        ctx._playback_thread = thread
+    thread.start()
+
+
+def _playback_loop(ctx: Context) -> None:
+    try:
+        while True:
+            with ctx._playback_lock:
+                if not ctx.playback_queue:
+                    break
+                chunk = ctx.playback_queue.pop(0)
+            try:
+                ctx.tts.speak(chunk)
+            except TTSClientError:
+                logger.exception("TTS failed for chunk")
+                break
+        try:
+            earcon.completion()
+        except earcon.EarconError:
+            pass
+    finally:
+        with ctx._playback_lock:
+            ctx._playback_thread = None
+
+
+def advance_playback(ctx: Context) -> None:
+    """Skip the current chunk; the worker will pick up the next one."""
+    ctx.tts.stop()
+
+
+def stop_playback(ctx: Context) -> None:
+    """Drop pending chunks and interrupt current playback."""
+    with ctx._playback_lock:
+        ctx.playback_queue.clear()
+    ctx.tts.stop()
+
+
+def is_playback_active(ctx: Context) -> bool:
+    """True while audio is playing or chunks remain queued."""
+    if ctx.tts.is_playing():
+        return True
+    with ctx._playback_lock:
+        return bool(ctx.playback_queue)
+
+
+# --- window navigation -----------------------------------------------------
+
+
+def _select_window(ctx: Context, name: str) -> None:
     host, opts = ctx.ssh
-    session = ctx.config.tmux_session
-
-    if "list" in low or "what" in low:
-        _announce_windows(ctx)
+    try:
+        remote.select_window(host, opts, ctx.config.tmux_session, name)
+    except remote.RemoteError as exc:
+        _report_error(ctx, f"Could not switch: {exc}")
         return
+    ctx.active_window = name
+    _speak(ctx, f"Switched to {name}.")
 
-    m = re.match(r"(?:switch(?:\s+to)?|go\s+to|select)\s+(.+)", low)
-    if m:
-        name = m.group(1).strip().strip(".")
-        try:
-            remote.select_window(host, opts, session, name)
-            ctx.active_window = name
-            _speak(ctx, f"Switched to {name}.")
-            _enter_mode(ctx, "WORK")
-        except remote.RemoteError as exc:
-            _report_error(ctx, f"Could not switch: {exc}")
+
+def _new_window(ctx: Context, name: str) -> None:
+    host, opts = ctx.ssh
+    try:
+        remote.new_window(host, opts, ctx.config.tmux_session, name)
+    except remote.RemoteError as exc:
+        _report_error(ctx, f"Could not create window: {exc}")
         return
-
-    m = re.match(r"new\s+window\s+(.+)", low)
-    if m:
-        name = m.group(1).strip().strip(".")
-        try:
-            remote.new_window(host, opts, session, name)
-            ctx.active_window = name
-            _speak(ctx, f"Created window {name}.")
-            _enter_mode(ctx, "WORK")
-        except remote.RemoteError as exc:
-            _report_error(ctx, f"Could not create window: {exc}")
-        return
-
-    _announce_windows(ctx)
+    ctx.active_window = name
+    _speak(ctx, f"Created window {name}.")
 
 
 def _announce_windows(ctx: Context) -> None:
@@ -297,43 +434,6 @@ _LINEAR_REFRESH_PROMPT = (
 )
 
 _JSON_ARRAY_RE = re.compile(r"\[\s*\{.*\}\s*\]", re.DOTALL)
-
-
-def _linear_voice(ctx: Context, t: str) -> None:
-    low = t.lower()
-    if "refresh" in low or "reload" in low or "list" in low:
-        _linear_refresh(ctx)
-        return
-    if low in ("next", "next ticket"):
-        _linear_step(ctx, +1)
-        return
-    if low in ("previous", "prev", "back", "previous ticket"):
-        _linear_step(ctx, -1)
-        return
-    m = re.match(r"(?:select|work on|start)\s+(?:ticket\s+)?(\d+|this)", low)
-    if m:
-        token = m.group(1)
-        idx: int | None
-        if token == "this":
-            idx = ctx.ticket_index
-        else:
-            idx = int(token) - 1
-        _linear_select(ctx, idx)
-        return
-    # Otherwise treat as a filter / free-text query on cached tickets
-    if ctx.tickets:
-        hits = [
-            t_ for t_ in ctx.tickets
-            if low in str(t_.get("title", "")).lower()
-            or low in str(t_.get("id", "")).lower()
-        ]
-        if hits:
-            ctx.tickets = hits
-            ctx.ticket_index = 0
-            _speak(ctx, f"{len(hits)} tickets match.")
-            _linear_announce(ctx)
-            return
-    _speak(ctx, "Say 'list', 'next', 'previous', or 'select <n>'.")
 
 
 def _linear_refresh(ctx: Context) -> None:
@@ -366,7 +466,7 @@ def _linear_refresh(ctx: Context) -> None:
 
 def _linear_step(ctx: Context, delta: int) -> None:
     if not ctx.tickets:
-        _speak(ctx, "No tickets. Say 'list' to refresh.")
+        _speak(ctx, "No tickets. Say 'list tickets' to refresh.")
         return
     ctx.ticket_index = (ctx.ticket_index + delta) % len(ctx.tickets)
     _linear_announce(ctx)
@@ -381,19 +481,21 @@ def _linear_announce(ctx: Context) -> None:
     title = str(t.get("title", ""))
     prio = str(t.get("priority", "")) or "no priority"
     assignee = str(t.get("assignee", "")) or "unassigned"
-    _speak(ctx, f"{ctx.ticket_index + 1} of {len(ctx.tickets)}. {tid}. {title}. Priority {prio}. Assigned to {assignee}.")
+    _speak(
+        ctx,
+        f"{ctx.ticket_index + 1} of {len(ctx.tickets)}. {tid}. {title}. "
+        f"Priority {prio}. Assigned to {assignee}.",
+    )
 
 
-def _linear_select(ctx: Context, idx: int | None) -> None:
-    if not ctx.tickets or idx is None or idx < 0 or idx >= len(ctx.tickets):
+def _linear_select(ctx: Context, idx: int) -> None:
+    if not ctx.tickets or idx < 0 or idx >= len(ctx.tickets):
         _speak(ctx, "No such ticket.")
         return
     t = ctx.tickets[idx]
     tid = str(t.get("id", ""))
     branch = str(t.get("branch", "")) or tid.lower()
     ctx.ticket_index = idx
-    # Open a window for the ticket; rely on the user's existing shell
-    # to have the right setup. Domain logic stays on the remote side.
     host, opts = ctx.ssh
     try:
         remote.new_window(host, opts, ctx.config.tmux_session, branch)
@@ -403,7 +505,6 @@ def _linear_select(ctx: Context, idx: int | None) -> None:
         return
     ctx.active_window = branch
     _speak(ctx, f"Opened {tid} in window {branch}.")
-    _enter_mode(ctx, "WORK")
 
 
 # --- helpers ---------------------------------------------------------------
@@ -425,4 +526,4 @@ def _report_error(ctx: Context, message: str) -> None:
     except earcon.EarconError:
         pass
     _speak(ctx, message)
-    ctx.log.event("error", message=message, mode=ctx.mode)
+    ctx.log.event("error", message=message)
