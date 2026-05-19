@@ -15,11 +15,13 @@ deliberately pairs "next unread" with "history back".
 from __future__ import annotations
 
 import logging
+import re
+import subprocess
 from typing import TYPE_CHECKING
 
 from pynput import keyboard
 
-from code_trip2 import earcon, window
+from code_trip2 import earcon, remote, window
 from code_trip2.tts_client import TTSClientError
 from code_trip2.window import Chord, KeyStroke
 
@@ -27,6 +29,11 @@ if TYPE_CHECKING:
     from code_trip2.modes import Context
 
 logger = logging.getLogger(__name__)
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
+_URL_RE = re.compile(r"https?://[^\s\)\]\}\"\'>`<]+")
+_URL_TRIM = ".,;:!?"
+_CHROME_APP = "Google Chrome"
 
 
 _KITTY_NEXT = KeyStroke(
@@ -70,6 +77,9 @@ APP_NAV: dict[str, tuple[KeyStroke, KeyStroke]] = {
 _TAP_YES = KeyStroke(chords=(Chord(key=keyboard.Key.enter),))
 _TAP_NO = KeyStroke(chords=(Chord(key=keyboard.Key.esc),))
 _TAP_NAV = KeyStroke(chords=(Chord(key=keyboard.Key.down),))
+
+# Cmd+T = open new tab (focuses the URL bar by default in Chrome).
+_CHROME_NEW_TAB = KeyStroke(chords=(Chord(modifiers=(keyboard.Key.cmd,), key="t"),))
 
 # ACT+NO = Ctrl+U (clear line to start in shell / readline inputs).
 _ACT_NO_CLEAR_LINE = KeyStroke(chords=(Chord(modifiers=(keyboard.Key.ctrl,), key="u"),))
@@ -115,6 +125,8 @@ def handle_tap(ctx: "Context", name: str) -> None:
         if name == "no":
             modes.stop_playback(ctx)
             return
+    if name == "nav" and _nav_tap_app_aware(ctx):
+        return
     stroke = TAP_STROKES.get(name)
     if stroke is None:
         logger.warning("Unknown tap: %s", name)
@@ -123,6 +135,53 @@ def handle_tap(ctx: "Context", name: str) -> None:
         window.send_keystroke(stroke)
     except Exception as exc:
         _speak_error(ctx, f"Could not send keystroke: {exc}")
+
+
+def _nav_tap_app_aware(ctx: "Context") -> bool:
+    """Per-app NAV-tap behavior. Returns True if handled (skip default Down)."""
+    try:
+        app = window.active_app()
+    except window.WindowError:
+        return False
+    if app in ctx.config.terminal_apps:
+        _open_last_pane_url(ctx)
+        return True
+    if app == _CHROME_APP:
+        _send_stroke(ctx, _CHROME_NEW_TAB)
+        return True
+    return False
+
+
+def _open_last_pane_url(ctx: "Context") -> None:
+    """Capture the active tmux pane, find the most recent URL, open in Chrome."""
+    host, opts = ctx.ssh
+    try:
+        raw = remote.capture(
+            host, opts, ctx.config.tmux_session, ctx.active_window, lines=200
+        )
+    except remote.RemoteError as exc:
+        _speak_error(ctx, f"Could not read pane: {exc}")
+        return
+    text = _ANSI_RE.sub("", raw)
+    matches = _URL_RE.findall(text)
+    if not matches:
+        _speak_error(ctx, "No URL in pane.")
+        return
+    url = matches[-1].rstrip(_URL_TRIM)
+    try:
+        subprocess.run(
+            ["open", "-a", _CHROME_APP, url],
+            check=True,
+            capture_output=True,
+            timeout=5.0,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        _speak_error(ctx, f"Could not open URL: {exc}")
+        return
+    try:
+        earcon.completion()
+    except earcon.EarconError:
+        pass
 
 
 def _nav(ctx: "Context", forward: bool) -> None:

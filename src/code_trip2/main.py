@@ -77,17 +77,13 @@ def run(config: Config) -> None:
         # mic input isn't talking over TTS.
         stop_playback(ctx)
 
+    # Dispatch off the pynput listener thread — anything slow (TTS,
+    # ssh capture) here would freeze the keyboard.
     def on_chord(name: str) -> None:
-        try:
-            handle_chord(ctx, name)
-        except Exception:
-            logger.exception("chord %s failed", name)
+        threading.Thread(target=handle_chord, args=(ctx, name), daemon=True).start()
 
     def on_tap(name: str) -> None:
-        try:
-            handle_tap(ctx, name)
-        except Exception:
-            logger.exception("tap %s failed", name)
+        threading.Thread(target=handle_tap, args=(ctx, name), daemon=True).start()
 
     ptt_forward_key = (
         resolve_key(config.stt_local_hotkey) if config.stt_provider == "local" else None

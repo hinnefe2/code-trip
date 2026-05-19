@@ -306,15 +306,31 @@ def test_suppress_vks_covers_all_macropad_keys():
 # --- Chord handler ---------------------------------------------------------
 
 
-def _ctx(app_cycle=("kitty", "Google Chrome", "Slack"), *, playing=False, queue=None):
+def _ctx(
+    app_cycle=("kitty", "Google Chrome", "Slack"),
+    *,
+    playing=False,
+    queue=None,
+    terminal_apps=("kitty",),
+    ssh_host="",
+    ssh_options=(),
+    tmux_session="s",
+    active_window="work",
+):
     tts = MagicMock()
     tts.is_playing.return_value = playing
-    config = SimpleNamespace(app_cycle=app_cycle)
+    config = SimpleNamespace(
+        app_cycle=app_cycle,
+        terminal_apps=terminal_apps,
+        tmux_session=tmux_session,
+    )
     return SimpleNamespace(
         tts=tts,
         config=config,
         playback_queue=list(queue or []),
         _playback_lock=threading.Lock(),
+        ssh=(ssh_host, ssh_options),
+        active_window=active_window,
     )
 
 
@@ -429,14 +445,127 @@ def test_tap_no_sends_escape(monkeypatch):
     assert sent[0].chords[0].key == keyboard.Key.esc
 
 
-def test_tap_nav_sends_down(monkeypatch):
+def test_tap_nav_in_other_app_sends_down(monkeypatch):
     ctx = _ctx()
     sent: list[KeyStroke] = []
     monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
+    # Frontmost is something neither in terminal_apps nor Chrome.
+    monkeypatch.setattr(window, "active_app", lambda: "TextEdit")
 
     chords.handle_tap(ctx, "nav")
     assert sent == [chords._TAP_NAV]
     assert sent[0].chords[0].key == keyboard.Key.down
+
+
+def test_tap_nav_active_app_error_falls_through_to_down(monkeypatch):
+    ctx = _ctx()
+    sent: list[KeyStroke] = []
+    monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
+    monkeypatch.setattr(
+        window, "active_app", lambda: (_ for _ in ()).throw(window.WindowError("x"))
+    )
+
+    chords.handle_tap(ctx, "nav")
+    assert sent == [chords._TAP_NAV]
+
+
+def test_tap_nav_in_chrome_opens_new_tab(monkeypatch):
+    ctx = _ctx()
+    sent: list[KeyStroke] = []
+    monkeypatch.setattr(window, "active_app", lambda: "Google Chrome")
+    monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
+
+    chords.handle_tap(ctx, "nav")
+
+    assert sent == [chords._CHROME_NEW_TAB]
+    assert sent[0].chords[0].key == "t"
+    assert sent[0].chords[0].modifiers == (keyboard.Key.cmd,)
+
+
+def test_tap_nav_in_terminal_opens_last_pane_url(monkeypatch):
+    ctx = _ctx()
+    monkeypatch.setattr(window, "active_app", lambda: "kitty")
+    pane = (
+        "Earlier output https://old.example.com/x referenced.\n"
+        "Then a status update.\n"
+        "Final URL is https://github.com/owner/repo/pull/42 here.\n"
+        ">\n"
+    )
+    monkeypatch.setattr(chords.remote, "capture", lambda *a, **kw: pane)
+    opened: list[list[str]] = []
+    monkeypatch.setattr(
+        chords.subprocess,
+        "run",
+        lambda cmd, **kw: opened.append(cmd) or MagicMock(),
+    )
+    monkeypatch.setattr(chords.earcon, "completion", lambda: None)
+
+    chords.handle_tap(ctx, "nav")
+
+    assert opened == [["open", "-a", "Google Chrome", "https://github.com/owner/repo/pull/42"]]
+
+
+def test_tap_nav_in_terminal_strips_trailing_punctuation(monkeypatch):
+    ctx = _ctx()
+    monkeypatch.setattr(window, "active_app", lambda: "kitty")
+    monkeypatch.setattr(
+        chords.remote, "capture", lambda *a, **kw: "see https://example.com/path."
+    )
+    opened: list[list[str]] = []
+    monkeypatch.setattr(
+        chords.subprocess,
+        "run",
+        lambda cmd, **kw: opened.append(cmd) or MagicMock(),
+    )
+    monkeypatch.setattr(chords.earcon, "completion", lambda: None)
+
+    chords.handle_tap(ctx, "nav")
+
+    assert opened[0][-1] == "https://example.com/path"
+
+
+def test_tap_nav_in_terminal_no_url_speaks_error(monkeypatch):
+    ctx = _ctx()
+    monkeypatch.setattr(window, "active_app", lambda: "kitty")
+    monkeypatch.setattr(chords.remote, "capture", lambda *a, **kw: "no urls here")
+    monkeypatch.setattr(chords.earcon, "error", lambda: None)
+    called: list[list[str]] = []
+    monkeypatch.setattr(chords.subprocess, "run", lambda cmd, **kw: called.append(cmd))
+
+    chords.handle_tap(ctx, "nav")
+
+    assert called == []
+    ctx.tts.speak.assert_called_once()
+    assert "url" in ctx.tts.speak.call_args.args[0].lower()
+
+
+def test_tap_nav_in_terminal_capture_error_speaks_error(monkeypatch):
+    ctx = _ctx()
+    monkeypatch.setattr(window, "active_app", lambda: "kitty")
+
+    def boom(*_a, **_kw):
+        raise chords.remote.RemoteError("ssh down")
+
+    monkeypatch.setattr(chords.remote, "capture", boom)
+    monkeypatch.setattr(chords.earcon, "error", lambda: None)
+
+    chords.handle_tap(ctx, "nav")
+
+    ctx.tts.speak.assert_called_once()
+    assert "ssh down" in ctx.tts.speak.call_args.args[0]
+
+
+def test_tap_nav_playback_active_still_advances(monkeypatch):
+    ctx = _ctx(queue=["chunk a", "chunk b"])
+    monkeypatch.setattr(window, "active_app", lambda: "kitty")
+    opened: list[list[str]] = []
+    monkeypatch.setattr(chords.subprocess, "run", lambda cmd, **kw: opened.append(cmd))
+
+    chords.handle_tap(ctx, "nav")
+
+    # Playback advance wins over the URL-open behavior.
+    assert opened == []
+    ctx.tts.stop.assert_called_once()
 
 
 def test_chord_act_no_sends_ctrl_u(monkeypatch):

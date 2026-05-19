@@ -363,6 +363,8 @@ def test_taps_pass_through_when_idle(monkeypatch):
     ctx = _real_ctx()  # queue empty, tts not playing
     sent: list = []
     monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
+    # Frontmost neither in terminal_apps nor Chrome → default keystrokes.
+    monkeypatch.setattr(window, "active_app", lambda: "TextEdit")
 
     chords.handle_tap(ctx, "nav")
     chords.handle_tap(ctx, "no")
