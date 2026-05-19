@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
 # Setup the Claude Code Stop hook for code-trip completion detection.
 #
-# This script writes a Stop hook into .claude/settings.json that touches a
-# signal file each time Claude finishes responding.  The signal file is:
+# This script writes a Stop hook into .claude/settings.json that fires
+# every time Claude finishes responding. It writes TWO things:
 #
-#   /tmp/claude-done-<window_name>
+#   1. /tmp/claude-done-<window_name>     (touch-file)
+#      Used by code_trip2.remote.wait_done() for synchronous waits in
+#      focused-mode WORK flow.
 #
-# where <window_name> comes from the tmux window the Claude session is running
-# in.  The code-trip orchestrator watches for this file to know when Claude is
-# done.
+#   2. /tmp/claude-events/<window>-<ts>.json     (JSON event)
+#      Used by code_trip2.producers.claude.ClaudeProducer in queue mode
+#      to surface a new task each time a Claude session finishes.
+#
+# Both are kept for backward compatibility — the orchestrator can run in
+# either app-mode and the hook serves both.
 #
 # Usage:
 #   Run this on the REMOTE host where Claude Code runs (inside the project
@@ -23,16 +28,21 @@ TARGET_DIR="${1:-.}"
 SETTINGS_DIR="${TARGET_DIR}/.claude"
 SETTINGS_FILE="${SETTINGS_DIR}/settings.json"
 
-HOOK_JSON='{
-  "hooks": {
-    "Stop": [
+# The hook command is intentionally a single shell expression so the
+# Stop hook only invokes one command. It (a) records the window name,
+# (b) touches the legacy signal file, and (c) writes a JSON event file.
+HOOK_CMD='WIN=$(tmux display-message -p '"'"'#{window_name}'"'"' 2>/dev/null || echo unknown); touch /tmp/claude-done-$WIN; mkdir -p /tmp/claude-events; printf '"'"'{"window":"%s","finished_at":%s}'"'"' "$WIN" "$(date +%s)" > /tmp/claude-events/$WIN-$(date +%s%N).json'
+
+HOOK_JSON="{
+  \"hooks\": {
+    \"Stop\": [
       {
-        "type": "command",
-        "command": "touch /tmp/claude-done-$(tmux display-message -p '"'"'#{window_name}'"'"' 2>/dev/null || echo unknown)"
+        \"type\": \"command\",
+        \"command\": \"${HOOK_CMD}\"
       }
     ]
   }
-}'
+}"
 
 mkdir -p "$SETTINGS_DIR"
 
@@ -43,7 +53,7 @@ if [ -f "$SETTINGS_FILE" ]; then
     echo "$HOOK_JSON"
     echo ""
     echo "The Stop hook command should be:"
-    echo '  touch /tmp/claude-done-$(tmux display-message -p '"'"'#{window_name}'"'"' 2>/dev/null || echo unknown)'
+    echo "  ${HOOK_CMD}"
     exit 1
 fi
 

@@ -90,6 +90,7 @@ class Macropad:
     _reverse: dict[object, str] = field(default_factory=dict, init=False, repr=False)
     _held: set[str] = field(default_factory=set, init=False, repr=False)
     _nav_chorded: bool = field(default=False, init=False, repr=False)
+    _act_chorded: bool = field(default=False, init=False, repr=False)
     _suppress_vks: set[int] = field(default_factory=set, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -147,6 +148,11 @@ class Macropad:
         elif "nav" in self._held:
             self._nav_chorded = True
 
+        if name == "act":
+            self._act_chorded = False
+        elif "act" in self._held:
+            self._act_chorded = True
+
         nav_modifier = "nav" in self._held and name != "nav"
         act_modifier = "act" in self._held and name != "act"
         if name == "ptt":
@@ -184,6 +190,9 @@ class Macropad:
         elif name == "nav":
             if not self._nav_chorded and self.on_tap is not None:
                 self._fire_tap("nav")
+        elif name == "act":
+            if not self._act_chorded and self.on_tap is not None:
+                self._fire_tap("act")
 
     # --- audio ------------------------------------------------------------
 

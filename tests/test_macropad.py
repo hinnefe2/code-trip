@@ -331,6 +331,7 @@ def _ctx(
         _playback_lock=threading.Lock(),
         ssh=(ssh_host, ssh_options),
         active_window=active_window,
+        app_mode="focused",
     )
 
 

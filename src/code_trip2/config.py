@@ -49,6 +49,14 @@ class Config:
     tts_speed: float = 1.15
     # claude
     wait_timeout: float = 300.0
+    # task-queue
+    startup_mode: str = "focused"           # "queue" | "focused"
+    # mcp producers (skeletons in v1; need a local MCP server command to start)
+    slack_channels: tuple[str, ...] = ()
+    slack_mcp_command: str = ""
+    slack_mcp_args: tuple[str, ...] = ()
+    linear_mcp_command: str = ""
+    linear_mcp_args: tuple[str, ...] = ()
 
 
 def _select(src: dict, *fields: str) -> dict:
@@ -119,5 +127,24 @@ def load_config(path: Path | str) -> Config:
     # claude
     if "wait_timeout" in claude:
         kw["wait_timeout"] = claude["wait_timeout"]
+
+    # task queue
+    queue_cfg = data.get("queue", {})
+    if "startup_mode" in queue_cfg:
+        kw["startup_mode"] = queue_cfg["startup_mode"]
+
+    slack_cfg = data.get("slack", {})
+    if "channels" in slack_cfg:
+        kw["slack_channels"] = tuple(slack_cfg["channels"])
+    if "mcp_command" in slack_cfg:
+        kw["slack_mcp_command"] = slack_cfg["mcp_command"]
+    if "mcp_args" in slack_cfg:
+        kw["slack_mcp_args"] = tuple(slack_cfg["mcp_args"])
+
+    linear_cfg = data.get("linear", {})
+    if "mcp_command" in linear_cfg:
+        kw["linear_mcp_command"] = linear_cfg["mcp_command"]
+    if "mcp_args" in linear_cfg:
+        kw["linear_mcp_args"] = tuple(linear_cfg["mcp_args"])
 
     return Config(**kw)

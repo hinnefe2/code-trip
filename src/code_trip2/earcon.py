@@ -57,6 +57,9 @@ MODE_CHIMES: dict[str, float] = {
     "WORK": 587.33,
     "LINEAR": 659.25,
     "SLACK": 783.99,
+    # Queue / focused-app app-modes for the task-queue dispatch.
+    "queue": 698.46,    # F5
+    "focused": 392.00,  # G4 — distinctly lower so direction of flip is audible
 }
 
 
@@ -65,6 +68,11 @@ def mode_chime(mode: str) -> None:
     if base is None:
         raise EarconError(f"Unknown mode: {mode}")
     _play(np.concatenate([_tone(base, 0.09), _tone(base * 1.5, 0.12)]))
+
+
+def new_task() -> None:
+    """A task just arrived on an empty/idle queue."""
+    _play(np.concatenate([_tone(523.25, 0.07), _tone(659.25, 0.10)]))
 
 
 class Thinking:

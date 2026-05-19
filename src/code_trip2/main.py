@@ -12,10 +12,18 @@ from pathlib import Path
 from code_trip2 import earcon
 from code_trip2.chords import handle_chord, handle_tap
 from code_trip2.config import Config, load_config
+from code_trip2.dispatch import QueueConsumer, handle_voice
 from code_trip2.macropad import Macropad, resolve_key
-from code_trip2.modes import Context, handle_voice, stop_playback
+from code_trip2.modes import Context, stop_playback
+from code_trip2.producers import ProducerSupervisor
+from code_trip2.producers.claude import ClaudeProducer
+from code_trip2.producers.linear import LinearProducer
+from code_trip2.producers.manual import ManualProducer
+from code_trip2.producers.slack import SlackProducer
+from code_trip2.queue_log import QueueLog
 from code_trip2.session_log import SessionLogger, default_session_path
 from code_trip2.stt_client import STTClient, STTClientError
+from code_trip2.tasks import TaskQueue
 from code_trip2.tts_client import TTSClient
 
 logger = logging.getLogger(__name__)
@@ -46,7 +54,36 @@ def run(config: Config) -> None:
         speed=config.tts_speed,
     )
     thinking = earcon.Thinking()
-    ctx = Context(config=config, tts=tts, log=log, thinking=thinking)
+
+    queue = TaskQueue()
+    queue_log = QueueLog()
+    queue_log.attach(queue)
+    # Replay last 24h of queue events so deferred / snoozed work survives a
+    # restart. Log records the replay-load so it shows up in offline analysis.
+    replayed = queue_log.replay()
+    if replayed:
+        queue.load(replayed)
+        logger.info("Replayed %d tasks from queue log", len(replayed))
+
+    ctx = Context(
+        config=config,
+        tts=tts,
+        log=log,
+        thinking=thinking,
+        queue=queue,
+        queue_log=queue_log,
+        app_mode=config.startup_mode if config.startup_mode in ("queue", "focused") else "focused",
+    )
+
+    # Producers run in their own threads; supervisor owns start/stop.
+    supervisor = ProducerSupervisor()
+    supervisor.add(ClaudeProducer(config=config, queue=queue))
+    supervisor.add(SlackProducer(config=config, queue=queue))
+    supervisor.add(LinearProducer(config=config, queue=queue))
+    supervisor.add(ManualProducer())
+
+    consumer = QueueConsumer(ctx)
+    consumer.attach()
 
     shutdown = threading.Event()
 
@@ -123,9 +160,13 @@ def run(config: Config) -> None:
         config.nav_key,
     )
     macropad.start()
+    supervisor.start_all()
+    consumer.start()
     try:
         shutdown.wait()
     finally:
+        consumer.stop()
+        supervisor.stop_all()
         macropad.stop()
         thinking.stop()
         log.close()

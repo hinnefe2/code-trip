@@ -116,7 +116,7 @@ def _send_stroke(ctx: "Context", stroke: KeyStroke) -> None:
 def handle_tap(ctx: "Context", name: str) -> None:
     # Playback-aware: while audio is playing or chunks are queued, NAV/NO
     # control playback instead of falling through to the focused app.
-    from code_trip2 import modes  # local import to avoid module-load cycle
+    from code_trip2 import dispatch, modes  # local import to avoid cycle
 
     if modes.is_playback_active(ctx):
         if name == "nav":
@@ -125,6 +125,21 @@ def handle_tap(ctx: "Context", name: str) -> None:
         if name == "no":
             modes.stop_playback(ctx)
             return
+
+    # ACT solo tap: app-mode flip (queue <-> focused). Mode-independent.
+    if name == "act":
+        dispatch.flip_mode(ctx)
+        return
+
+    # Queue mode: YES/NO drive the queue rather than the focused app.
+    if ctx.app_mode == dispatch.MODE_QUEUE:
+        if name == "yes":
+            dispatch.queue_yes_tap(ctx)
+            return
+        if name == "no":
+            dispatch.queue_no_tap(ctx)
+            return
+
     if name == "nav" and _nav_tap_app_aware(ctx):
         return
     stroke = TAP_STROKES.get(name)

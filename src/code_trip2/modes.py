@@ -28,7 +28,9 @@ from dataclasses import dataclass, field
 
 from code_trip2 import earcon, remote, window
 from code_trip2.config import Config
+from code_trip2.queue_log import QueueLog
 from code_trip2.session_log import SessionLogger
+from code_trip2.tasks import RecentTopics, Task, TaskQueue
 from code_trip2.tts_client import TTSClient, TTSClientError
 
 logger = logging.getLogger(__name__)
@@ -60,6 +62,13 @@ class Context:
     _playback_thread: "threading.Thread | None" = field(
         default=None, init=False, repr=False
     )
+    # Task-queue interaction surface (queue mode).
+    queue: TaskQueue = field(default_factory=TaskQueue)
+    queue_log: QueueLog | None = None
+    recent_topics: RecentTopics = field(default_factory=RecentTopics)
+    current_task: Task | None = None
+    # "queue" | "focused". See dispatch.py for the mode flip.
+    app_mode: str = "focused"
 
     def __post_init__(self) -> None:
         if not self.active_window:
@@ -103,6 +112,18 @@ def _dispatch_by_focus(ctx: Context, t: str) -> None:
 # --- global commands -------------------------------------------------------
 
 
+def replay_last(ctx: Context) -> bool:
+    """Re-queue the last response's chunks for playback. Returns True if
+    anything was queued. Used by both ``modes`` and ``dispatch`` repeat
+    handlers."""
+    if not ctx.last_response_chunks:
+        return False
+    with ctx._playback_lock:
+        ctx.playback_queue = list(ctx.last_response_chunks)
+    _start_playback_worker(ctx)
+    return True
+
+
 def _try_global_commands(ctx: Context, t: str) -> bool:
     low = t.lower().strip(" .!?")
     if (
@@ -111,11 +132,7 @@ def _try_global_commands(ctx: Context, t: str) -> bool:
         or "say that again" in low
         or "say it again" in low
     ):
-        if ctx.last_response_chunks:
-            with ctx._playback_lock:
-                ctx.playback_queue = list(ctx.last_response_chunks)
-            _start_playback_worker(ctx)
-        else:
+        if not replay_last(ctx):
             _speak(ctx, "Nothing to repeat.")
         return True
     if low in ("stop", "cancel", "stop talking", "shut up", "be quiet"):
@@ -322,6 +339,12 @@ def chunk_text(
 
 
 def _speak_chunked(ctx: Context, text: str) -> None:
+    speak_chunked(ctx, text)
+
+
+def speak_chunked(ctx: Context, text: str) -> None:
+    """Public entry point: chunk ``text`` and start playback. Replaces any
+    pending playback. Sets ``last_response_chunks`` for repeat support."""
     chunks = chunk_text(text)
     if not chunks:
         return
