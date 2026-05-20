@@ -1,0 +1,155 @@
+"""Tests for the TUI render function.
+
+We don't start a real ``Live`` display in tests — just verify ``render``
+produces a non-empty Layout that prints cleanly for the relevant states
+(idle queue, active task, populated queue, etc.).
+"""
+
+from __future__ import annotations
+
+import io
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+
+from rich.console import Console
+from rich.layout import Layout
+
+from code_trip2 import modes, tui
+from code_trip2.producers import ProducerSupervisor
+from code_trip2.tasks import Task
+
+
+def _make_ctx(*, app_mode="queue", summarizer_enabled=False):
+    tts = MagicMock()
+    tts.is_playing.return_value = False
+    cfg = SimpleNamespace(
+        ssh_host="",
+        ssh_options=(),
+        tmux_session="main",
+        work_window="work",
+        linear_window="linear",
+        terminal_apps=("kitty",),
+    )
+    summarizer = None
+    if summarizer_enabled:
+        summarizer = SimpleNamespace(enabled=True, _model="gpt-4o-mini")
+    ctx = modes.Context(
+        config=cfg,  # type: ignore[arg-type]
+        tts=tts,
+        log=MagicMock(),
+        thinking=MagicMock(),
+        summarizer=summarizer,
+    )
+    ctx.app_mode = app_mode
+    ctx.active_window = "ticket-42"
+    return ctx
+
+
+def _render_to_string(layout: Layout) -> str:
+    """Render the layout to a string so we can assert presence of pieces."""
+    buf = io.StringIO()
+    console = Console(file=buf, width=120, height=40, force_terminal=False)
+    console.print(layout)
+    return buf.getvalue()
+
+
+# --- format helpers --------------------------------------------------------
+
+
+def test_format_age_units():
+    assert tui._format_age(5) == "5s"
+    assert tui._format_age(120) == "2m"
+    assert tui._format_age(3700) == "1h"
+    assert tui._format_age(86_400 * 3) == "3d"
+
+
+def test_truncate_handles_newlines_and_caps():
+    assert tui._truncate("a\nb\nc", 80) == "a b c"
+    assert tui._truncate("x" * 100, 10) == "x" * 9 + "…"
+
+
+# --- render ----------------------------------------------------------------
+
+
+def test_render_idle_queue_mode():
+    ctx = _make_ctx(app_mode="queue")
+    layout = tui.render(ctx, supervisor=None)
+    out = _render_to_string(layout)
+    assert "QUEUE" in out
+    assert "ticket-42" in out
+    assert "queue empty" in out.lower()
+    assert "idle" in out.lower() or "say 'next'" in out.lower()
+
+
+def test_render_focused_mode_shows_summarizer_state():
+    ctx = _make_ctx(app_mode="focused", summarizer_enabled=True)
+    layout = tui.render(ctx, supervisor=None)
+    out = _render_to_string(layout)
+    assert "FOCUSED" in out
+    assert "gpt-4o-mini" in out
+
+
+def test_render_summarizer_off_when_disabled():
+    ctx = _make_ctx(summarizer_enabled=False)
+    layout = tui.render(ctx, supervisor=None)
+    out = _render_to_string(layout)
+    assert "off" in out  # the "off" label for missing summarizer
+
+
+def test_render_current_task():
+    ctx = _make_ctx()
+    t = Task(
+        kind="claude_reply",
+        topic="ticket-42",
+        headline="replied to: run the tests",
+        body="Tests passed in two files.",
+    )
+    ctx.current_task = t
+    layout = tui.render(ctx, supervisor=None)
+    out = _render_to_string(layout)
+    assert "claude_reply" in out
+    assert "ticket-42" in out
+    assert "replied to: run the tests" in out
+
+
+def test_render_populated_queue_shows_pending_count_and_top():
+    ctx = _make_ctx()
+    ctx.queue.add(Task(kind="claude_reply", topic="ticket-42", headline="top item",
+                       created_at=1.0))
+    ctx.queue.add(Task(kind="slack_msg", topic="general", headline="alice pinged",
+                       created_at=100.0))
+    layout = tui.render(ctx, supervisor=None)
+    out = _render_to_string(layout)
+    assert "2 pending" in out
+    assert "top item" in out
+    assert "alice pinged" in out
+
+
+def test_render_recent_topics_shows_recent_first():
+    ctx = _make_ctx()
+    import time as _t
+    ctx.recent_topics.touch("ticket-1", now=_t.time() - 60)
+    ctx.recent_topics.touch("ticket-2", now=_t.time() - 5)
+    layout = tui.render(ctx, supervisor=None)
+    out = _render_to_string(layout)
+    # Both topics rendered; ticket-2 (more recent) should appear before
+    # ticket-1 in the output stream.
+    assert out.find("ticket-2") < out.find("ticket-1")
+
+
+def test_render_producers_status_uses_supervisor():
+    ctx = _make_ctx()
+    sup = ProducerSupervisor()
+    # Fake two producers: one idle, one running.
+    sup.add(SimpleNamespace(name="claude", _thread=SimpleNamespace(is_alive=lambda: True),
+                            start=lambda: None, stop=lambda: None))
+    sup.add(SimpleNamespace(name="slack", _thread=None,
+                            start=lambda: None, stop=lambda: None))
+    layout = tui.render(ctx, supervisor=sup)
+    out = _render_to_string(layout)
+    assert "claude" in out
+    assert "running" in out
+    assert "slack" in out
+    assert "idle" in out

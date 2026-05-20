@@ -26,11 +26,12 @@ from code_trip2.stt_client import STTClient, STTClientError
 from code_trip2.summarizer import Summarizer
 from code_trip2.tasks import TaskQueue
 from code_trip2.tts_client import TTSClient
+from code_trip2.tui import Dashboard
 
 logger = logging.getLogger(__name__)
 
 
-def run(config: Config) -> None:
+def run(config: Config, *, tui: bool = False) -> None:
     log = SessionLogger(default_session_path())
     log.event("session_start", config={
         "tmux_session": config.tmux_session,
@@ -171,9 +172,14 @@ def run(config: Config) -> None:
     macropad.start()
     supervisor.start_all()
     consumer.start()
+    dashboard = Dashboard(ctx, supervisor=supervisor) if tui else None
+    if dashboard is not None:
+        dashboard.start()
     try:
         shutdown.wait()
     finally:
+        if dashboard is not None:
+            dashboard.stop()
         consumer.stop()
         supervisor.stop_all()
         macropad.stop()
@@ -185,15 +191,34 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="code-trip")
     parser.add_argument("--config", type=Path, required=True, help="Path to TOML config")
     parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument(
+        "--tui",
+        action="store_true",
+        help="Show a live status dashboard. Suppresses Python logging output.",
+    )
     args = parser.parse_args(argv)
 
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(name)s %(levelname)s: %(message)s",
-    )
+    if args.tui:
+        # The live display owns the terminal; route logs to a file so they
+        # don't clobber the dashboard. tail -f the file in another pane to
+        # debug.
+        log_dir = Path.home() / ".code-trip" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / "orchestrator.log"
+        logging.basicConfig(
+            level=logging.DEBUG if args.verbose else logging.INFO,
+            format="%(asctime)s %(name)s %(levelname)s: %(message)s",
+            handlers=[logging.FileHandler(log_path)],
+            force=True,
+        )
+    else:
+        logging.basicConfig(
+            level=logging.DEBUG if args.verbose else logging.INFO,
+            format="%(asctime)s %(name)s %(levelname)s: %(message)s",
+        )
 
     config = load_config(args.config)
-    run(config)
+    run(config, tui=args.tui)
     return 0
 
 

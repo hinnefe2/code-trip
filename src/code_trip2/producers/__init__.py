@@ -52,3 +52,25 @@ class ProducerSupervisor:
                 p.stop()
             except Exception:
                 logger.exception("Failed to stop producer %s", p.name)
+
+    def status(self) -> list[tuple[str, str]]:
+        """Best-effort ``(name, state)`` per producer for the TUI / debug.
+
+        State is one of ``running`` (thread alive), ``stopped`` (thread
+        existed but exited), ``ready`` (manual-style producer with no
+        background work), or ``idle`` (never started, e.g. because the
+        relevant config was empty).
+        """
+        out: list[tuple[str, str]] = []
+        for p in self._producers:
+            thread = getattr(p, "_thread", None)
+            if thread is None:
+                out.append((p.name, "ready" if p.name == "manual" else "idle"))
+            elif thread.is_alive():
+                out.append((p.name, "running"))
+            else:
+                out.append((p.name, "stopped"))
+        return out
+
+    def __iter__(self):
+        return iter(self._producers)
