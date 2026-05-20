@@ -21,8 +21,8 @@ from code_trip2.producers.linear import LinearProducer
 from code_trip2.producers.manual import ManualProducer
 from code_trip2.producers.slack import SlackProducer
 from code_trip2.queue_log import QueueLog
+from code_trip2.producers.claude_mcp import ClaudeMCPClient
 from code_trip2.session_log import SessionLogger, default_session_path
-from code_trip2.slack_filter import SlackFilter
 from code_trip2.slack_state import SlackState
 from code_trip2.stt_client import STTClient, STTClientError
 from code_trip2.summarizer import Summarizer
@@ -81,14 +81,12 @@ def run(config: Config, *, tui: bool = False) -> None:
         logger.info("TUI host detected as %r; suppressing synthesized "
                     "keystrokes that would target it.", tui_host_app)
 
-    slack_client = None
-    if config.slack_bot_token:
-        try:
-            from slack_sdk import WebClient
-
-            slack_client = WebClient(token=config.slack_bot_token)
-        except ImportError:
-            logger.warning("slack_sdk not installed; Slack producer disabled.")
+    slack_mcp = ClaudeMCPClient(server_id="claude_ai_Slack")
+    if not slack_mcp.enabled:
+        logger.info(
+            "Slack MCP via claude CLI not available; Slack producer will "
+            "stay idle. Install claude CLI to enable."
+        )
 
     ctx = Context(
         config=config,
@@ -99,27 +97,14 @@ def run(config: Config, *, tui: bool = False) -> None:
         queue_log=queue_log,
         summarizer=summarizer,
         tui_host_app=tui_host_app,
-        slack_client=slack_client,
+        slack_mcp=slack_mcp,
         app_mode=config.startup_mode if config.startup_mode in ("queue", "focused") else "focused",
-    )
-
-    slack_filter = SlackFilter(
-        api_key=config.api_key,
-        extra_prompt=config.slack_filter_extra,
     )
 
     # Producers run in their own threads; supervisor owns start/stop.
     supervisor = ProducerSupervisor()
     supervisor.add(ClaudeProducer(config=config, queue=queue, summarizer=summarizer))
-    supervisor.add(
-        SlackProducer(
-            config=config,
-            queue=queue,
-            client=slack_client,
-            filter_=slack_filter,
-            state=SlackState(),
-        )
-    )
+    supervisor.add(SlackProducer(config=config, queue=queue, mcp=slack_mcp, state=SlackState()))
     supervisor.add(LinearProducer(config=config, queue=queue))
     supervisor.add(ManualProducer())
 

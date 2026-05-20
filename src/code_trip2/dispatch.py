@@ -287,10 +287,10 @@ def _respond_claude(ctx: "Context", task: Task, transcript: str) -> None:
 
 
 def _respond_slack(ctx: "Context", task: Task, transcript: str) -> None:
-    """Reply in the Slack thread the task came from."""
-    client = ctx.slack_client
-    if client is None:
-        _speak(ctx, "Slack client is not configured.")
+    """Reply in the Slack thread the task came from via the Slack MCP."""
+    mcp = ctx.slack_mcp
+    if mcp is None:
+        _speak(ctx, "Slack MCP is not configured.")
         return
     channel_id = task.source.get("channel_id")
     thread_ts = task.source.get("thread_ts") or task.source.get("ts")
@@ -298,8 +298,13 @@ def _respond_slack(ctx: "Context", task: Task, transcript: str) -> None:
         _speak(ctx, "Missing Slack channel for this task.")
         return
     try:
-        client.chat_postMessage(
-            channel=channel_id, thread_ts=thread_ts, text=transcript
+        mcp.call_tool(
+            "slack_send_message",
+            {
+                "channel_id": channel_id,
+                "message": transcript,
+                "thread_ts": thread_ts,
+            },
         )
     except Exception as exc:
         logger.exception("Slack reply failed")

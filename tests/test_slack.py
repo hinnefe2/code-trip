@@ -1,8 +1,9 @@
-"""Tests for slack_state, slack_filter, SlackProducer, and the reply path."""
+"""Tests for ClaudeMCPClient, SlackState, SlackProducer, and the reply path."""
 
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -10,285 +11,315 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from code_trip2 import dispatch, modes
+from code_trip2.producers.claude_mcp import ClaudeMCPClient, ClaudeMCPError
 from code_trip2.producers.slack import SlackProducer
-from code_trip2.slack_filter import SlackFilter, SlackFilterError
 from code_trip2.slack_state import SlackState
 from code_trip2.tasks import Task, TaskQueue
 
 
-# --- SlackState -----------------------------------------------------------
+# --- ClaudeMCPClient stream parsing --------------------------------------
+
+
+def _stream_event(tool_result_text: str) -> str:
+    """One stream-json line that includes a tool_result content block."""
+    return json.dumps({
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "tool_call_1",
+                    "content": [{"type": "text", "text": tool_result_text}],
+                }
+            ],
+        },
+    })
+
+
+def _mk_client(**kwargs) -> ClaudeMCPClient:
+    """Build a client that's marked enabled regardless of shutil.which()."""
+    c = ClaudeMCPClient(**kwargs)
+    c._available = True
+    return c
+
+
+def test_claude_mcp_client_disabled_when_binary_missing():
+    with patch("code_trip2.producers.claude_mcp.shutil.which", return_value=None):
+        c = ClaudeMCPClient()
+    assert c.enabled is False
+    with pytest.raises(ClaudeMCPError):
+        c.call_tool("anything", {})
+
+
+def test_claude_mcp_call_tool_parses_json_object_from_tool_result():
+    c = _mk_client()
+    stdout = "\n".join([
+        '{"type": "system", "subtype": "init"}',
+        _stream_event('{"messages": [{"ts": "1.0", "text": "hi"}]}'),
+        '{"type": "result", "is_error": false}',
+    ])
+    with patch("code_trip2.producers.claude_mcp.subprocess.run") as run:
+        run.return_value = SimpleNamespace(stdout=stdout, stderr="", returncode=0)
+        result = c.call_tool("slack_search_public_and_private", {"query": "x"})
+    assert result == {"messages": [{"ts": "1.0", "text": "hi"}]}
+
+
+def test_claude_mcp_call_tool_handles_string_tool_result_content():
+    c = _mk_client()
+    stdout = json.dumps({
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "content": '{"id": "U123"}'},
+            ],
+        },
+    })
+    with patch("code_trip2.producers.claude_mcp.subprocess.run") as run:
+        run.return_value = SimpleNamespace(stdout=stdout, stderr="", returncode=0)
+        assert c.call_tool("slack_read_user_profile", {}) == {"id": "U123"}
+
+
+def test_claude_mcp_call_tool_raises_when_no_tool_result():
+    c = _mk_client()
+    stdout = '{"type": "system"}\n{"type": "result"}\n'
+    with patch("code_trip2.producers.claude_mcp.subprocess.run") as run:
+        run.return_value = SimpleNamespace(stdout=stdout, stderr="", returncode=0)
+        with pytest.raises(ClaudeMCPError) as exc:
+            c.call_tool("slack_send_message", {"channel_id": "C1", "message": "hi"})
+    assert "No tool_result" in str(exc.value)
+
+
+def test_claude_mcp_call_tool_raises_on_nonzero_exit():
+    c = _mk_client()
+    with patch("code_trip2.producers.claude_mcp.subprocess.run") as run:
+        run.return_value = SimpleNamespace(stdout="", stderr="boom", returncode=1)
+        with pytest.raises(ClaudeMCPError) as exc:
+            c.call_tool("slack_read_user_profile", {})
+    assert "exited 1" in str(exc.value)
+
+
+def test_claude_mcp_call_tool_raises_on_timeout():
+    c = _mk_client()
+    with patch("code_trip2.producers.claude_mcp.subprocess.run") as run:
+        run.side_effect = subprocess.TimeoutExpired(cmd=["claude"], timeout=60)
+        with pytest.raises(ClaudeMCPError) as exc:
+            c.call_tool("slack_read_user_profile", {})
+    assert "timed out" in str(exc.value)
+
+
+def test_claude_mcp_command_passes_expected_args():
+    c = _mk_client(model="haiku", server_id="claude_ai_Slack", max_budget_usd=0.05)
+    stdout = _stream_event('{"id": "U1"}')
+    with patch("code_trip2.producers.claude_mcp.subprocess.run") as run:
+        run.return_value = SimpleNamespace(stdout=stdout, stderr="", returncode=0)
+        c.call_tool("slack_read_user_profile", {})
+    cmd = run.call_args.args[0]
+    assert "--allowedTools" in cmd
+    allowed_idx = cmd.index("--allowedTools")
+    assert cmd[allowed_idx + 1] == "mcp__claude_ai_Slack__slack_read_user_profile"
+    assert "--max-budget-usd" in cmd
+    budget_idx = cmd.index("--max-budget-usd")
+    assert cmd[budget_idx + 1] == "0.05"
+    assert "--model" in cmd
+    model_idx = cmd.index("--model")
+    assert cmd[model_idx + 1] == "haiku"
+
+
+# --- SlackState ----------------------------------------------------------
 
 
 def test_slack_state_persists_roundtrip(tmp_path: Path):
     p = tmp_path / "slack-state.json"
     s = SlackState(path=p)
-    s.set_last_ts("C1", "1716000000.000100")
-    s.set_last_ts("C2", "1716000005.000200")
+    s.set_last_search_ts("1716000000.000100")
     s2 = SlackState(path=p)
-    assert s2.last_ts("C1") == "1716000000.000100"
-    assert s2.last_ts("C2") == "1716000005.000200"
+    assert s2.last_search_ts() == "1716000000.000100"
 
 
 def test_slack_state_missing_file_is_empty(tmp_path: Path):
     s = SlackState(path=tmp_path / "nope.json")
-    assert s.last_ts("anything") is None
-    assert s.all() == {}
+    assert s.last_search_ts() is None
 
 
 def test_slack_state_does_not_regress_ts(tmp_path: Path):
     s = SlackState(path=tmp_path / "s.json")
-    s.set_last_ts("C1", "1716000100.000000")
-    s.set_last_ts("C1", "1716000050.000000")  # older — should be ignored
-    assert s.last_ts("C1") == "1716000100.000000"
+    s.set_last_search_ts("1716000100.000000")
+    s.set_last_search_ts("1716000050.000000")  # older — ignored
+    assert s.last_search_ts() == "1716000100.000000"
 
 
 def test_slack_state_handles_corrupt_file(tmp_path: Path):
     p = tmp_path / "broken.json"
     p.write_text("{ not json")
     s = SlackState(path=p)
-    assert s.all() == {}
+    assert s.last_search_ts() is None
 
 
-# --- SlackFilter ----------------------------------------------------------
+# --- SlackProducer -------------------------------------------------------
 
 
-def _fake_openai_response(content: str):
-    return SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
-    )
-
-
-def test_filter_disabled_without_api_key():
-    f = SlackFilter(api_key=None)
-    assert f.enabled is False
-    with pytest.raises(SlackFilterError):
-        f.evaluate(
-            text="hello", sender_name="Alice", channel_name="general",
-            is_dm=False, user_id="U1",
-        )
-
-
-def test_filter_empty_message_is_irrelevant():
-    f = SlackFilter(api_key="sk-test")
-    f._client = MagicMock()
-    verdict = f.evaluate(
-        text="   ", sender_name="A", channel_name="g", is_dm=False, user_id="U1",
-    )
-    assert verdict["relevant"] is False
-    f._client.chat.completions.create.assert_not_called()
-
-
-def test_filter_parses_clean_json():
-    f = SlackFilter(api_key="sk-test")
-    f._client = MagicMock()
-    f._client.chat.completions.create.return_value = _fake_openai_response(
-        '{"relevant": true, "urgency": "interrupt", "headline": "Alice asks about deploy"}'
-    )
-    verdict = f.evaluate(
-        text="hey @user", sender_name="Alice", channel_name="general",
-        is_dm=False, user_id="U1",
-    )
-    assert verdict == {
-        "relevant": True,
-        "urgency": "interrupt",
-        "headline": "Alice asks about deploy",
-    }
-
-
-def test_filter_extracts_json_from_prose():
-    f = SlackFilter(api_key="sk-test")
-    f._client = MagicMock()
-    f._client.chat.completions.create.return_value = _fake_openai_response(
-        'Here is the verdict: {"relevant": false, "urgency": "background", "headline": ""}'
-    )
-    verdict = f.evaluate(
-        text="lol", sender_name="A", channel_name="g", is_dm=False, user_id="U1",
-    )
-    assert verdict["relevant"] is False
-    assert verdict["urgency"] == "background"
-
-
-def test_filter_normalizes_unknown_urgency():
-    f = SlackFilter(api_key="sk-test")
-    f._client = MagicMock()
-    f._client.chat.completions.create.return_value = _fake_openai_response(
-        '{"relevant": true, "urgency": "RED ALERT", "headline": "x"}'
-    )
-    verdict = f.evaluate(
-        text="t", sender_name="A", channel_name="g", is_dm=False, user_id="U1",
-    )
-    assert verdict["urgency"] == "normal"
-
-
-def test_filter_api_error_raises():
-    f = SlackFilter(api_key="sk-test")
-    f._client = MagicMock()
-    f._client.chat.completions.create.side_effect = RuntimeError("boom")
-    with pytest.raises(SlackFilterError):
-        f.evaluate(
-            text="t", sender_name="A", channel_name="g", is_dm=False, user_id="U1",
-        )
-
-
-def test_filter_includes_extra_prompt_when_set():
-    f = SlackFilter(api_key="sk-test", extra_prompt="My handle is @henry.")
-    f._client = MagicMock()
-    f._client.chat.completions.create.return_value = _fake_openai_response(
-        '{"relevant": true, "urgency": "normal", "headline": "x"}'
-    )
-    f.evaluate(text="t", sender_name="A", channel_name="g", is_dm=False, user_id="U1")
-    sent_messages = f._client.chat.completions.create.call_args.kwargs["messages"]
-    assert "@henry" in sent_messages[0]["content"]
-
-
-# --- SlackProducer --------------------------------------------------------
-
-
-def _producer(
-    *,
-    channels=("general",),
-    state=None,
-    client=None,
-    filter_enabled=True,
-    user_id="UME",
-    poll_interval=30.0,
-):
-    cfg = SimpleNamespace(
-        slack_channels=tuple(channels),
-        slack_user_id=user_id,
-        slack_poll_interval=poll_interval,
-    )
-    if client is None:
-        client = MagicMock()
-        client.auth_test.return_value = {"user_id": user_id}
-        client.conversations_list.return_value = {
-            "channels": [
-                {"id": "C123", "name": "general"},
-                {"id": "C999", "name": "other"},
-            ],
-            "response_metadata": {"next_cursor": ""},
-        }
-    f = MagicMock(spec=SlackFilter)
-    f.enabled = filter_enabled
+def _producer(tmp_path: Path, *, poll_interval=30.0):
+    cfg = SimpleNamespace(slack_poll_interval=poll_interval)
+    state = SlackState(path=tmp_path / "slack-state.json")
+    mcp = MagicMock(spec=ClaudeMCPClient)
+    mcp.enabled = True
     q = TaskQueue()
-    p = SlackProducer(config=cfg, queue=q, client=client, filter_=f, state=state)
-    return p, q, client, f
+    p = SlackProducer(config=cfg, queue=q, mcp=mcp, state=state)
+    return p, q, mcp, state
 
 
-def test_producer_skips_when_no_client():
-    cfg = SimpleNamespace(slack_channels=("general",), slack_user_id="UME")
-    p = SlackProducer(config=cfg, queue=TaskQueue(), client=None, filter_=MagicMock())
+def test_producer_skips_when_mcp_unavailable(tmp_path: Path):
+    cfg = SimpleNamespace(slack_poll_interval=30.0)
+    p = SlackProducer(config=cfg, queue=TaskQueue(), mcp=None)
     p.start()
     assert p._thread is None
 
 
-def test_producer_skips_when_filter_disabled():
-    p, _q, _client, _filter = _producer(filter_enabled=False)
+def test_producer_skips_when_user_id_fails(tmp_path: Path):
+    p, _q, mcp, _state = _producer(tmp_path)
+    mcp.call_tool.side_effect = ClaudeMCPError("auth broken")
     p.start()
     assert p._thread is None
 
 
-def test_producer_setup_resolves_channel_names(tmp_path: Path):
-    state = SlackState(path=tmp_path / "s.json")
-    p, _q, client, _filter = _producer(channels=("general",), state=state)
-    p._setup()
-    assert p._channels == {"C123": "general"}
+def test_producer_skips_when_user_id_empty(tmp_path: Path):
+    p, _q, mcp, _state = _producer(tmp_path)
+    mcp.call_tool.return_value = {"id": ""}
+    p.start()
+    assert p._thread is None
 
 
-def test_producer_handle_message_emits_task_when_relevant(tmp_path: Path):
-    state = SlackState(path=tmp_path / "s.json")
-    p, q, client, filt = _producer(state=state)
-    p._channels = {"C123": "general"}
+def test_producer_fetch_user_id_reads_id_from_user_block(tmp_path: Path):
+    p, _q, mcp, _state = _producer(tmp_path)
+    mcp.call_tool.return_value = {"user": {"id": "UABC", "name": "henry"}}
+    assert p._fetch_user_id() == "UABC"
+
+
+def test_producer_fetch_user_id_reads_id_from_top_level(tmp_path: Path):
+    p, _q, mcp, _state = _producer(tmp_path)
+    mcp.call_tool.return_value = {"id": "UDEF"}
+    assert p._fetch_user_id() == "UDEF"
+
+
+def test_producer_poll_emits_tasks_and_advances_state(tmp_path: Path):
+    p, q, mcp, state = _producer(tmp_path)
     p._user_id = "UME"
-    filt.evaluate.return_value = {
-        "relevant": True,
-        "urgency": "interrupt",
-        "headline": "Alice: deploy looks broken",
-    }
-    client.users_info.return_value = {
-        "user": {"profile": {"display_name": "Alice"}}
-    }
-    p._handle_message(
-        {"user": "UALICE", "text": "deploy looks broken @UME", "ts": "1716000000.000100"},
-        "C123",
-        "general",
-    )
-    tasks = q.all()
-    assert len(tasks) == 1
-    t = tasks[0]
-    assert t.kind == "slack_msg"
-    assert t.topic == "slack-general"
-    assert t.headline == "Alice: deploy looks broken"
-    assert t.urgency == "interrupt"
-    assert t.source["channel_id"] == "C123"
-    assert t.source["ts"] == "1716000000.000100"
-    assert t.source["thread_ts"] == "1716000000.000100"
-    assert t.source["sender_name"] == "Alice"
-
-
-def test_producer_handle_message_drops_when_irrelevant(tmp_path: Path):
-    state = SlackState(path=tmp_path / "s.json")
-    p, q, client, filt = _producer(state=state)
-    p._channels = {"C123": "general"}
-    p._user_id = "UME"
-    filt.evaluate.return_value = {"relevant": False, "urgency": "background", "headline": ""}
-    client.users_info.return_value = {"user": {"profile": {"display_name": "Bob"}}}
-    p._handle_message(
-        {"user": "UBOB", "text": "morning everyone", "ts": "1716000001.000100"},
-        "C123",
-        "general",
-    )
-    assert q.all() == []
-
-
-def test_producer_handle_message_skips_own_posts():
-    p, q, _client, filt = _producer()
-    p._channels = {"C123": "general"}
-    p._user_id = "UME"
-    p._handle_message(
-        {"user": "UME", "text": "talking to myself", "ts": "1.0"}, "C123", "general"
-    )
-    filt.evaluate.assert_not_called()
-    assert q.all() == []
-
-
-def test_producer_handle_message_skips_bots():
-    p, q, _client, filt = _producer()
-    p._channels = {"C123": "general"}
-    p._user_id = "UME"
-    p._handle_message(
-        {"bot_id": "B1", "text": "deploy: ok", "ts": "1.0"}, "C123", "general"
-    )
-    filt.evaluate.assert_not_called()
-    assert q.all() == []
-
-
-def test_producer_poll_channel_advances_last_ts(tmp_path: Path):
-    state = SlackState(path=tmp_path / "s.json")
-    p, q, client, filt = _producer(state=state)
-    p._channels = {"C123": "general"}
-    p._user_id = "UME"
-    filt.evaluate.return_value = {
-        "relevant": True, "urgency": "normal", "headline": "Alice: hi",
-    }
-    client.users_info.return_value = {"user": {"profile": {"display_name": "Alice"}}}
-    client.conversations_history.return_value = {
+    mcp.call_tool.return_value = {
         "messages": [
-            {"user": "UA", "text": "third", "ts": "1716000003.000000"},
-            {"user": "UA", "text": "second", "ts": "1716000002.000000"},
-            {"user": "UA", "text": "first", "ts": "1716000001.000000"},
+            {
+                "ts": "1716000001.000000",
+                "text": "hey <@UME> can you check the deploy",
+                "user": "UALICE",
+                "username": "Alice",
+                "channel": {"id": "CRAND", "name": "random"},
+                "thread_ts": "1716000001.000000",
+            },
+            {
+                "ts": "1716000002.000000",
+                "text": "follow-up question",
+                "user": "UBOB",
+                "username": "Bob",
+                "channel": {"id": "CENG", "name": "engineering"},
+            },
         ]
     }
-    p._poll_channel("C123", "general")
-    assert state.last_ts("C123") == "1716000003.000000"
-    # All 3 messages were emitted as tasks.
-    assert len(q.all()) == 3
+    p._poll_once()
+
+    tasks = q.all()
+    assert len(tasks) == 2
+    by_ts = {t.source["ts"]: t for t in tasks}
+    t1 = by_ts["1716000001.000000"]
+    assert t1.topic == "slack-random"
+    assert "Alice" in t1.headline
+    assert t1.source["channel_id"] == "CRAND"
+    assert t1.source["sender_id"] == "UALICE"
+    assert t1.source["thread_ts"] == "1716000001.000000"
+    t2 = by_ts["1716000002.000000"]
+    assert t2.source["thread_ts"] == "1716000002.000000"  # falls back to ts
+    assert state.last_search_ts() == "1716000002.000000"
 
 
-# --- reply path ----------------------------------------------------------
+def test_producer_poll_skips_messages_at_or_before_last_ts(tmp_path: Path):
+    p, q, mcp, state = _producer(tmp_path)
+    p._user_id = "UME"
+    state.set_last_search_ts("1716000005.000000")
+    mcp.call_tool.return_value = {
+        "messages": [
+            {"ts": "1716000005.000000", "text": "old", "user": "U1",
+             "channel": {"id": "C1", "name": "c"}},
+            {"ts": "1716000006.000000", "text": "new", "user": "U1",
+             "channel": {"id": "C1", "name": "c"}},
+        ]
+    }
+    p._poll_once()
+    assert len(q.all()) == 1
+    assert q.all()[0].body == "new"
 
 
-def _ctx_with_slack(client):
+def test_producer_poll_dedupes_within_session(tmp_path: Path):
+    p, q, mcp, _state = _producer(tmp_path)
+    p._user_id = "UME"
+    msg = {"ts": "1716000010.000000", "text": "ping", "user": "U1",
+           "channel": {"id": "C1", "name": "c"}}
+    mcp.call_tool.return_value = {"messages": [msg]}
+    p._poll_once()
+    p._poll_once()  # same poll result returned; should not emit twice
+    assert len(q.all()) == 1
+
+
+def test_producer_poll_handles_empty_results(tmp_path: Path):
+    p, q, mcp, _state = _producer(tmp_path)
+    p._user_id = "UME"
+    mcp.call_tool.return_value = {"messages": []}
+    p._poll_once()
+    assert q.all() == []
+
+
+def test_producer_poll_handles_alt_response_shapes(tmp_path: Path):
+    """Slack MCP variants put matches under several keys; handle them."""
+    p, q, mcp, _state = _producer(tmp_path)
+    p._user_id = "UME"
+    mcp.call_tool.return_value = {
+        "messages": {
+            "matches": [
+                {"ts": "1.0", "text": "via matches", "user": "U1",
+                 "channel": {"id": "C1", "name": "c"}}
+            ]
+        }
+    }
+    p._poll_once()
+    assert len(q.all()) == 1
+
+
+def test_producer_poll_resilient_to_mcp_errors(tmp_path: Path):
+    p, q, mcp, _state = _producer(tmp_path)
+    p._user_id = "UME"
+    mcp.call_tool.side_effect = ClaudeMCPError("network")
+    p._poll_once()  # should not raise
+    assert q.all() == []
+
+
+def test_producer_after_param_uses_state_ts(tmp_path: Path):
+    p, _q, _mcp, state = _producer(tmp_path)
+    state.set_last_search_ts("1716000100.000000")
+    assert p._after_param(state.last_search_ts()) == "1716000100"
+
+
+def test_producer_after_param_falls_back_to_lookback(tmp_path: Path):
+    p, _q, _mcp, _state = _producer(tmp_path)
+    out = p._after_param(None)
+    # Should be a Unix timestamp roughly _INITIAL_LOOKBACK_S in the past.
+    import time
+    now = time.time()
+    assert (now - 8 * 24 * 3600) < int(out) < now
+
+
+# --- reply path ---------------------------------------------------------
+
+
+def _ctx_with_slack_mcp(mcp):
     cfg = SimpleNamespace(
         ssh_host="", ssh_options=(), tmux_session="main",
         work_window="work", linear_window="linear", terminal_apps=("kitty",),
@@ -298,67 +329,59 @@ def _ctx_with_slack(client):
         tts=MagicMock(),
         log=MagicMock(),
         thinking=MagicMock(),
-        slack_client=client,
+        slack_mcp=mcp,
     )
 
 
-def test_respond_slack_posts_to_thread():
-    client = MagicMock()
-    ctx = _ctx_with_slack(client)
+def test_respond_slack_calls_send_message_via_mcp():
+    mcp = MagicMock()
+    ctx = _ctx_with_slack_mcp(mcp)
     task = Task(
         kind="slack_msg",
         topic="slack-general",
-        headline="alice: deploy?",
         source={"channel_id": "C123", "ts": "1.0", "thread_ts": "1.0"},
     )
     ctx.queue.add(task)
     ctx.current_task = task
     dispatch._respond_slack(ctx, task, "Yes, ship it.")
-    client.chat_postMessage.assert_called_once_with(
-        channel="C123", thread_ts="1.0", text="Yes, ship it."
+    mcp.call_tool.assert_called_once_with(
+        "slack_send_message",
+        {"channel_id": "C123", "message": "Yes, ship it.", "thread_ts": "1.0"},
     )
     assert ctx.queue.get(task.id).state == "done"
     assert ctx.current_task is None
 
 
-def test_respond_slack_without_client_speaks_error():
-    ctx = _ctx_with_slack(client=None)
-    task = Task(
-        kind="slack_msg",
-        source={"channel_id": "C1", "ts": "1.0", "thread_ts": "1.0"},
-    )
+def test_respond_slack_without_mcp_speaks_error():
+    ctx = _ctx_with_slack_mcp(mcp=None)
+    task = Task(kind="slack_msg",
+                source={"channel_id": "C1", "ts": "1.0", "thread_ts": "1.0"})
     ctx.queue.add(task)
     ctx.current_task = task
     dispatch._respond_slack(ctx, task, "reply")
-    ctx.tts.speak.assert_called_with("Slack client is not configured.")
-    # Task should still be active since we didn't actually send.
+    ctx.tts.speak.assert_called_with("Slack MCP is not configured.")
     assert ctx.queue.get(task.id).state != "done"
 
 
 def test_respond_slack_api_error_keeps_task_active():
-    client = MagicMock()
-    client.chat_postMessage.side_effect = RuntimeError("network down")
-    ctx = _ctx_with_slack(client)
-    task = Task(
-        kind="slack_msg",
-        source={"channel_id": "C1", "ts": "1.0", "thread_ts": "1.0"},
-    )
+    mcp = MagicMock()
+    mcp.call_tool.side_effect = ClaudeMCPError("network down")
+    ctx = _ctx_with_slack_mcp(mcp)
+    task = Task(kind="slack_msg",
+                source={"channel_id": "C1", "ts": "1.0", "thread_ts": "1.0"})
     ctx.queue.add(task)
     ctx.current_task = task
     dispatch._respond_slack(ctx, task, "reply")
     assert ctx.queue.get(task.id).state != "done"
-    assert ctx.current_task is task  # still active so user can retry
+    assert ctx.current_task is task
 
 
 def test_dispatch_task_response_routes_slack_kind():
-    """End-to-end: PTTing while a slack_msg is active calls the reply path."""
-    client = MagicMock()
-    ctx = _ctx_with_slack(client)
-    task = Task(
-        kind="slack_msg",
-        source={"channel_id": "C1", "ts": "1.0", "thread_ts": "1.0"},
-    )
+    mcp = MagicMock()
+    ctx = _ctx_with_slack_mcp(mcp)
+    task = Task(kind="slack_msg",
+                source={"channel_id": "C1", "ts": "1.0", "thread_ts": "1.0"})
     ctx.queue.add(task)
     ctx.current_task = task
     dispatch._dispatch_task_response(ctx, task, "responding now")
-    client.chat_postMessage.assert_called_once()
+    mcp.call_tool.assert_called_once()

@@ -54,12 +54,8 @@ class Config:
     summarizer_max_chars: int = 600
     # task-queue
     startup_mode: str = "focused"           # "queue" | "focused"
-    # slack (direct slack_sdk; bot token + channel name list)
-    slack_channels: tuple[str, ...] = ()        # channel names, resolved to IDs at start
-    slack_bot_token: str = ""                   # falls back to $SLACK_BOT_TOKEN
-    slack_user_id: str = ""                     # auto-detected via auth.test if empty
+    # slack (via the claude.ai Slack MCP — auth piggy-backs on claude CLI)
     slack_poll_interval: float = 30.0
-    slack_filter_extra: str = ""                # appended to the relevance-filter prompt
     # linear (MCP — server choice TBD, still stubbed)
     linear_mcp_command: str = ""
     linear_mcp_args: tuple[str, ...] = ()
@@ -146,20 +142,8 @@ def load_config(path: Path | str) -> Config:
         kw["startup_mode"] = queue_cfg["startup_mode"]
 
     slack_cfg = data.get("slack", {})
-    if "channels" in slack_cfg:
-        kw["slack_channels"] = tuple(slack_cfg["channels"])
-    if "bot_token" in slack_cfg:
-        kw["slack_bot_token"] = slack_cfg["bot_token"]
-    else:
-        env_token = os.environ.get("SLACK_BOT_TOKEN")
-        if env_token:
-            kw["slack_bot_token"] = env_token
-    if "user_id" in slack_cfg:
-        kw["slack_user_id"] = slack_cfg["user_id"]
     if "poll_interval" in slack_cfg:
         kw["slack_poll_interval"] = float(slack_cfg["poll_interval"])
-    if "filter_extra" in slack_cfg:
-        kw["slack_filter_extra"] = slack_cfg["filter_extra"]
 
     linear_cfg = data.get("linear", {})
     if "mcp_command" in linear_cfg:

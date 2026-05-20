@@ -1,26 +1,20 @@
-"""SlackProducer: polls Slack via slack_sdk and emits filtered tasks.
+"""SlackProducer: cross-channel @-mention polling via the claude.ai Slack MCP.
 
-Direct Web API integration — no MCP layer. On start, resolves the
-configured channel **names** to channel **IDs** (via
-``conversations.list``) and looks up the bot's own user_id (via
-``auth.test``) if the config didn't provide one.
+Single tool call per poll tick: ``slack_search_public_and_private``
+with the user's own ID as the query. That catches @-mentions in any
+channel (public, private, DM, group DM) — the producer doesn't need a
+per-channel list, doesn't need a workspace install, and doesn't need
+its own Slack credentials. All auth is piggy-backed off claude.ai via
+:class:`ClaudeMCPClient`.
 
-Per poll tick (``slack_poll_interval``):
+**Known limitation:** DMs that don't @-mention the user won't surface.
+The Slack MCP exposed by claude.ai doesn't have a clean
+"list-all-DMs-since-X" tool, and a heuristic search query would either
+miss messages or burn tokens. Out of scope for this pass.
 
-1. For each known channel, call ``conversations.history`` with
-   ``oldest = SlackState.last_ts(channel_id)`` so we only see new
-   messages.
-2. Skip messages from bots, the user themselves, and edits/threads we
-   don't care about.
-3. Pass each survivor through :class:`SlackFilter` (LLM relevance
-   check). Only ``relevant: true`` messages become tasks.
-4. Emit ``Task(kind="slack_msg", topic=f"slack-{name}")`` with the
-   channel id, ts, and thread_ts on ``source`` so the reply path can
-   thread back correctly.
-5. Persist the new last-seen timestamp for the channel.
-
-Threading model: one daemon thread runs the poll loop. All
-``slack_sdk`` calls block, which is fine on the dedicated thread.
+On startup the producer makes one ``slack_read_user_profile`` call to
+discover the current user's ID, then loops mention searches at the
+configured interval.
 """
 
 from __future__ import annotations
@@ -28,30 +22,23 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from code_trip2.config import Config
-from code_trip2.slack_filter import SlackFilter, SlackFilterError
+from code_trip2.producers.claude_mcp import ClaudeMCPClient, ClaudeMCPError
 from code_trip2.slack_state import SlackState
-from code_trip2.tasks import (
-    URGENCY_BACKGROUND,
-    URGENCY_INTERRUPT,
-    URGENCY_NORMAL,
-    Task,
-    TaskQueue,
-)
+from code_trip2.tasks import Task, TaskQueue
 
 if TYPE_CHECKING:
-    from slack_sdk import WebClient
+    pass
 
 logger = logging.getLogger(__name__)
 
 
-_URGENCY_MAP = {
-    "interrupt": URGENCY_INTERRUPT,
-    "normal": URGENCY_NORMAL,
-    "background": URGENCY_BACKGROUND,
-}
+# Search "from" floor when the state file is empty. One week feels
+# right: enough to capture stale-but-unread mentions from a weekend
+# away, not so much that startup floods the queue.
+_INITIAL_LOOKBACK_S = 7 * 24 * 3600
 
 
 class SlackProducer:
@@ -62,45 +49,37 @@ class SlackProducer:
         *,
         config: Config,
         queue: TaskQueue,
-        client: "WebClient | None" = None,
-        filter_: SlackFilter | None = None,
+        mcp: ClaudeMCPClient | None = None,
         state: SlackState | None = None,
     ) -> None:
         self._config = config
         self._queue = queue
-        self._client = client
-        self._filter = filter_
+        self._mcp = mcp
         self._state = state or SlackState()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        # Resolved lazily in _setup. Maps channel_id → display name.
-        self._channels: dict[str, str] = {}
-        # User cache for sender-name lookups.
-        self._users: dict[str, str] = {}
-        self._user_id: str = config.slack_user_id
+        self._user_id: str = ""
+        # Tiny cache to suppress duplicates within a session (state file
+        # already handles cross-restart dedup).
+        self._recent_ids: set[str] = set()
 
     # ---- lifecycle ------------------------------------------------------
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
-        if self._client is None:
-            logger.info("SlackProducer: no client configured; not starting.")
-            return
-        if not self._config.slack_channels:
-            logger.info("SlackProducer: no channels configured; not starting.")
-            return
-        if self._filter is None or not self._filter.enabled:
-            logger.warning(
-                "SlackProducer: no filter (or filter disabled); messages "
-                "would flood the queue. Not starting."
-            )
+        if self._mcp is None or not self._mcp.enabled:
+            logger.info("SlackProducer: ClaudeMCPClient unavailable; not starting.")
             return
         try:
-            self._setup()
-        except SlackProducerError as exc:
-            logger.warning("SlackProducer setup failed: %s", exc)
+            self._user_id = self._fetch_user_id()
+        except ClaudeMCPError as exc:
+            logger.warning("SlackProducer: could not resolve user_id (%s); not starting.", exc)
             return
+        if not self._user_id:
+            logger.warning("SlackProducer: empty user_id from slack_read_user_profile; not starting.")
+            return
+        logger.info("SlackProducer: starting (user_id=%s)", self._user_id)
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -113,54 +92,20 @@ class SlackProducer:
 
     # ---- setup ----------------------------------------------------------
 
-    def _setup(self) -> None:
-        """Resolve channel names → IDs and identify the bot user."""
-        if not self._user_id:
-            try:
-                resp = self._client.auth_test()
-            except Exception as exc:
-                raise SlackProducerError(f"auth.test failed: {exc}") from exc
-            self._user_id = resp.get("user_id", "") or ""
-            if not self._user_id:
-                logger.warning("SlackProducer: auth.test returned no user_id.")
-
-        wanted = {name.lstrip("#") for name in self._config.slack_channels}
-        try:
-            cursor: str | None = None
-            seen: dict[str, str] = {}
-            while True:
-                resp = self._client.conversations_list(
-                    limit=200,
-                    types="public_channel,private_channel",
-                    cursor=cursor,
-                )
-                for ch in resp.get("channels", []):
-                    cid = ch.get("id")
-                    cname = ch.get("name")
-                    if cid and cname and cname in wanted:
-                        seen[cid] = cname
-                cursor = resp.get("response_metadata", {}).get("next_cursor", "")
-                if not cursor:
-                    break
-        except Exception as exc:
-            raise SlackProducerError(f"conversations.list failed: {exc}") from exc
-
-        if not seen:
-            raise SlackProducerError(
-                f"None of the configured channels were found: {sorted(wanted)}"
-            )
-        self._channels = seen
-        missing = wanted - set(seen.values())
-        if missing:
-            logger.warning(
-                "SlackProducer: channels not found / not joined: %s", sorted(missing)
-            )
+    def _fetch_user_id(self) -> str:
+        """Resolve the current user's Slack ID via the MCP."""
+        result = self._mcp.call_tool("slack_read_user_profile", {})
+        # The Slack MCP can return either {"user": {"id": "..."}} or
+        # {"id": "..."} depending on response_format and version. Try
+        # both shapes defensively.
+        user = result.get("user") if isinstance(result.get("user"), dict) else result
+        return str(user.get("id") or "")
 
     # ---- poll loop ------------------------------------------------------
 
     def _run(self) -> None:
-        # Stagger a tiny bit so the producer isn't fighting for the network
-        # the instant the orchestrator starts.
+        # Slight stagger so we don't hammer claude at the same instant the
+        # orchestrator starts.
         if self._stop.wait(2.0):
             return
         while not self._stop.is_set():
@@ -172,84 +117,107 @@ class SlackProducer:
                 return
 
     def _poll_once(self) -> None:
-        for channel_id, channel_name in list(self._channels.items()):
-            self._poll_channel(channel_id, channel_name)
-
-    def _poll_channel(self, channel_id: str, channel_name: str) -> None:
-        oldest = self._state.last_ts(channel_id)
+        last_ts = self._state.last_search_ts()
+        after = self._after_param(last_ts)
         try:
-            resp = self._client.conversations_history(
-                channel=channel_id,
-                oldest=oldest or None,
-                limit=50,
+            result = self._mcp.call_tool(
+                "slack_search_public_and_private",
+                {
+                    "query": f"<@{self._user_id}>",
+                    "after": after,
+                    "sort": "timestamp",
+                    "sort_dir": "asc",
+                    "limit": 20,
+                    "include_context": False,
+                    "response_format": "concise",
+                },
             )
-        except Exception as exc:
-            logger.warning(
-                "conversations.history failed for %s: %s", channel_name, exc
-            )
+        except ClaudeMCPError as exc:
+            logger.warning("SlackProducer: search call failed: %s", exc)
             return
 
-        # Slack returns messages newest-first. We want to process oldest-first
-        # so last_ts only advances after we've fully handled earlier messages.
-        messages = list(reversed(resp.get("messages", [])))
-        if not messages:
-            return
-
-        for msg in messages:
-            ts = msg.get("ts")
+        for msg in self._extract_messages(result):
+            ts = msg.get("ts") or ""
             if not ts:
                 continue
-            if oldest and ts <= oldest:
+            if last_ts and ts <= last_ts:
+                continue
+            if ts in self._recent_ids:
                 continue
             try:
-                self._handle_message(msg, channel_id, channel_name)
+                self._emit_task(msg)
             except Exception:
-                logger.exception("Failed to handle message in %s", channel_name)
-            self._state.set_last_ts(channel_id, ts)
+                logger.exception("Failed to emit Slack task for ts=%s", ts)
+            self._recent_ids.add(ts)
+            self._state.set_last_search_ts(ts)
 
-    def _handle_message(self, msg: dict, channel_id: str, channel_name: str) -> None:
-        # Skip non-user messages, edits, joins, and our own posts.
-        subtype = msg.get("subtype") or ""
-        if subtype in ("channel_join", "channel_leave", "message_changed", "message_deleted"):
-            return
-        if msg.get("bot_id"):
-            return
-        sender_id = msg.get("user") or ""
-        if not sender_id or sender_id == self._user_id:
-            return
+        # Cap the in-memory dedup set so it doesn't grow unbounded.
+        if len(self._recent_ids) > 500:
+            self._recent_ids = set(sorted(self._recent_ids)[-250:])
 
-        text = msg.get("text") or ""
-        if not text.strip():
-            return
+    def _after_param(self, last_ts: str | None) -> str:
+        """Compute the ``after`` argument for the search call.
 
-        sender_name = self._resolve_user_name(sender_id)
-        try:
-            verdict = self._filter.evaluate(
-                text=text,
-                sender_name=sender_name,
-                channel_name=channel_name,
-                is_dm=False,
-                user_id=self._user_id,
+        Slack's ``after`` is a Unix timestamp in seconds. From a Slack
+        message ts string we take the integer portion. From an empty
+        state, we look back :data:`_INITIAL_LOOKBACK_S` seconds.
+        """
+        if last_ts:
+            try:
+                return str(int(float(last_ts)))
+            except ValueError:
+                pass
+        return str(int(time.time() - _INITIAL_LOOKBACK_S))
+
+    # ---- response shape -------------------------------------------------
+
+    def _extract_messages(self, result: dict) -> list[dict]:
+        """Defensive: the Slack MCP returns matches under several keys
+        depending on response_format and version. Try the common ones."""
+        candidates = (
+            result.get("messages"),
+            (result.get("messages") or {}).get("matches") if isinstance(result.get("messages"), dict) else None,
+            result.get("matches"),
+            result.get("results"),
+            result.get("items"),
+        )
+        for c in candidates:
+            if isinstance(c, list):
+                return c
+        return []
+
+    def _emit_task(self, msg: dict) -> None:
+        text = (msg.get("text") or "").strip()
+        if not text:
+            return
+        sender_id = msg.get("user") or msg.get("user_id") or ""
+        sender_name = (
+            msg.get("username")
+            or msg.get("user_name")
+            or (msg.get("user_profile") or {}).get("display_name")
+            or (msg.get("user_profile") or {}).get("real_name")
+            or sender_id
+            or "someone"
+        )
+        channel = msg.get("channel") or {}
+        if isinstance(channel, str):
+            channel_id = channel
+            channel_name = "channel"
+        else:
+            channel_id = channel.get("id") or msg.get("channel_id") or ""
+            channel_name = (
+                channel.get("name")
+                or msg.get("channel_name")
+                or "channel"
             )
-        except SlackFilterError as exc:
-            logger.warning("Slack filter failed; skipping message: %s", exc)
-            return
-
-        if not verdict.get("relevant"):
-            return
-
-        headline = verdict.get("headline") or f"{sender_name}: {text.strip()[:60]}"
-        urgency_label = verdict.get("urgency", "normal")
-        urgency = _URGENCY_MAP.get(urgency_label, URGENCY_NORMAL)
-        ts = msg.get("ts", "")
+        ts = msg.get("ts") or ""
         thread_ts = msg.get("thread_ts") or ts
-
+        headline = f"{sender_name}: {text[:60]}"
         task = Task(
             kind="slack_msg",
-            topic=f"slack-{channel_name}",
+            topic=f"slack-{channel_name}" if channel_name else "slack",
             headline=headline,
             body=text,
-            urgency=urgency,
             source={
                 "channel_id": channel_id,
                 "channel_name": channel_name,
@@ -261,27 +229,3 @@ class SlackProducer:
             created_at=time.time(),
         )
         self._queue.add(task)
-
-    def _resolve_user_name(self, user_id: str) -> str:
-        if not user_id:
-            return "someone"
-        cached = self._users.get(user_id)
-        if cached:
-            return cached
-        try:
-            resp = self._client.users_info(user=user_id)
-            profile = resp.get("user", {}).get("profile", {}) or {}
-            name = (
-                profile.get("display_name")
-                or profile.get("real_name")
-                or resp.get("user", {}).get("name")
-                or user_id
-            )
-        except Exception:
-            name = user_id
-        self._users[user_id] = name
-        return name
-
-
-class SlackProducerError(Exception):
-    pass

@@ -1,13 +1,13 @@
-"""Persistent Slack producer state: last-seen message timestamp per channel.
+"""Persistent Slack producer state.
 
-Stored at ``~/.code-trip/slack-state.json``. Read on producer start,
-written after each poll batch. Survives restarts so we don't resurface
-messages the user has already seen.
+v2 of the producer makes a single mention-search call per poll, so we
+only need one cursor: the highest message timestamp we've already
+surfaced. Stored at ``~/.code-trip/slack-state.json`` so the cursor
+survives restarts and old messages don't resurface.
 
-The format is a flat ``{channel_id: ts_str}`` map. Slack timestamps are
-strings of the form ``"1716321234.000200"`` (epoch seconds + 6-digit
-ordinal); we treat them opaquely and pass them straight back to
-``conversations.history`` as the ``oldest`` cursor.
+The file holds a flat ``{"last_search_ts": "1716000000.000200", ...}``
+JSON object. Other keys are reserved for future producers that need
+their own cursors.
 """
 
 from __future__ import annotations
@@ -22,32 +22,41 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+_LAST_SEARCH_KEY = "last_search_ts"
+
+
 def default_state_path() -> Path:
     return Path.home() / ".code-trip" / "slack-state.json"
 
 
 class SlackState:
-    """Thread-safe ``channel_id → last_ts`` map with JSON persistence."""
+    """Thread-safe JSON-backed cursor store for the Slack producer."""
 
     def __init__(self, path: Path | None = None) -> None:
         self.path = path or default_state_path()
         self._lock = threading.Lock()
         self._data: dict[str, str] = self._load()
 
-    def last_ts(self, channel_id: str) -> str | None:
-        with self._lock:
-            return self._data.get(channel_id)
+    # ---- last_search_ts (high-water mark across all channels) -----------
 
-    def set_last_ts(self, channel_id: str, ts: str) -> None:
+    def last_search_ts(self) -> str | None:
+        with self._lock:
+            return self._data.get(_LAST_SEARCH_KEY)
+
+    def set_last_search_ts(self, ts: str) -> None:
+        """Advance the cursor. Refuses to go backwards.
+
+        Slack timestamps are strings like ``"1716000000.000200"`` where
+        the lexicographic order matches the numeric order, so we just
+        string-compare.
+        """
         if not ts:
             return
         with self._lock:
-            prior = self._data.get(channel_id)
+            prior = self._data.get(_LAST_SEARCH_KEY)
             if prior is not None and prior >= ts:
-                # Slack's lexicographic order on these strings is the same as
-                # numeric order, so a smaller new ts is a regression — skip.
                 return
-            self._data[channel_id] = ts
+            self._data[_LAST_SEARCH_KEY] = ts
         self._save()
 
     def all(self) -> dict[str, str]:
@@ -75,7 +84,6 @@ class SlackState:
         except OSError:
             logger.warning("Could not create %s", self.path.parent, exc_info=True)
             return
-        # Atomic write so a crash mid-save doesn't leave a half-written file.
         try:
             fd, tmp = tempfile.mkstemp(
                 prefix=".slack-state-", suffix=".json", dir=str(self.path.parent)
