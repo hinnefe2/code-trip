@@ -30,6 +30,7 @@ from code_trip2 import earcon, remote, window
 from code_trip2.config import Config
 from code_trip2.queue_log import QueueLog
 from code_trip2.session_log import SessionLogger
+from code_trip2.summarizer import Summarizer, SummarizerError
 from code_trip2.tasks import RecentTopics, Task, TaskQueue
 from code_trip2.tts_client import TTSClient, TTSClientError
 
@@ -69,6 +70,9 @@ class Context:
     current_task: Task | None = None
     # "queue" | "focused". See dispatch.py for the mode flip.
     app_mode: str = "focused"
+    # Raw-pane-output → spoken-English summarizer; falls back to clean_output
+    # when None or when summarize() raises.
+    summarizer: Summarizer | None = None
 
     def __post_init__(self) -> None:
         if not self.active_window:
@@ -239,12 +243,39 @@ def _work_voice(ctx: Context, t: str) -> None:
     finally:
         ctx.thinking.stop()
 
-    spoken = clean_output(raw or "", anchor=t)
-    ctx.log.event("turn", branch="work", user=t, remote_output=raw, spoken=spoken)
+    spoken, summarized = _summarize_or_strip(ctx, raw or "", t)
+    ctx.log.event(
+        "turn",
+        branch="work",
+        user=t,
+        remote_output=raw,
+        spoken=spoken,
+        summarized=summarized,
+    )
     if not spoken:
         _speak(ctx, "No output.")
         return
     _speak_chunked(ctx, spoken)
+
+
+def _summarize_or_strip(ctx: Context, raw: str, prompt: str) -> tuple[str, bool]:
+    """Run the summarizer if available; otherwise fall back to clean_output.
+
+    Returns ``(spoken_text, summarized)`` where ``summarized`` is True iff
+    the LLM summarizer produced the text. The fallback also fires if the
+    summarizer succeeded but returned an empty string.
+    """
+    if ctx.summarizer is not None and ctx.summarizer.enabled and raw.strip():
+        try:
+            text = ctx.summarizer.summarize(
+                raw, context={"kind": "claude_reply", "user_prompt": prompt}
+            )
+        except SummarizerError as exc:
+            logger.warning("Summarizer failed; falling back to clean_output: %s", exc)
+        else:
+            if text:
+                return text, True
+    return clean_output(raw, anchor=prompt), False
 
 
 # --- output cleanup --------------------------------------------------------

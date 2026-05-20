@@ -21,6 +21,7 @@ import time
 
 from code_trip2 import remote
 from code_trip2.config import Config
+from code_trip2.summarizer import Summarizer, SummarizerError
 from code_trip2.tasks import Task, TaskQueue
 
 logger = logging.getLogger(__name__)
@@ -37,10 +38,12 @@ class ClaudeProducer:
         *,
         config: Config,
         queue: TaskQueue,
+        summarizer: Summarizer | None = None,
         poll_interval: float = 1.5,
     ) -> None:
         self._config = config
         self._queue = queue
+        self._summarizer = summarizer
         self._poll = poll_interval
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -128,7 +131,7 @@ class ClaudeProducer:
         finished_at = float(payload.get("finished_at") or time.time())
         last_user_msg = payload.get("last_user_msg") or ""
         headline = self._make_headline(window, last_user_msg)
-        body = payload.get("preview") or None
+        body = self._summarize_pane(window, last_user_msg)
         task = Task(
             kind="claude_reply",
             topic=window,
@@ -138,6 +141,35 @@ class ClaudeProducer:
             created_at=time.time(),
         )
         self._queue.add(task)
+
+    def _summarize_pane(self, window: str, last_user_msg: str) -> str | None:
+        """Capture the pane and run it through the summarizer.
+
+        Returns the summary (audio-ready) or None if no summarizer is
+        configured or the call fails. The producer doesn't fall back to
+        ``clean_output`` here — the *headline* is already a usable
+        announcement; an absent body just means the user has nothing to
+        expand on tap. Better than reading raw ANSI gunk aloud.
+        """
+        if self._summarizer is None or not self._summarizer.enabled:
+            return None
+        host, opts = self._config.ssh_host, self._config.ssh_options
+        if not host:
+            return None
+        try:
+            raw = remote.capture(host, opts, self._config.tmux_session, window, lines=400)
+        except remote.RemoteError as exc:
+            logger.warning("ClaudeProducer: capture-pane failed for %s: %s", window, exc)
+            return None
+        if not raw or not raw.strip():
+            return None
+        try:
+            return self._summarizer.summarize(
+                raw, context={"kind": "claude_reply", "user_prompt": last_user_msg}
+            )
+        except SummarizerError as exc:
+            logger.warning("ClaudeProducer: summarize failed for %s: %s", window, exc)
+            return None
 
     def _make_headline(self, window: str, last_user_msg: str) -> str:
         if last_user_msg:

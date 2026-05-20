@@ -23,6 +23,7 @@ from code_trip2.producers.slack import SlackProducer
 from code_trip2.queue_log import QueueLog
 from code_trip2.session_log import SessionLogger, default_session_path
 from code_trip2.stt_client import STTClient, STTClientError
+from code_trip2.summarizer import Summarizer
 from code_trip2.tasks import TaskQueue
 from code_trip2.tts_client import TTSClient
 
@@ -54,6 +55,13 @@ def run(config: Config) -> None:
         speed=config.tts_speed,
     )
     thinking = earcon.Thinking()
+    summarizer = Summarizer(
+        api_key=config.api_key,
+        model=config.summarizer_model,
+        max_chars=config.summarizer_max_chars,
+    )
+    if not summarizer.enabled:
+        logger.info("Summarizer disabled (no API key); falling back to clean_output.")
 
     queue = TaskQueue()
     queue_log = QueueLog()
@@ -72,12 +80,13 @@ def run(config: Config) -> None:
         thinking=thinking,
         queue=queue,
         queue_log=queue_log,
+        summarizer=summarizer,
         app_mode=config.startup_mode if config.startup_mode in ("queue", "focused") else "focused",
     )
 
     # Producers run in their own threads; supervisor owns start/stop.
     supervisor = ProducerSupervisor()
-    supervisor.add(ClaudeProducer(config=config, queue=queue))
+    supervisor.add(ClaudeProducer(config=config, queue=queue, summarizer=summarizer))
     supervisor.add(SlackProducer(config=config, queue=queue))
     supervisor.add(LinearProducer(config=config, queue=queue))
     supervisor.add(ManualProducer())

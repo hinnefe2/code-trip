@@ -1,223 +1,192 @@
-"""Unit tests for Summarizer with mocked OpenAI client."""
+"""Unit tests for the Summarizer wrapper + WORK-flow fallback."""
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from code_trip.summarizer import (
-    DEFAULT_MODEL,
-    ENV_API_KEY,
-    SUMMARIZER_PROMPT,
-    VERBOSITY_INSTRUCTIONS,
-    Summarizer,
-    SummarizerError,
-    Verbosity,
-)
+from code_trip2 import modes
+from code_trip2.summarizer import Summarizer, SummarizerError
 
 
-@pytest.fixture
-def mock_openai():
-    with patch("code_trip.summarizer.openai") as m:
-        mock_client = MagicMock()
-        m.OpenAI.return_value = mock_client
-        # Default: successful summary
-        mock_choice = MagicMock()
-        mock_choice.message.content = "Tests passed successfully with no errors."
-        mock_client.chat.completions.create.return_value = MagicMock(
-            choices=[mock_choice]
-        )
-        yield m
+# --- Summarizer itself -----------------------------------------------------
 
 
-@pytest.fixture
-def summarizer(mock_openai, monkeypatch):
-    monkeypatch.delenv(ENV_API_KEY, raising=False)
-    return Summarizer(api_key="test-key")
+def test_summarizer_disabled_without_api_key():
+    s = Summarizer(api_key=None)
+    assert s.enabled is False
+    with pytest.raises(SummarizerError):
+        s.summarize("anything")
 
 
-# --- summarize happy path -------------------------------------------------
+def test_summarizer_empty_input_returns_empty():
+    s = Summarizer(api_key="sk-test")
+    s._client = MagicMock()
+    assert s.summarize("") == ""
+    assert s.summarize("   \n\n   ") == ""
+    s._client.chat.completions.create.assert_not_called()
 
 
-def test_summarize_returns_text(summarizer, mock_openai):
-    result = summarizer.summarize("raw output here")
-    assert result == "Tests passed successfully with no errors."
-
-
-def test_summarize_passes_model(summarizer, mock_openai):
-    summarizer.summarize("raw output")
-
-    call_kwargs = mock_openai.OpenAI.return_value.chat.completions.create.call_args.kwargs
-    assert call_kwargs["model"] == DEFAULT_MODEL
-
-
-def test_summarize_sends_system_and_user_messages(summarizer, mock_openai):
-    summarizer.summarize("raw output")
-
-    call_kwargs = mock_openai.OpenAI.return_value.chat.completions.create.call_args.kwargs
-    messages = call_kwargs["messages"]
-    assert len(messages) == 2
-    assert messages[0]["role"] == "system"
-    assert messages[1]["role"] == "user"
-
-
-# --- mode and user_request context ----------------------------------------
-
-
-def test_mode_context_prepended(summarizer, mock_openai):
-    summarizer.summarize("raw output", mode="WORK")
-
-    call_kwargs = mock_openai.OpenAI.return_value.chat.completions.create.call_args.kwargs
-    user_msg = call_kwargs["messages"][1]["content"]
-    assert "[Mode: WORK]" in user_msg
-    assert "raw output" in user_msg
-
-
-def test_user_request_context_prepended(summarizer, mock_openai):
-    summarizer.summarize("raw output", user_request="run the tests")
-
-    call_kwargs = mock_openai.OpenAI.return_value.chat.completions.create.call_args.kwargs
-    user_msg = call_kwargs["messages"][1]["content"]
-    assert '[User asked: "run the tests"]' in user_msg
-    assert "raw output" in user_msg
-
-
-def test_both_context_fields(summarizer, mock_openai):
-    summarizer.summarize("raw output", mode="REVIEW", user_request="check types")
-
-    call_kwargs = mock_openai.OpenAI.return_value.chat.completions.create.call_args.kwargs
-    user_msg = call_kwargs["messages"][1]["content"]
-    assert "[Mode: REVIEW]" in user_msg
-    assert '[User asked: "check types"]' in user_msg
-
-
-def test_no_context_when_none(summarizer, mock_openai):
-    summarizer.summarize("raw output")
-
-    call_kwargs = mock_openai.OpenAI.return_value.chat.completions.create.call_args.kwargs
-    user_msg = call_kwargs["messages"][1]["content"]
-    assert user_msg == "raw output"
-    assert "[Mode:" not in user_msg
-    assert "[User asked:" not in user_msg
-
-
-# --- verbosity levels -----------------------------------------------------
-
-
-def test_verbosity_brief(mock_openai, monkeypatch):
-    monkeypatch.delenv(ENV_API_KEY, raising=False)
-    s = Summarizer(api_key="test-key", verbosity=Verbosity.BRIEF)
-    s.summarize("raw output")
-
-    call_kwargs = mock_openai.OpenAI.return_value.chat.completions.create.call_args.kwargs
-    system_msg = call_kwargs["messages"][0]["content"]
-    assert VERBOSITY_INSTRUCTIONS["brief"] in system_msg
-
-
-def test_verbosity_detailed(summarizer, mock_openai):
-    summarizer.summarize("raw output")
-
-    call_kwargs = mock_openai.OpenAI.return_value.chat.completions.create.call_args.kwargs
-    system_msg = call_kwargs["messages"][0]["content"]
-    assert VERBOSITY_INSTRUCTIONS["detailed"] in system_msg
-
-
-def test_verbosity_verbose(mock_openai, monkeypatch):
-    monkeypatch.delenv(ENV_API_KEY, raising=False)
-    s = Summarizer(api_key="test-key", verbosity=Verbosity.VERBOSE)
-    s.summarize("raw output")
-
-    call_kwargs = mock_openai.OpenAI.return_value.chat.completions.create.call_args.kwargs
-    system_msg = call_kwargs["messages"][0]["content"]
-    assert VERBOSITY_INSTRUCTIONS["verbose"] in system_msg
-
-
-# --- system prompt contains rules -----------------------------------------
-
-
-def test_system_prompt_contains_summarizer_rules(summarizer, mock_openai):
-    summarizer.summarize("raw output")
-
-    call_kwargs = mock_openai.OpenAI.return_value.chat.completions.create.call_args.kwargs
-    system_msg = call_kwargs["messages"][0]["content"]
-    assert "NEVER include code" in system_msg
-    assert SUMMARIZER_PROMPT in system_msg
-
-
-# --- API key configuration ------------------------------------------------
-
-
-def test_api_key_from_env(mock_openai, monkeypatch):
-    monkeypatch.setenv(ENV_API_KEY, "env-key")
-    Summarizer()
-    mock_openai.OpenAI.assert_called_with(api_key="env-key")
-
-
-def test_explicit_key_takes_precedence(mock_openai, monkeypatch):
-    monkeypatch.setenv(ENV_API_KEY, "env-key")
-    Summarizer(api_key="explicit-key")
-    mock_openai.OpenAI.assert_called_with(api_key="explicit-key")
-
-
-def test_missing_api_key_raises(mock_openai, monkeypatch):
-    monkeypatch.delenv(ENV_API_KEY, raising=False)
-    with pytest.raises(SummarizerError, match="No API key"):
-        Summarizer()
-
-
-# --- error handling -------------------------------------------------------
-
-
-def test_empty_response_raises(summarizer, mock_openai):
-    mock_choice = MagicMock()
-    mock_choice.message.content = "   "
-    mock_openai.OpenAI.return_value.chat.completions.create.return_value = (
-        MagicMock(choices=[mock_choice])
+def test_summarizer_calls_chat_completions_with_prompt():
+    s = Summarizer(api_key="sk-test", model="gpt-4o-mini")
+    client = MagicMock()
+    client.chat.completions.create.return_value = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="Tests passed."))]
     )
-    with pytest.raises(SummarizerError, match="Empty summary"):
-        summarizer.summarize("raw output")
+    s._client = client
+
+    out = s.summarize("raw output here", context={"user_prompt": "run tests"})
+
+    assert out == "Tests passed."
+    args, kwargs = client.chat.completions.create.call_args
+    assert kwargs["model"] == "gpt-4o-mini"
+    msgs = kwargs["messages"]
+    assert msgs[0]["role"] == "system"
+    assert "spoken audio" in msgs[0]["content"]
+    assert msgs[1]["role"] == "user"
+    assert "run tests" in msgs[1]["content"]
+    assert "raw output here" in msgs[1]["content"]
 
 
-def test_auth_error_raises(summarizer, mock_openai):
-    import openai as _openai
-
-    mock_openai.OpenAI.return_value.chat.completions.create.side_effect = (
-        _openai.AuthenticationError(
-            message="bad key",
-            response=MagicMock(status_code=401),
-            body=None,
-        )
+def test_summarizer_caps_output_length():
+    s = Summarizer(api_key="sk-test", max_chars=20)
+    long = "word " * 100
+    client = MagicMock()
+    client.chat.completions.create.return_value = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=long))]
     )
-    mock_openai.AuthenticationError = _openai.AuthenticationError
+    s._client = client
+    out = s.summarize("anything")
+    assert len(out) <= 21  # 20 chars + the ellipsis we append
 
-    with pytest.raises(SummarizerError, match="Authentication failed"):
-        summarizer.summarize("raw output")
 
-
-def test_network_error_raises(summarizer, mock_openai):
-    import openai as _openai
-
-    mock_openai.OpenAI.return_value.chat.completions.create.side_effect = (
-        _openai.APIConnectionError(request=MagicMock())
+def test_summarizer_truncates_long_input():
+    s = Summarizer(api_key="sk-test", max_input_chars=100)
+    big_raw = "X" * 5000 + "Y" * 50  # tail is the meaningful part
+    client = MagicMock()
+    client.chat.completions.create.return_value = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
     )
-    mock_openai.APIConnectionError = _openai.APIConnectionError
+    s._client = client
+    s.summarize(big_raw)
+    msgs = client.chat.completions.create.call_args.kwargs["messages"]
+    body = msgs[1]["content"]
+    assert "truncated" in body
+    assert "Y" * 50 in body
 
-    with pytest.raises(SummarizerError, match="Network error"):
-        summarizer.summarize("raw output")
+
+def test_summarizer_api_error_raises():
+    s = Summarizer(api_key="sk-test")
+    client = MagicMock()
+    client.chat.completions.create.side_effect = RuntimeError("boom")
+    s._client = client
+    with pytest.raises(SummarizerError):
+        s.summarize("raw")
 
 
-def test_api_error_raises(summarizer, mock_openai):
-    import openai as _openai
+# --- modes._summarize_or_strip fallback ------------------------------------
 
-    mock_openai.OpenAI.return_value.chat.completions.create.side_effect = (
-        _openai.APIError(
-            message="server error",
-            request=MagicMock(),
-            body=None,
-        )
+
+def _make_ctx_for_strip(summarizer=None):
+    tts = MagicMock()
+    tts.is_playing.return_value = False
+    cfg = SimpleNamespace(
+        ssh_host="",
+        ssh_options=(),
+        tmux_session="main",
+        work_window="work",
+        linear_window="linear",
+        terminal_apps=("kitty",),
     )
-    mock_openai.APIError = _openai.APIError
+    return modes.Context(
+        config=cfg,  # type: ignore[arg-type]
+        tts=tts,
+        log=MagicMock(),
+        thinking=MagicMock(),
+        summarizer=summarizer,
+    )
 
-    with pytest.raises(SummarizerError, match="API error"):
-        summarizer.summarize("raw output")
+
+def test_summarize_or_strip_no_summarizer_falls_back():
+    ctx = _make_ctx_for_strip(summarizer=None)
+    out, used_llm = modes._summarize_or_strip(ctx, "some text\n>", "the prompt")
+    assert used_llm is False
+    assert ">" not in out
+
+
+def test_summarize_or_strip_uses_summarizer_when_enabled():
+    summarizer = MagicMock()
+    summarizer.enabled = True
+    summarizer.summarize.return_value = "Summary."
+    ctx = _make_ctx_for_strip(summarizer=summarizer)
+    out, used_llm = modes._summarize_or_strip(ctx, "raw", "ask")
+    assert out == "Summary."
+    assert used_llm is True
+    summarizer.summarize.assert_called_once()
+    kwargs = summarizer.summarize.call_args.kwargs
+    assert kwargs["context"]["user_prompt"] == "ask"
+    assert kwargs["context"]["kind"] == "claude_reply"
+
+
+def test_summarize_or_strip_falls_back_on_summarizer_error():
+    summarizer = MagicMock()
+    summarizer.enabled = True
+    summarizer.summarize.side_effect = SummarizerError("api 500")
+    ctx = _make_ctx_for_strip(summarizer=summarizer)
+    out, used_llm = modes._summarize_or_strip(ctx, "raw text", "ask")
+    assert used_llm is False
+    assert out
+
+
+def test_summarize_or_strip_falls_back_on_empty_summary():
+    summarizer = MagicMock()
+    summarizer.enabled = True
+    summarizer.summarize.return_value = ""
+    ctx = _make_ctx_for_strip(summarizer=summarizer)
+    out, used_llm = modes._summarize_or_strip(ctx, "raw text", "ask")
+    assert used_llm is False
+
+
+# --- ClaudeProducer summarization ------------------------------------------
+
+
+def test_claude_producer_summarizes_pane():
+    from code_trip2.producers.claude import ClaudeProducer
+    from code_trip2.tasks import TaskQueue
+
+    cfg = SimpleNamespace(ssh_host="remote", ssh_options=(), tmux_session="main")
+    summarizer = MagicMock()
+    summarizer.enabled = True
+    summarizer.summarize.return_value = "Tests passed in two files."
+    q = TaskQueue()
+
+    p = ClaudeProducer(config=cfg, queue=q, summarizer=summarizer)  # type: ignore[arg-type]
+
+    with patch("code_trip2.producers.claude.remote.capture") as cap:
+        cap.return_value = "raw pane text"
+        p._emit({"window": "ticket-42", "finished_at": 1000.0, "last_user_msg": "run tests"})
+
+    tasks = q.all()
+    assert len(tasks) == 1
+    t = tasks[0]
+    assert t.kind == "claude_reply"
+    assert t.topic == "ticket-42"
+    assert t.body == "Tests passed in two files."
+    summarizer.summarize.assert_called_once()
+
+
+def test_claude_producer_no_summarizer_leaves_body_none():
+    from code_trip2.producers.claude import ClaudeProducer
+    from code_trip2.tasks import TaskQueue
+
+    cfg = SimpleNamespace(ssh_host="remote", ssh_options=(), tmux_session="main")
+    q = TaskQueue()
+
+    p = ClaudeProducer(config=cfg, queue=q, summarizer=None)  # type: ignore[arg-type]
+    p._emit({"window": "w", "finished_at": 1000.0})
+
+    tasks = q.all()
+    assert len(tasks) == 1
+    assert tasks[0].body is None

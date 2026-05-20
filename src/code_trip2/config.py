@@ -49,6 +49,9 @@ class Config:
     tts_speed: float = 1.15
     # claude
     wait_timeout: float = 300.0
+    # summarizer (cloud LLM that turns raw Claude pane output into spoken text)
+    summarizer_model: str = "gpt-4o-mini"
+    summarizer_max_chars: int = 600
     # task-queue
     startup_mode: str = "focused"           # "queue" | "focused"
     # mcp producers (skeletons in v1; need a local MCP server command to start)
@@ -127,6 +130,12 @@ def load_config(path: Path | str) -> Config:
     # claude
     if "wait_timeout" in claude:
         kw["wait_timeout"] = claude["wait_timeout"]
+
+    summarizer = data.get("summarizer", {})
+    if "model" in summarizer:
+        kw["summarizer_model"] = summarizer["model"]
+    if "max_chars" in summarizer:
+        kw["summarizer_max_chars"] = summarizer["max_chars"]
 
     # task queue
     queue_cfg = data.get("queue", {})
