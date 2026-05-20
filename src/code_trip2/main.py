@@ -192,7 +192,12 @@ def run(config: Config, *, tui: bool = False) -> None:
     if dashboard is not None:
         dashboard.start()
     try:
-        shutdown.wait()
+        # Poll instead of an indefinite wait so signal handlers (SIGINT
+        # in particular) get to run promptly. Python's signal delivery
+        # doesn't always interrupt threading.Event().wait() with no
+        # timeout on the main thread.
+        while not shutdown.is_set():
+            shutdown.wait(timeout=1.0)
     finally:
         if dashboard is not None:
             dashboard.stop()

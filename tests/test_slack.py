@@ -199,18 +199,47 @@ def test_producer_skips_when_mcp_unavailable(tmp_path: Path):
     assert p._thread is None
 
 
-def test_producer_skips_when_user_id_fails(tmp_path: Path):
+def test_producer_setup_returns_false_when_user_id_fails(tmp_path: Path):
+    """user_id resolution now happens on the worker thread; if it raises,
+    setup returns False and the poll loop is skipped."""
     p, _q, mcp, _state = _producer(tmp_path)
     mcp.call_tool.side_effect = ClaudeMCPError("auth broken")
-    p.start()
-    assert p._thread is None
+    assert p._setup_in_thread() is False
 
 
-def test_producer_skips_when_user_id_empty(tmp_path: Path):
+def test_producer_setup_returns_false_when_user_id_empty(tmp_path: Path):
     p, _q, mcp, _state = _producer(tmp_path)
     mcp.call_tool.return_value = {"id": ""}
+    assert p._setup_in_thread() is False
+
+
+def test_producer_setup_returns_true_and_caches_user_id(tmp_path: Path):
+    p, _q, mcp, _state = _producer(tmp_path)
+    mcp.call_tool.return_value = {"id": "UABC"}
+    assert p._setup_in_thread() is True
+    assert p._user_id == "UABC"
+
+
+def test_producer_start_spawns_thread_without_blocking(tmp_path: Path):
+    """Critical: start() must not block on the user_id fetch, even when
+    that fetch takes a long time. The fetch happens inside the worker
+    thread instead."""
+    p, _q, mcp, _state = _producer(tmp_path)
+
+    def slow_call(*_args, **_kwargs):
+        import time as _t
+        _t.sleep(10)
+        return {"id": "UABC"}
+
+    mcp.call_tool.side_effect = slow_call
+
+    import time as _t
+    started_at = _t.monotonic()
     p.start()
-    assert p._thread is None
+    elapsed = _t.monotonic() - started_at
+    assert elapsed < 0.5, f"start() blocked for {elapsed:.2f}s — should be near-instant"
+    assert p._thread is not None and p._thread.is_alive()
+    p.stop()  # don't leave the slow-sleeping thread running across tests
 
 
 def test_producer_fetch_user_id_reads_id_from_user_block(tmp_path: Path):

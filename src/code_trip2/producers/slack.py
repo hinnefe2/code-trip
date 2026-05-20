@@ -156,15 +156,10 @@ class SlackProducer:
         if self._mcp is None or not self._mcp.enabled:
             logger.info("SlackProducer: ClaudeMCPClient unavailable; not starting.")
             return
-        try:
-            self._user_id = self._fetch_user_id()
-        except ClaudeMCPError as exc:
-            logger.warning("SlackProducer: could not resolve user_id (%s); not starting.", exc)
-            return
-        if not self._user_id:
-            logger.warning("SlackProducer: empty user_id from slack_read_user_profile; not starting.")
-            return
-        logger.info("SlackProducer: starting (user_id=%s)", self._user_id)
+        # Resolve user_id inside the worker thread, not here — the
+        # claude --print call takes ~10 s and would block the
+        # orchestrator's whole startup (no logs, no dashboard) until
+        # it returns.
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -210,6 +205,8 @@ class SlackProducer:
         # orchestrator starts.
         if self._stop.wait(2.0):
             return
+        if not self._setup_in_thread():
+            return
         while not self._stop.is_set():
             try:
                 self._poll_once()
@@ -217,6 +214,25 @@ class SlackProducer:
                 logger.exception("SlackProducer poll failed")
             if self._stop.wait(self._config.slack_poll_interval):
                 return
+
+    def _setup_in_thread(self) -> bool:
+        """Resolve user_id from inside the worker thread.
+
+        Returns ``True`` if setup succeeded and the poll loop should
+        proceed, ``False`` otherwise (failed MCP call or empty user_id).
+        Split out from :meth:`_run` so tests can drive the setup path
+        without sitting through the 2 s startup stagger.
+        """
+        try:
+            self._user_id = self._fetch_user_id()
+        except ClaudeMCPError as exc:
+            logger.warning("SlackProducer: could not resolve user_id (%s); idling.", exc)
+            return False
+        if not self._user_id:
+            logger.warning("SlackProducer: empty user_id from slack_read_user_profile; idling.")
+            return False
+        logger.info("SlackProducer: ready (user_id=%s)", self._user_id)
+        return True
 
     def _poll_once(self) -> None:
         last_ts = self._state.last_search_ts()
