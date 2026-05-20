@@ -1,9 +1,11 @@
-"""Unit tests for TTSClient audio-shaping (fade + silence pad)."""
+"""Unit tests for TTSClient: audio-shaping + persistent OutputStream."""
 
 from __future__ import annotations
 
 import io
+import threading
 import wave
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -12,6 +14,8 @@ from code_trip2 import tts_client
 from code_trip2.tts_client import (
     _FADE_MS,
     _SILENCE_PAD_MS,
+    _WRITE_BLOCK_FRAMES,
+    TTSClient,
     _decode_wav,
     _shape_samples,
 )
@@ -119,3 +123,97 @@ def test_decode_wav_applies_shaping():
     assert decoded.size == samples.size + 2 * n_pad
     assert decoded[0] == 0  # leading silence
     assert decoded[-1] == 0  # trailing silence
+
+
+# --- persistent OutputStream behavior --------------------------------------
+
+
+def _stub_client():
+    """Build a TTSClient without touching the OpenAI/sounddevice modules."""
+    c = TTSClient.__new__(TTSClient)
+    c.api_key = "sk-test"
+    c.model = "test-model"
+    c.voice = "test-voice"
+    c.speed = 1.0
+    c._client = MagicMock()
+    c._playing = False
+    c._stream = None
+    c._stream_rate = 0
+    c._stream_channels = 0
+    c._stream_lock = threading.Lock()
+    c._stop_event = threading.Event()
+    return c
+
+
+def test_ensure_stream_creates_once_and_caches():
+    c = _stub_client()
+    with patch.object(tts_client, "sd") as sd_mock:
+        sd_mock.OutputStream.return_value = MagicMock()
+        s1 = c._ensure_stream(24_000, 1)
+        s2 = c._ensure_stream(24_000, 1)
+    assert s1 is s2
+    assert sd_mock.OutputStream.call_count == 1
+
+
+def test_ensure_stream_recreates_on_rate_change():
+    c = _stub_client()
+    stream_a = MagicMock()
+    stream_b = MagicMock()
+    with patch.object(tts_client, "sd") as sd_mock:
+        sd_mock.OutputStream.side_effect = [stream_a, stream_b]
+        c._ensure_stream(24_000, 1)
+        c._ensure_stream(48_000, 1)
+    stream_a.close.assert_called_once()
+    assert sd_mock.OutputStream.call_count == 2
+
+
+def test_ensure_stream_uses_high_latency():
+    c = _stub_client()
+    with patch.object(tts_client, "sd") as sd_mock:
+        sd_mock.OutputStream.return_value = MagicMock()
+        c._ensure_stream(24_000, 1)
+    kwargs = sd_mock.OutputStream.call_args.kwargs
+    assert kwargs["latency"] == "high"
+    assert kwargs["samplerate"] == 24_000
+    assert kwargs["channels"] == 1
+    assert kwargs["dtype"] == "int16"
+
+
+def test_write_in_blocks_streams_full_array():
+    c = _stub_client()
+    stream = MagicMock()
+    samples = np.zeros(_WRITE_BLOCK_FRAMES * 3 + 100, dtype=np.int16)
+    c._write_in_blocks(stream, samples)
+    # Expect 4 writes: 3 full blocks + a remainder.
+    assert stream.write.call_count == 4
+    total_written = sum(len(call.args[0]) for call in stream.write.call_args_list)
+    assert total_written == len(samples)
+
+
+def test_write_in_blocks_stops_when_event_set():
+    c = _stub_client()
+    stream = MagicMock()
+    samples = np.zeros(_WRITE_BLOCK_FRAMES * 5, dtype=np.int16)
+    # Set the stop event before write 3.
+    counter = {"calls": 0}
+    def fake_write(_):
+        counter["calls"] += 1
+        if counter["calls"] == 2:
+            c._stop_event.set()
+    stream.write.side_effect = fake_write
+    c._write_in_blocks(stream, samples)
+    # Stop should be honored within one extra block (the loop checks
+    # at the top of each iteration).
+    assert stream.write.call_count == 2
+
+
+def test_stop_does_not_close_stream():
+    """The stream must stay alive across stop()/speak() cycles so the
+    audio device doesn't get reinitialized on every utterance."""
+    c = _stub_client()
+    c._stream = MagicMock()
+    c._stream_rate = 24_000
+    c._stream_channels = 1
+    c.stop()
+    c._stream.close.assert_not_called()
+    assert c._stream is not None

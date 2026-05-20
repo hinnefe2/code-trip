@@ -10,7 +10,9 @@ playback mid-sentence.
 from __future__ import annotations
 
 import io
+import logging
 import os
+import threading
 import wave
 from dataclasses import dataclass, field
 
@@ -22,6 +24,8 @@ try:
     import sounddevice as sd
 except OSError:
     sd = None  # type: ignore[assignment]  # PortAudio not installed; tests mock this
+
+logger = logging.getLogger(__name__)
 
 # --- Module-level defaults ------------------------------------------------
 
@@ -39,6 +43,17 @@ ENV_API_KEY: str = "OPENAI_API_KEY"
 # plays.
 _FADE_MS: int = 12
 _SILENCE_PAD_MS: int = 40
+
+# Playback is done over a single, long-lived OutputStream rather than
+# the high-level ``sd.play()`` helper, which opens and tears down a
+# fresh stream on every call. Repeated reinit thrashes the audio device
+# (especially when the device's native rate differs from the TTS rate
+# — 48 kHz vs 24 kHz on macOS) and shows up as buffer underruns / pops
+# throughout playback, not just at the edges. With a persistent stream
+# the device stays configured and we just write blocks to it. Blocks
+# of ~170 ms at 24 kHz give us a reasonable cadence for honoring stop
+# requests without holding the GIL too long per write.
+_WRITE_BLOCK_FRAMES: int = 4096
 
 
 # --- Exceptions -----------------------------------------------------------
@@ -70,6 +85,18 @@ class TTSClient:
 
     _client: openai.OpenAI = field(default=None, init=False, repr=False)  # type: ignore[assignment]
     _playing: bool = field(default=False, init=False, repr=False)
+    # Persistent OutputStream so we don't reopen the audio device on every
+    # speak() call. Lazily created and recreated only when the sample
+    # rate / channel count changes.
+    _stream: object = field(default=None, init=False, repr=False)
+    _stream_rate: int = field(default=0, init=False, repr=False)
+    _stream_channels: int = field(default=0, init=False, repr=False)
+    _stream_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False
+    )
+    _stop_event: threading.Event = field(
+        default_factory=threading.Event, init=False, repr=False
+    )
 
     def __post_init__(self) -> None:
         resolved_key = self.api_key or os.environ.get(ENV_API_KEY)
@@ -85,7 +112,8 @@ class TTSClient:
         """Synthesize ``text`` and play it through the system audio.
 
         Blocks until playback finishes.  Call :meth:`stop` from another
-        thread to interrupt mid-sentence.
+        thread to interrupt mid-sentence (latency: ~170 ms = one write
+        block).
 
         Raises:
             TTSClientError: if the text is empty or the API call fails.
@@ -114,23 +142,80 @@ class TTSClient:
             raise TTSClientError("Empty audio returned")
 
         samples, sample_rate = _decode_wav(audio)
+        channels = 1 if samples.ndim == 1 else samples.shape[1]
 
-        # Stop anything still playing before starting new audio.
-        sd.stop()
+        self._stop_event.clear()
+        stream = self._ensure_stream(sample_rate, channels)
         self._playing = True
         try:
-            sd.play(samples, sample_rate)
-            sd.wait()
+            self._write_in_blocks(stream, samples)
         finally:
             self._playing = False
 
     def stop(self) -> None:
-        """Interrupt any in-progress playback.  No-op if nothing is playing."""
-        sd.stop()
+        """Interrupt any in-progress playback.
+
+        Sets a stop flag; the write loop exits at the next block
+        boundary (~170 ms). The OutputStream itself is left open so
+        the next ``speak()`` doesn't pay the reopen cost.
+        """
+        self._stop_event.set()
 
     def is_playing(self) -> bool:
         """True while ``speak()`` is blocked on playback."""
         return self._playing
+
+    # --- internals --------------------------------------------------------
+
+    def _ensure_stream(self, sample_rate: int, channels: int):
+        """Return the live OutputStream, creating it if needed.
+
+        Recreated when the sample-rate or channel count changes (rare —
+        OpenAI TTS always returns mono 24 kHz today, but the device may
+        be the user's choice and we want to honor whatever WAV comes
+        back).
+        """
+        with self._stream_lock:
+            if (
+                self._stream is not None
+                and self._stream_rate == sample_rate
+                and self._stream_channels == channels
+            ):
+                return self._stream
+
+            if self._stream is not None:
+                try:
+                    self._stream.close()
+                except Exception:
+                    logger.warning("TTS: failed to close prior stream", exc_info=True)
+
+            try:
+                self._stream = sd.OutputStream(
+                    samplerate=sample_rate,
+                    channels=channels,
+                    dtype="int16",
+                    latency="high",
+                )
+                self._stream.start()
+            except Exception as exc:
+                self._stream = None
+                self._stream_rate = 0
+                self._stream_channels = 0
+                raise TTSClientError(f"Could not open audio stream: {exc}") from exc
+
+            self._stream_rate = sample_rate
+            self._stream_channels = channels
+            return self._stream
+
+    def _write_in_blocks(self, stream, samples: np.ndarray) -> None:
+        """Push samples into the stream in small blocks so we can
+        honor ``stop()`` without aborting the stream."""
+        total = len(samples)
+        for start in range(0, total, _WRITE_BLOCK_FRAMES):
+            if self._stop_event.is_set():
+                return
+            end = min(start + _WRITE_BLOCK_FRAMES, total)
+            stream.write(samples[start:end])
 
 
 # --- helpers --------------------------------------------------------------
