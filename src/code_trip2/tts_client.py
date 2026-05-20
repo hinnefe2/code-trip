@@ -31,6 +31,15 @@ DEFAULT_SPEED: float = 1.15
 DEFAULT_FORMAT: str = "wav"
 ENV_API_KEY: str = "OPENAI_API_KEY"
 
+# Pop/click suppression. The OpenAI WAV doesn't always start or end at
+# zero amplitude, and the audio device often goes idle between
+# utterances (especially on Bluetooth earbuds), so the first sample of
+# playback hits an asleep DAC and we hear a click. A short fade + a
+# silence cushion lets the device wake up before the speech itself
+# plays.
+_FADE_MS: int = 12
+_SILENCE_PAD_MS: int = 40
+
 
 # --- Exceptions -----------------------------------------------------------
 
@@ -128,7 +137,12 @@ class TTSClient:
 
 
 def _decode_wav(audio: bytes) -> tuple[np.ndarray, int]:
-    """Decode WAV bytes into a numpy int16 array and sample rate."""
+    """Decode WAV bytes into a numpy int16 array and sample rate.
+
+    Applies a small fade-in/out and silence pad to suppress the DAC-wakeup
+    click that's especially noticeable for short utterances ("Queue is
+    empty.") and on Bluetooth audio paths.
+    """
     with wave.open(io.BytesIO(audio), "rb") as wf:
         sample_rate = wf.getframerate()
         channels = wf.getnchannels()
@@ -136,4 +150,31 @@ def _decode_wav(audio: bytes) -> tuple[np.ndarray, int]:
     samples = np.frombuffer(frames, dtype=np.int16)
     if channels > 1:
         samples = samples.reshape(-1, channels)
+    samples = _shape_samples(samples, sample_rate)
     return samples, sample_rate
+
+
+def _shape_samples(samples: np.ndarray, sample_rate: int) -> np.ndarray:
+    """Apply fade-in/out and prepend/append silence so playback doesn't pop."""
+    if samples.size == 0:
+        return samples
+    n_fade = int(sample_rate * _FADE_MS / 1000)
+    n_pad = int(sample_rate * _SILENCE_PAD_MS / 1000)
+    n = len(samples)
+    if 2 * n_fade < n:
+        env = np.ones(n, dtype=np.float32)
+        env[:n_fade] = np.linspace(0.0, 1.0, n_fade, dtype=np.float32)
+        env[-n_fade:] = np.linspace(1.0, 0.0, n_fade, dtype=np.float32)
+        if samples.ndim == 1:
+            faded = (samples.astype(np.float32) * env).astype(np.int16)
+        else:
+            faded = (samples.astype(np.float32) * env[:, np.newaxis]).astype(np.int16)
+    else:
+        faded = samples
+    if n_pad > 0:
+        if samples.ndim == 1:
+            silence = np.zeros(n_pad, dtype=np.int16)
+        else:
+            silence = np.zeros((n_pad, samples.shape[1]), dtype=np.int16)
+        return np.concatenate([silence, faded, silence])
+    return faded
