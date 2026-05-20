@@ -220,6 +220,32 @@ def test_yes_tap_suppressed_in_focused_mode_when_tui_host_focused(monkeypatch):
     send.assert_not_called()
 
 
+def test_render_keymap_in_queue_mode_shows_queue_actions():
+    ctx = _make_ctx(app_mode="queue")
+    layout = tui.render(ctx, supervisor=None)
+    out = _render_to_string(layout)
+    assert "Macropad" in out
+    assert "PTT" in out and "YES" in out and "NO" in out and "ACT" in out and "NAV" in out
+    # YES/NO/ACT meaning is queue-flavored.
+    assert "accept" in out or "expand" in out
+    assert "skip task" in out
+    assert "→ focused" in out
+    # Chord rows are mode-independent.
+    assert "NAV+" in out
+    assert "ACT+" in out
+
+
+def test_render_keymap_in_focused_mode_shows_focused_actions():
+    ctx = _make_ctx(app_mode="focused")
+    layout = tui.render(ctx, supervisor=None)
+    out = _render_to_string(layout)
+    assert "Macropad" in out
+    # YES/NO/ACT show keyboard-style meanings in focused mode.
+    assert "Enter" in out
+    assert "Esc" in out
+    assert "→ queue" in out
+
+
 def test_render_producers_status_uses_supervisor():
     ctx = _make_ctx()
     sup = ProducerSupervisor()

@@ -183,6 +183,52 @@ def _topics_panel(ctx: "Context") -> Panel:
     return Panel(body, title="Recent topics", border_style="bright_black")
 
 
+def _keymap_panel(ctx: "Context") -> Panel:
+    """Mode-aware reminder of what each macropad key does.
+
+    YES/NO solo tap meaning depends on app-mode (queue vs focused), so
+    the panel re-renders that row when the mode flips. Chord rows
+    (NAV+x, ACT+NO) are mode-independent and shown verbatim.
+    """
+    if ctx.app_mode == "queue":
+        yes_solo = "accept / expand"
+        no_solo = "skip task"
+        act_solo = "→ focused"
+    else:
+        yes_solo = "Enter"
+        no_solo = "Esc"
+        act_solo = "→ queue"
+
+    def _key(name: str) -> Text:
+        return Text(name, style="bold cyan")
+
+    def _act(text: str) -> Text:
+        return Text(text, style="white")
+
+    sep = Text("   ")
+
+    solo = Text.assemble(
+        _key("PTT"), " ", _act("hold to talk"), sep,
+        _key("YES"), " ", _act(yes_solo), sep,
+        _key("NO"), " ", _act(no_solo), sep,
+        _key("ACT"), " ", _act(act_solo), sep,
+        _key("NAV"), " ", _act("per-app"),
+    )
+    nav_chords = Text.assemble(
+        Text("NAV+", style="bold magenta"),
+        _key("PTT"), " ", _act("speak app"), sep,
+        _key("YES"), " ", _act("next"), sep,
+        _key("NO"), " ", _act("prev"), sep,
+        _key("ACT"), " ", _act("cycle app"),
+    )
+    act_chords = Text.assemble(
+        Text("ACT+", style="bold magenta"),
+        _key("NO"), " ", _act("Ctrl+U (clear line)"),
+    )
+    body = Group(solo, nav_chords, act_chords)
+    return Panel(body, title="Macropad", border_style="bright_black")
+
+
 def _producers_panel(supervisor: "ProducerSupervisor | None") -> Panel:
     if supervisor is None:
         return Panel(Text("(no supervisor)", style="dim"), title="Producers")
@@ -203,7 +249,8 @@ def render(ctx: "Context", supervisor: "ProducerSupervisor | None") -> Layout:
     layout.split_column(
         Layout(_header(ctx), name="header", size=3),
         Layout(name="body"),
-        Layout(_producers_panel(supervisor), name="footer", size=3),
+        Layout(_keymap_panel(ctx), name="keymap", size=5),
+        Layout(_producers_panel(supervisor), name="producers", size=3),
     )
     layout["body"].split_row(
         Layout(name="left", ratio=2),
