@@ -246,28 +246,37 @@ def test_producer_fetch_user_id_returns_empty_when_unparseable(tmp_path: Path):
     assert p._fetch_user_id() == ""
 
 
-def test_producer_poll_emits_tasks_and_advances_state(tmp_path: Path):
+_DETAILED_FIXTURE = (
+    "# Search Results for: <@UME>\n\n"
+    "## Messages (2 results)\n"
+    "### Result 1 of 2\n"
+    "Channel: #random (ID: CRAND)\n"
+    "From: Alice (ID: UALICE) \n"
+    "Time: 2026-05-20 13:43:54 CDT\n"
+    "Message_ts: 1716000001.000000\n"
+    "Permalink: [link](https://x.slack.com/archives/CRAND/p1716000001000000?thread_ts=1716000001.000000&cid=CRAND)\n"
+    "Text: \n"
+    "hey <@UME> can you check the deploy\n"
+    "\n"
+    "---\n\n"
+    "### Result 2 of 2\n"
+    "Channel: #engineering (ID: CENG)\n"
+    "From: Bob (ID: UBOB) \n"
+    "Time: 2026-05-20 13:44:54 CDT\n"
+    "Message_ts: 1716000002.000000\n"
+    "Reply count: 3\n"
+    "Permalink: [link](https://x.slack.com/archives/CENG/p1716000002000000?thread_ts=1716000000.500000&cid=CENG)\n"
+    "Text: \n"
+    "follow-up question\n"
+    "\n"
+    "---\n\n"
+)
+
+
+def test_producer_poll_emits_tasks_from_detailed_markdown(tmp_path: Path):
     p, q, mcp, state = _producer(tmp_path)
     p._user_id = "UME"
-    mcp.call_tool.return_value = {
-        "messages": [
-            {
-                "ts": "1716000001.000000",
-                "text": "hey <@UME> can you check the deploy",
-                "user": "UALICE",
-                "username": "Alice",
-                "channel": {"id": "CRAND", "name": "random"},
-                "thread_ts": "1716000001.000000",
-            },
-            {
-                "ts": "1716000002.000000",
-                "text": "follow-up question",
-                "user": "UBOB",
-                "username": "Bob",
-                "channel": {"id": "CENG", "name": "engineering"},
-            },
-        ]
-    }
+    mcp.call_tool.return_value = {"results": _DETAILED_FIXTURE}
     p._poll_once()
 
     tasks = q.all()
@@ -276,61 +285,110 @@ def test_producer_poll_emits_tasks_and_advances_state(tmp_path: Path):
     t1 = by_ts["1716000001.000000"]
     assert t1.topic == "slack-random"
     assert "Alice" in t1.headline
+    assert "deploy" in t1.body
     assert t1.source["channel_id"] == "CRAND"
     assert t1.source["sender_id"] == "UALICE"
     assert t1.source["thread_ts"] == "1716000001.000000"
     t2 = by_ts["1716000002.000000"]
-    assert t2.source["thread_ts"] == "1716000002.000000"  # falls back to ts
+    assert t2.source["thread_ts"] == "1716000000.500000"  # extracted from permalink
     assert state.last_search_ts() == "1716000002.000000"
 
 
+def test_producer_poll_skips_bot_messages_by_default(tmp_path: Path):
+    bot_fixture = (
+        "# Search Results for: <@UME>\n\n"
+        "### Result 1 of 1\n"
+        "Channel: #alerts (ID: CALERT)\n"
+        "From: Linear (ID: UBOTID)  [BOT]\n"
+        "Message_ts: 1716000099.000000\n"
+        "Permalink: [link](https://x.slack.com/archives/CALERT/p1716000099000000?thread_ts=1716000099.000000)\n"
+        "Text: \n"
+        "Created issue ABC-123\n"
+        "\n"
+        "---\n\n"
+    )
+    p, q, mcp, state = _producer(tmp_path)
+    p._user_id = "UME"
+    mcp.call_tool.return_value = {"results": bot_fixture}
+    p._poll_once()
+    assert q.all() == []
+    # State should still advance so we don't keep re-parsing the same bot
+    # message on every poll.
+    assert state.last_search_ts() == "1716000099.000000"
+
+
 def test_producer_poll_skips_messages_at_or_before_last_ts(tmp_path: Path):
+    fixture = (
+        "### Result 1 of 2\n"
+        "Channel: #c (ID: C1)\n"
+        "From: A (ID: U1) \n"
+        "Message_ts: 1716000005.000000\n"
+        "Permalink: [link](https://x.slack.com/archives/C1/p1716000005000000?thread_ts=1716000005.000000)\n"
+        "Text: \n"
+        "old\n\n"
+        "---\n\n"
+        "### Result 2 of 2\n"
+        "Channel: #c (ID: C1)\n"
+        "From: A (ID: U1) \n"
+        "Message_ts: 1716000006.000000\n"
+        "Permalink: [link](https://x.slack.com/archives/C1/p1716000006000000?thread_ts=1716000006.000000)\n"
+        "Text: \n"
+        "new\n\n"
+        "---\n\n"
+    )
     p, q, mcp, state = _producer(tmp_path)
     p._user_id = "UME"
     state.set_last_search_ts("1716000005.000000")
-    mcp.call_tool.return_value = {
-        "messages": [
-            {"ts": "1716000005.000000", "text": "old", "user": "U1",
-             "channel": {"id": "C1", "name": "c"}},
-            {"ts": "1716000006.000000", "text": "new", "user": "U1",
-             "channel": {"id": "C1", "name": "c"}},
-        ]
-    }
+    mcp.call_tool.return_value = {"results": fixture}
     p._poll_once()
     assert len(q.all()) == 1
-    assert q.all()[0].body == "new"
+    assert "new" in q.all()[0].body
 
 
 def test_producer_poll_dedupes_within_session(tmp_path: Path):
+    fixture = (
+        "### Result 1 of 1\n"
+        "Channel: #c (ID: C1)\n"
+        "From: A (ID: U1) \n"
+        "Message_ts: 1716000010.000000\n"
+        "Permalink: [link](https://x.slack.com/archives/C1/p1716000010000000?thread_ts=1716000010.000000)\n"
+        "Text: \n"
+        "ping\n\n"
+        "---\n\n"
+    )
     p, q, mcp, _state = _producer(tmp_path)
     p._user_id = "UME"
-    msg = {"ts": "1716000010.000000", "text": "ping", "user": "U1",
-           "channel": {"id": "C1", "name": "c"}}
-    mcp.call_tool.return_value = {"messages": [msg]}
+    mcp.call_tool.return_value = {"results": fixture}
     p._poll_once()
-    p._poll_once()  # same poll result returned; should not emit twice
+    p._poll_once()  # same poll result; second pass should be a no-op
     assert len(q.all()) == 1
 
 
 def test_producer_poll_handles_empty_results(tmp_path: Path):
     p, q, mcp, _state = _producer(tmp_path)
     p._user_id = "UME"
-    mcp.call_tool.return_value = {"messages": []}
+    mcp.call_tool.return_value = {"results": "# Search Results for: <@UME>\n\n## Messages (0 results)\n"}
     p._poll_once()
     assert q.all() == []
 
 
-def test_producer_poll_handles_alt_response_shapes(tmp_path: Path):
-    """Slack MCP variants put matches under several keys; handle them."""
+def test_producer_poll_handles_structured_messages_too(tmp_path: Path):
+    """Future-proof: if the MCP ever returns a structured ``messages``
+    list instead of markdown, we still cope."""
     p, q, mcp, _state = _producer(tmp_path)
     p._user_id = "UME"
     mcp.call_tool.return_value = {
-        "messages": {
-            "matches": [
-                {"ts": "1.0", "text": "via matches", "user": "U1",
-                 "channel": {"id": "C1", "name": "c"}}
-            ]
-        }
+        "messages": [
+            {
+                "ts": "1.0",
+                "text": "ping",
+                "channel_id": "C1",
+                "channel_name": "c",
+                "sender_id": "U1",
+                "sender_name": "Alice",
+                "thread_ts": "1.0",
+            }
+        ]
     }
     p._poll_once()
     assert len(q.all()) == 1

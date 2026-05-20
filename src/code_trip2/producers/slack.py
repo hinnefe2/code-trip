@@ -33,6 +33,26 @@ from code_trip2.tasks import Task, TaskQueue
 
 _USER_ID_RE = re.compile(r"User ID:\s*(U[A-Z0-9]+)", re.IGNORECASE)
 
+# Parsers for the Slack MCP's ``response_format=detailed`` markdown output.
+# Each result block looks like::
+#
+#     ### Result 1 of N
+#     Channel: #<name> (ID: C0…)
+#     From: <Display Name> (ID: U0…)  [BOT]
+#     Time: 2026-05-20 13:43:54 CDT
+#     Message_ts: 1779302634.710049
+#     Reply count: 5             (optional)
+#     Permalink: [link](https://…?thread_ts=…&cid=…)
+#     Text:
+#     <body, possibly multiline>
+#
+#     ---
+_BLOCK_SPLIT_RE = re.compile(r"^### Result \d+ of \d+\s*$", re.MULTILINE)
+_CHANNEL_RE = re.compile(r"^Channel:\s+#(\S+)\s+\(ID:\s+(\w+)\)\s*$")
+_FROM_RE = re.compile(r"^From:\s+(.+?)\s+\(ID:\s+(\w+)\)(?:\s+\[(BOT)\])?\s*$")
+_TS_RE = re.compile(r"^Message_ts:\s+(\d+\.\d+)\s*$")
+_THREAD_TS_RE = re.compile(r"thread_ts=(\d+\.\d+)")
+
 if TYPE_CHECKING:
     pass
 
@@ -150,27 +170,47 @@ class SlackProducer:
                     "sort_dir": "asc",
                     "limit": 20,
                     "include_context": False,
-                    "response_format": "concise",
+                    "response_format": "detailed",
                 },
             )
         except ClaudeMCPError as exc:
             logger.warning("SlackProducer: search call failed: %s", exc)
             return
 
-        for msg in self._extract_messages(result):
+        messages = self._extract_messages(result)
+        emitted = 0
+        skipped_bot = 0
+        skipped_old = 0
+        for msg in messages:
             ts = msg.get("ts") or ""
             if not ts:
                 continue
             if last_ts and ts <= last_ts:
+                skipped_old += 1
                 continue
             if ts in self._recent_ids:
+                skipped_old += 1
+                continue
+            if msg.get("is_bot"):
+                skipped_bot += 1
+                self._recent_ids.add(ts)
+                self._state.set_last_search_ts(ts)
                 continue
             try:
                 self._emit_task(msg)
+                emitted += 1
             except Exception:
                 logger.exception("Failed to emit Slack task for ts=%s", ts)
             self._recent_ids.add(ts)
             self._state.set_last_search_ts(ts)
+
+        logger.info(
+            "SlackProducer: poll found %d matches (%d emitted, %d bot, %d already-seen)",
+            len(messages),
+            emitted,
+            skipped_bot,
+            skipped_old,
+        )
 
         # Cap the in-memory dedup set so it doesn't grow unbounded.
         if len(self._recent_ids) > 500:
@@ -193,50 +233,86 @@ class SlackProducer:
     # ---- response shape -------------------------------------------------
 
     def _extract_messages(self, result: dict) -> list[dict]:
-        """Defensive: the Slack MCP returns matches under several keys
-        depending on response_format and version. Try the common ones."""
-        candidates = (
-            result.get("messages"),
-            (result.get("messages") or {}).get("matches") if isinstance(result.get("messages"), dict) else None,
-            result.get("matches"),
-            result.get("results"),
-            result.get("items"),
-        )
-        for c in candidates:
-            if isinstance(c, list):
-                return c
-        return []
+        """Parse the Slack MCP's ``response_format=detailed`` markdown.
+
+        The MCP returns ``{"results": "# Search Results for: …\\n### Result
+        1 of N\\nChannel: …\\nFrom: …\\n…"}``. We split on ``### Result``
+        headers and pull structured fields out of each block.
+        """
+        if isinstance(result.get("messages"), list):
+            # Future-proof: if the MCP ever returns structured JSON instead
+            # of markdown, take it.
+            return result["messages"]
+
+        text = result.get("results") or result.get("result") or ""
+        if not isinstance(text, str) or not text.strip():
+            return []
+
+        # The split keeps the chunks between headers; the first one is the
+        # preamble (e.g. "# Search Results for: …") and we drop it.
+        blocks = _BLOCK_SPLIT_RE.split(text)
+        return [parsed for b in blocks[1:] if (parsed := self._parse_block(b))]
+
+    def _parse_block(self, block: str) -> dict | None:
+        """Pull (channel, sender, ts, thread_ts, text, is_bot) out of one
+        result block. Returns None if any required field is missing."""
+        msg: dict = {"is_bot": False}
+        text_lines: list[str] = []
+        in_text = False
+        for line in block.splitlines():
+            stripped = line.strip()
+            if stripped == "---":
+                break
+            if in_text:
+                text_lines.append(line)
+                continue
+            if not stripped:
+                continue
+            m = _CHANNEL_RE.match(stripped)
+            if m:
+                msg["channel_name"] = m.group(1)
+                msg["channel_id"] = m.group(2)
+                continue
+            m = _FROM_RE.match(stripped)
+            if m:
+                msg["sender_name"] = m.group(1).strip()
+                msg["sender_id"] = m.group(2)
+                msg["is_bot"] = m.group(3) == "BOT"
+                continue
+            m = _TS_RE.match(stripped)
+            if m:
+                msg["ts"] = m.group(1)
+                continue
+            if stripped.startswith("Permalink:"):
+                t = _THREAD_TS_RE.search(stripped)
+                msg["thread_ts"] = t.group(1) if t else msg.get("ts", "")
+                continue
+            if stripped.startswith("Text:"):
+                in_text = True
+                continue
+            # Time, Reply count, etc. — ignore for now.
+
+        body = "\n".join(text_lines).strip()
+        if not msg.get("ts") or not msg.get("channel_id") or not body:
+            return None
+        msg["text"] = body
+        msg.setdefault("thread_ts", msg["ts"])
+        return msg
 
     def _emit_task(self, msg: dict) -> None:
         text = (msg.get("text") or "").strip()
         if not text:
             return
-        sender_id = msg.get("user") or msg.get("user_id") or ""
-        sender_name = (
-            msg.get("username")
-            or msg.get("user_name")
-            or (msg.get("user_profile") or {}).get("display_name")
-            or (msg.get("user_profile") or {}).get("real_name")
-            or sender_id
-            or "someone"
-        )
-        channel = msg.get("channel") or {}
-        if isinstance(channel, str):
-            channel_id = channel
-            channel_name = "channel"
-        else:
-            channel_id = channel.get("id") or msg.get("channel_id") or ""
-            channel_name = (
-                channel.get("name")
-                or msg.get("channel_name")
-                or "channel"
-            )
+        channel_id = msg.get("channel_id") or ""
+        channel_name = msg.get("channel_name") or "channel"
+        sender_id = msg.get("sender_id") or ""
+        sender_name = msg.get("sender_name") or sender_id or "someone"
         ts = msg.get("ts") or ""
         thread_ts = msg.get("thread_ts") or ts
         headline = f"{sender_name}: {text[:60]}"
         task = Task(
             kind="slack_msg",
-            topic=f"slack-{channel_name}" if channel_name else "slack",
+            topic=f"slack-{channel_name}",
             headline=headline,
             body=text,
             source={
