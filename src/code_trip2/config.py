@@ -55,7 +55,7 @@ class Config:
     # task-queue
     startup_mode: str = "focused"           # "queue" | "focused"
     # slack (via the claude.ai Slack MCP — auth piggy-backs on claude CLI)
-    slack_poll_interval: float = 30.0
+    slack_poll_interval: float = 60.0
     # linear (MCP — server choice TBD, still stubbed)
     linear_mcp_command: str = ""
     linear_mcp_args: tuple[str, ...] = ()
