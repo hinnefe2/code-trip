@@ -23,6 +23,7 @@ import logging
 import re
 import threading
 import time
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
 from code_trip2.config import Config
@@ -59,10 +60,29 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# Search "from" floor when the state file is empty. One week feels
-# right: enough to capture stale-but-unread mentions from a weekend
-# away, not so much that startup floods the queue.
-_INITIAL_LOOKBACK_S = 7 * 24 * 3600
+def _previous_workday_5pm_unix(now: datetime | None = None) -> int:
+    """Unix timestamp for 5pm of the most recent weekday before ``now``.
+
+    Used as the search ``after`` floor on first startup (no saved state).
+    Walks back day-by-day from yesterday until we hit a Mon-Fri date.
+    Times are interpreted in the system's local timezone.
+
+    Mapping by day-of-week the orchestrator is started:
+
+    - **Mon**: previous workday = Fri (skips weekend) — catches all of
+      Fri-after-5pm and the whole weekend.
+    - **Tue–Fri**: previous workday = yesterday — catches anything since
+      end-of-day yesterday.
+    - **Sat/Sun**: previous workday = Fri — catches Fri-after-5pm
+      forward.
+    """
+    if now is None:
+        now = datetime.now()
+    candidate = (now - timedelta(days=1)).date()
+    while candidate.weekday() >= 5:  # Sat=5, Sun=6
+        candidate -= timedelta(days=1)
+    target = datetime(candidate.year, candidate.month, candidate.day, 17, 0, 0)
+    return int(target.timestamp())
 
 
 class SlackProducer:
@@ -221,14 +241,15 @@ class SlackProducer:
 
         Slack's ``after`` is a Unix timestamp in seconds. From a Slack
         message ts string we take the integer portion. From an empty
-        state, we look back :data:`_INITIAL_LOOKBACK_S` seconds.
+        state, we floor at 5pm of the previous workday (see
+        :func:`_previous_workday_5pm_unix`).
         """
         if last_ts:
             try:
                 return str(int(float(last_ts)))
             except ValueError:
                 pass
-        return str(int(time.time() - _INITIAL_LOOKBACK_S))
+        return str(_previous_workday_5pm_unix())
 
     # ---- response shape -------------------------------------------------
 

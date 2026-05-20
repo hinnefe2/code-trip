@@ -408,13 +408,69 @@ def test_producer_after_param_uses_state_ts(tmp_path: Path):
     assert p._after_param(state.last_search_ts()) == "1716000100"
 
 
-def test_producer_after_param_falls_back_to_lookback(tmp_path: Path):
+def test_producer_after_param_falls_back_to_previous_workday_5pm(tmp_path: Path):
     p, _q, _mcp, _state = _producer(tmp_path)
     out = p._after_param(None)
-    # Should be a Unix timestamp roughly _INITIAL_LOOKBACK_S in the past.
-    import time
-    now = time.time()
-    assert (now - 8 * 24 * 3600) < int(out) < now
+    # Should be the unix timestamp for 5pm of the most recent weekday.
+    from code_trip2.producers.slack import _previous_workday_5pm_unix
+    assert int(out) == _previous_workday_5pm_unix()
+
+
+# --- _previous_workday_5pm_unix ------------------------------------------
+
+
+def _expected_unix(year, month, day):
+    from datetime import datetime
+    return int(datetime(year, month, day, 17, 0, 0).timestamp())
+
+
+def test_previous_workday_5pm_unix_from_wednesday():
+    """Wed → previous workday is Tue."""
+    from datetime import datetime
+    from code_trip2.producers.slack import _previous_workday_5pm_unix
+    wed_noon = datetime(2026, 5, 20, 12, 0, 0)  # 2026-05-20 is a Wednesday
+    assert _previous_workday_5pm_unix(wed_noon) == _expected_unix(2026, 5, 19)
+
+
+def test_previous_workday_5pm_unix_from_friday():
+    """Fri → previous workday is Thu."""
+    from datetime import datetime
+    from code_trip2.producers.slack import _previous_workday_5pm_unix
+    fri = datetime(2026, 5, 22, 9, 0, 0)
+    assert _previous_workday_5pm_unix(fri) == _expected_unix(2026, 5, 21)
+
+
+def test_previous_workday_5pm_unix_from_monday_skips_weekend():
+    """Mon → previous workday is Fri (skip Sat/Sun)."""
+    from datetime import datetime
+    from code_trip2.producers.slack import _previous_workday_5pm_unix
+    mon = datetime(2026, 5, 25, 8, 30, 0)
+    assert _previous_workday_5pm_unix(mon) == _expected_unix(2026, 5, 22)
+
+
+def test_previous_workday_5pm_unix_from_saturday():
+    """Sat → previous workday is Fri."""
+    from datetime import datetime
+    from code_trip2.producers.slack import _previous_workday_5pm_unix
+    sat = datetime(2026, 5, 23, 14, 0, 0)
+    assert _previous_workday_5pm_unix(sat) == _expected_unix(2026, 5, 22)
+
+
+def test_previous_workday_5pm_unix_from_sunday():
+    """Sun → previous workday is Fri (skip Sat)."""
+    from datetime import datetime
+    from code_trip2.producers.slack import _previous_workday_5pm_unix
+    sun = datetime(2026, 5, 24, 23, 59, 59)
+    assert _previous_workday_5pm_unix(sun) == _expected_unix(2026, 5, 22)
+
+
+def test_previous_workday_5pm_unix_from_friday_after_5pm():
+    """Fri evening still rolls back to Thu — we want yesterday's
+    after-hours window, not 'today minus a few hours'."""
+    from datetime import datetime
+    from code_trip2.producers.slack import _previous_workday_5pm_unix
+    fri_late = datetime(2026, 5, 22, 22, 0, 0)
+    assert _previous_workday_5pm_unix(fri_late) == _expected_unix(2026, 5, 21)
 
 
 # --- reply path ---------------------------------------------------------
