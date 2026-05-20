@@ -20,6 +20,7 @@ configured interval.
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from typing import TYPE_CHECKING
@@ -28,6 +29,9 @@ from code_trip2.config import Config
 from code_trip2.producers.claude_mcp import ClaudeMCPClient, ClaudeMCPError
 from code_trip2.slack_state import SlackState
 from code_trip2.tasks import Task, TaskQueue
+
+
+_USER_ID_RE = re.compile(r"User ID:\s*(U[A-Z0-9]+)", re.IGNORECASE)
 
 if TYPE_CHECKING:
     pass
@@ -93,13 +97,30 @@ class SlackProducer:
     # ---- setup ----------------------------------------------------------
 
     def _fetch_user_id(self) -> str:
-        """Resolve the current user's Slack ID via the MCP."""
+        """Resolve the current user's Slack ID via the MCP.
+
+        The Slack MCP returns human-readable text wrapped in a ``result``
+        key (e.g. ``"User ID: U02L5V8H9RS\\nUsername: henry...\\n..."``).
+        We grep for the ID rather than expecting structured JSON. We
+        also try a few structured shapes in case a future MCP version
+        returns JSON.
+        """
         result = self._mcp.call_tool("slack_read_user_profile", {})
-        # The Slack MCP can return either {"user": {"id": "..."}} or
-        # {"id": "..."} depending on response_format and version. Try
-        # both shapes defensively.
-        user = result.get("user") if isinstance(result.get("user"), dict) else result
-        return str(user.get("id") or "")
+
+        # Structured shapes first, just in case.
+        for candidate in (result.get("user"), result):
+            if isinstance(candidate, dict):
+                uid = candidate.get("id") or candidate.get("user_id")
+                if uid:
+                    return str(uid)
+
+        # Plain-text "result" field — the common case.
+        text = result.get("result") or result.get("_raw") or ""
+        if isinstance(text, str):
+            m = _USER_ID_RE.search(text)
+            if m:
+                return m.group(1)
+        return ""
 
     # ---- poll loop ------------------------------------------------------
 

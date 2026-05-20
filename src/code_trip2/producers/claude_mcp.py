@@ -58,7 +58,12 @@ class ClaudeMCPClient:
     model: str = "haiku"
     server_id: str = "claude_ai_Slack"
     timeout: float = 60.0
-    max_budget_usd: float = 0.02
+    # Per-call budget cap. Real-world cost is ~$0.02–0.04 per call because
+    # claude --print loads the full catalog of available MCP tools into
+    # context, not just the allowed one — most of that is cache reads but
+    # they add up. The cap exists to keep a runaway invocation from
+    # spiraling (e.g., if the model retries), not as a normal-path knob.
+    max_budget_usd: float = 0.05
 
     _available: bool = field(default=False, init=False, repr=False)
 
@@ -118,12 +123,19 @@ class ClaudeMCPClient:
         except subprocess.TimeoutExpired as exc:
             raise ClaudeMCPError(f"claude timed out after {self.timeout}s") from exc
 
-        if proc.returncode != 0:
-            raise ClaudeMCPError(
-                f"claude exited {proc.returncode}: {proc.stderr[:500].strip()}"
-            )
-
-        return self._parse_stream_for_tool_result(proc.stdout, tool_id)
+        # Try to parse the tool_result regardless of returncode. Claude can
+        # exit nonzero *after* the tool ran successfully (e.g. budget hit
+        # post-call, the model adding extra commentary, etc.) — we'd rather
+        # surface the good result than throw it away.
+        try:
+            return self._parse_stream_for_tool_result(proc.stdout, tool_id)
+        except ClaudeMCPError as parse_exc:
+            if proc.returncode != 0:
+                raise ClaudeMCPError(
+                    f"claude exited {proc.returncode}: "
+                    f"{proc.stderr[:500].strip() or '(no stderr)'}"
+                ) from parse_exc
+            raise
 
     # ---- internals ------------------------------------------------------
 

@@ -225,6 +225,27 @@ def test_producer_fetch_user_id_reads_id_from_top_level(tmp_path: Path):
     assert p._fetch_user_id() == "UDEF"
 
 
+def test_producer_fetch_user_id_parses_plain_text_result(tmp_path: Path):
+    """The Slack MCP actually returns human-readable text in a ``result``
+    key — regex out the User ID line."""
+    p, _q, mcp, _state = _producer(tmp_path)
+    mcp.call_tool.return_value = {
+        "result": (
+            "User ID: U02L5V8H9RS\n"
+            "Username: henry.hinnefeld\n"
+            "Display Name: Henry Hinnefeld\n"
+            "Real Name: Henry Hinnefeld\n"
+        )
+    }
+    assert p._fetch_user_id() == "U02L5V8H9RS"
+
+
+def test_producer_fetch_user_id_returns_empty_when_unparseable(tmp_path: Path):
+    p, _q, mcp, _state = _producer(tmp_path)
+    mcp.call_tool.return_value = {"result": "no recognizable user ID here"}
+    assert p._fetch_user_id() == ""
+
+
 def test_producer_poll_emits_tasks_and_advances_state(tmp_path: Path):
     p, q, mcp, state = _producer(tmp_path)
     p._user_id = "UME"
