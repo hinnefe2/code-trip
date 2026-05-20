@@ -143,13 +143,20 @@ class Macropad:
             return
         self._held.add(name)
 
+        # A modifier key is "chorded" if it participated in a chord at all
+        # — either by being held when another key was pressed, OR by being
+        # the secondary key pressed while another modifier was held.
+        # Without the second case, NAV+ACT would fire "nav+act" on press
+        # AND fire "act" solo on release, because ACT's chord state would
+        # have been reset to False when ACT was pressed.
+        other_keys_held = bool(self._held - {name})
         if name == "nav":
-            self._nav_chorded = False
+            self._nav_chorded = other_keys_held
         elif "nav" in self._held:
             self._nav_chorded = True
 
         if name == "act":
-            self._act_chorded = False
+            self._act_chorded = other_keys_held
         elif "act" in self._held:
             self._act_chorded = True
 

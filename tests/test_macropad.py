@@ -129,12 +129,45 @@ def test_no_without_nav_fires_tap(monkeypatch):
     start.assert_not_called()
 
 
-def test_act_without_nav_is_noop(monkeypatch):
+def test_act_press_alone_does_not_fire_tap_yet(monkeypatch):
     pad, rec, start, _ = _make(monkeypatch)
     pad._on_press(keyboard.Key.f14)
     assert rec.chords == []
     assert rec.taps == []
     start.assert_not_called()
+
+
+def test_act_solo_press_release_fires_act_tap(monkeypatch):
+    pad, rec, start, _ = _make(monkeypatch)
+    pad._on_press(keyboard.Key.f14)
+    pad._on_release(keyboard.Key.f14)
+    assert rec.chords == []
+    assert rec.taps == ["act"]
+
+
+def test_nav_plus_act_chord_does_not_also_fire_act_tap(monkeypatch):
+    """Regression: pressing ACT while NAV is held used to reset
+    _act_chorded to False, so releasing ACT fired a stray solo tap and
+    flipped app-mode in addition to the nav+act chord."""
+    pad, rec, *_ = _make(monkeypatch)
+    pad._on_press(keyboard.Key.f17)  # NAV down
+    pad._on_press(keyboard.Key.f14)  # ACT under NAV → nav+act chord
+    pad._on_release(keyboard.Key.f14)
+    pad._on_release(keyboard.Key.f17)
+    assert rec.chords == ["nav+act"]
+    assert rec.taps == []  # no stray "act" tap
+
+
+def test_act_plus_no_chord_does_not_fire_act_tap(monkeypatch):
+    """Same regression class for the ACT-as-modifier case: act+no should
+    not fire a separate act tap on release."""
+    pad, rec, *_ = _make(monkeypatch)
+    pad._on_press(keyboard.Key.f14)  # ACT down
+    pad._on_press(keyboard.Key.f16)  # NO under ACT → act+no chord
+    pad._on_release(keyboard.Key.f16)
+    pad._on_release(keyboard.Key.f14)
+    assert rec.chords == ["act+no"]
+    assert rec.taps == []
 
 
 def test_nav_modifier_suppresses_tap(monkeypatch):
