@@ -26,7 +26,7 @@ from code_trip2.stt_client import STTClient, STTClientError
 from code_trip2.summarizer import Summarizer
 from code_trip2.tasks import TaskQueue
 from code_trip2.tts_client import TTSClient
-from code_trip2.tui import Dashboard
+from code_trip2.tui import Dashboard, detect_tui_host_app
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +74,11 @@ def run(config: Config, *, tui: bool = False) -> None:
         queue.load(replayed)
         logger.info("Replayed %d tasks from queue log", len(replayed))
 
+    tui_host_app = detect_tui_host_app() if tui else None
+    if tui and tui_host_app:
+        logger.info("TUI host detected as %r; suppressing synthesized "
+                    "keystrokes that would target it.", tui_host_app)
+
     ctx = Context(
         config=config,
         tts=tts,
@@ -82,6 +87,7 @@ def run(config: Config, *, tui: bool = False) -> None:
         queue=queue,
         queue_log=queue_log,
         summarizer=summarizer,
+        tui_host_app=tui_host_app,
         app_mode=config.startup_mode if config.startup_mode in ("queue", "focused") else "focused",
     )
 

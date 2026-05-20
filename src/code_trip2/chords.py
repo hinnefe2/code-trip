@@ -107,10 +107,26 @@ def handle_chord(ctx: "Context", name: str) -> None:
 
 
 def _send_stroke(ctx: "Context", stroke: KeyStroke) -> None:
+    if _keystroke_targets_tui_host(ctx):
+        # The TUI's alternate-screen buffer would scroll on every Enter/Esc/Down.
+        # Better to silently swallow than to corrupt the dashboard.
+        logger.debug("Suppressing keystroke targeting TUI host app")
+        return
     try:
         window.send_keystroke(stroke)
     except Exception as exc:
         _speak_error(ctx, f"Could not send keystroke: {exc}")
+
+
+def _keystroke_targets_tui_host(ctx: "Context") -> bool:
+    """True when the frontmost app is the terminal hosting the TUI."""
+    host = getattr(ctx, "tui_host_app", None)
+    if not host:
+        return False
+    try:
+        return window.active_app() == host
+    except window.WindowError:
+        return False
 
 
 def handle_tap(ctx: "Context", name: str) -> None:
@@ -146,10 +162,7 @@ def handle_tap(ctx: "Context", name: str) -> None:
     if stroke is None:
         logger.warning("Unknown tap: %s", name)
         return
-    try:
-        window.send_keystroke(stroke)
-    except Exception as exc:
-        _speak_error(ctx, f"Could not send keystroke: {exc}")
+    _send_stroke(ctx, stroke)
 
 
 def _nav_tap_app_aware(ctx: "Context") -> bool:
@@ -210,10 +223,7 @@ def _nav(ctx: "Context", forward: bool) -> None:
         _speak_error(ctx, f"No navigation for {app}.")
         return
     stroke = pair[0] if forward else pair[1]
-    try:
-        window.send_keystroke(stroke)
-    except Exception as exc:
-        _speak_error(ctx, f"Could not send keystroke: {exc}")
+    _send_stroke(ctx, stroke)
 
 
 def _cycle_app(ctx: "Context") -> None:

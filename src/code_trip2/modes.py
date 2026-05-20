@@ -73,6 +73,10 @@ class Context:
     # Raw-pane-output → spoken-English summarizer; falls back to clean_output
     # when None or when summarize() raises.
     summarizer: Summarizer | None = None
+    # Set when ``--tui`` is on. If the frontmost macOS app matches this
+    # value, ``chords`` suppresses synthesized keystrokes so YES/NO/NAV
+    # taps don't scroll the alternate-screen buffer.
+    tui_host_app: str | None = None
 
     def __post_init__(self) -> None:
         if not self.active_window:

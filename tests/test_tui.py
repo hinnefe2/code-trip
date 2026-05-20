@@ -9,16 +9,17 @@ from __future__ import annotations
 
 import io
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from rich.console import Console
 from rich.layout import Layout
 
-from code_trip2 import modes, tui
+from code_trip2 import chords, modes, tui
 from code_trip2.producers import ProducerSupervisor
 from code_trip2.tasks import Task
+from code_trip2.window import Chord, KeyStroke
 
 
 def _make_ctx(*, app_mode="queue", summarizer_enabled=False):
@@ -137,6 +138,86 @@ def test_render_recent_topics_shows_recent_first():
     # Both topics rendered; ticket-2 (more recent) should appear before
     # ticket-1 in the output stream.
     assert out.find("ticket-2") < out.find("ticket-1")
+
+
+def test_detect_tui_host_app_maps_known_terms(monkeypatch):
+    monkeypatch.setenv("TERM_PROGRAM", "kitty")
+    assert tui.detect_tui_host_app() == "kitty"
+    monkeypatch.setenv("TERM_PROGRAM", "Apple_Terminal")
+    assert tui.detect_tui_host_app() == "Terminal"
+    monkeypatch.setenv("TERM_PROGRAM", "iTerm.app")
+    assert tui.detect_tui_host_app() == "iTerm2"
+
+
+def test_detect_tui_host_app_unknown_falls_through(monkeypatch):
+    monkeypatch.setenv("TERM_PROGRAM", "MysteryTerm")
+    assert tui.detect_tui_host_app() == "MysteryTerm"
+
+
+def test_detect_tui_host_app_missing_returns_none(monkeypatch):
+    monkeypatch.delenv("TERM_PROGRAM", raising=False)
+    assert tui.detect_tui_host_app() is None
+
+
+# --- TUI-host keystroke suppression ---------------------------------------
+
+
+_FAKE_STROKE = KeyStroke(chords=(Chord(key="x"),))
+
+
+def _stroke_ctx(*, tui_host_app=None):
+    ctx = _make_ctx()
+    ctx.tui_host_app = tui_host_app
+    return ctx
+
+
+def test_send_stroke_fires_when_no_tui_host():
+    ctx = _stroke_ctx(tui_host_app=None)
+    with patch("code_trip2.chords.window.send_keystroke") as send:
+        chords._send_stroke(ctx, _FAKE_STROKE)
+    send.assert_called_once_with(_FAKE_STROKE)
+
+
+def test_send_stroke_suppressed_when_active_app_is_tui_host(monkeypatch):
+    ctx = _stroke_ctx(tui_host_app="kitty")
+    monkeypatch.setattr("code_trip2.chords.window.active_app", lambda: "kitty")
+    with patch("code_trip2.chords.window.send_keystroke") as send:
+        chords._send_stroke(ctx, _FAKE_STROKE)
+    send.assert_not_called()
+
+
+def test_send_stroke_fires_when_active_app_differs(monkeypatch):
+    ctx = _stroke_ctx(tui_host_app="kitty")
+    monkeypatch.setattr("code_trip2.chords.window.active_app", lambda: "Google Chrome")
+    with patch("code_trip2.chords.window.send_keystroke") as send:
+        chords._send_stroke(ctx, _FAKE_STROKE)
+    send.assert_called_once_with(_FAKE_STROKE)
+
+
+def test_send_stroke_fires_when_active_app_lookup_errors(monkeypatch):
+    """If we can't determine focus, default to firing — failing open is
+    less surprising than silent suppression."""
+    from code_trip2 import window
+
+    def boom():
+        raise window.WindowError("nope")
+
+    ctx = _stroke_ctx(tui_host_app="kitty")
+    monkeypatch.setattr("code_trip2.chords.window.active_app", boom)
+    with patch("code_trip2.chords.window.send_keystroke") as send:
+        chords._send_stroke(ctx, _FAKE_STROKE)
+    send.assert_called_once_with(_FAKE_STROKE)
+
+
+def test_yes_tap_suppressed_in_focused_mode_when_tui_host_focused(monkeypatch):
+    """End-to-end: a YES tap in focused mode should not synthesize Enter
+    when the user is looking at the TUI host terminal."""
+    ctx = _stroke_ctx(tui_host_app="kitty")
+    ctx.app_mode = "focused"
+    monkeypatch.setattr("code_trip2.chords.window.active_app", lambda: "kitty")
+    with patch("code_trip2.chords.window.send_keystroke") as send:
+        chords.handle_tap(ctx, "yes")
+    send.assert_not_called()
 
 
 def test_render_producers_status_uses_supervisor():

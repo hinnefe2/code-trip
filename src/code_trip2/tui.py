@@ -14,6 +14,7 @@ fields, builds a Rich Layout) so it can be tested without starting Live.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from typing import TYPE_CHECKING
@@ -29,6 +30,39 @@ if TYPE_CHECKING:
     from code_trip2.producers import ProducerSupervisor
 
 logger = logging.getLogger(__name__)
+
+
+# --- host-terminal detection ----------------------------------------------
+
+# Maps ``TERM_PROGRAM`` env-var values to the macOS application name that
+# ``window.active_app()`` returns. Used to suppress synthesized keystrokes
+# that would otherwise land in the terminal hosting the TUI (causing the
+# alternate-buffer to scroll when YES/NO/NAV taps fire Enter/Esc/Down).
+_TERM_PROGRAM_TO_APP: dict[str, str] = {
+    "Apple_Terminal": "Terminal",
+    "iTerm.app": "iTerm2",
+    "kitty": "kitty",
+    "WezTerm": "WezTerm",
+    "Tabby": "Tabby",
+    "vscode": "Code",
+    "ghostty": "Ghostty",
+    "Hyper": "Hyper",
+    "alacritty": "Alacritty",
+}
+
+
+def detect_tui_host_app() -> str | None:
+    """Best-effort identify the terminal app hosting this process.
+
+    Reads ``TERM_PROGRAM`` (set by most macOS terminals) and maps to the
+    app name ``window.active_app()`` would return. Falls back to the raw
+    env-var value so unknown terminals still get *some* coverage.
+    Returns ``None`` when the env var isn't set.
+    """
+    term = os.environ.get("TERM_PROGRAM", "").strip()
+    if not term:
+        return None
+    return _TERM_PROGRAM_TO_APP.get(term, term)
 
 
 # --- formatting helpers ---------------------------------------------------
