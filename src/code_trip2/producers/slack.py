@@ -34,6 +34,47 @@ from code_trip2.tasks import Task, TaskQueue
 
 _USER_ID_RE = re.compile(r"User ID:\s*(U[A-Z0-9]+)", re.IGNORECASE)
 
+# Slack message-format markup. The Slack message body is a "mrkdwn"
+# string where mentions, channels, links, and broadcasts are encoded
+# with angle-bracketed forms. Reading those aloud sounds awful
+# ("less-than at U-zero-two-L-five..."), so before we hand text to
+# TTS or use it for a task headline we collapse them to natural
+# spoken-English equivalents.
+#
+# Forms handled:
+#   <@U123|Alice>           → "Alice"
+#   <@U123>                 → "" (no display name to read; drop)
+#   <#C123|general>         → "#general"
+#   <#C123>                 → "a channel"
+#   <!channel>              → "channel"   (also @here, @everyone)
+#   <!subteam^S123|@team>   → "team"
+#   <https://x.com|label>   → "label"
+#   <https://x.com>         → "" (URL alone reads worse than nothing)
+_RE_USER_MENTION = re.compile(r"<@[UW][A-Z0-9]+(?:\|([^>]+))?>")
+_RE_CHANNEL_MENTION = re.compile(r"<#[CG][A-Z0-9]+(?:\|([^>]+))?>")
+_RE_BROADCAST = re.compile(r"<!(channel|here|everyone)>")
+_RE_SUBTEAM = re.compile(r"<!subteam\^[A-Z0-9]+(?:\|@?([^>]+))?>")
+_RE_LINK = re.compile(r"<(https?://[^|>]+)(?:\|([^>]+))?>")
+_RE_WHITESPACE_RUN = re.compile(r"[ \t]{2,}")
+
+
+def slack_to_plain_text(text: str) -> str:
+    """Strip Slack mrkdwn markup so the message reads cleanly aloud."""
+    if not text:
+        return text
+    text = _RE_USER_MENTION.sub(lambda m: (m.group(1) or "").strip(), text)
+    text = _RE_CHANNEL_MENTION.sub(
+        lambda m: f"#{m.group(1)}" if m.group(1) else "a channel", text
+    )
+    text = _RE_BROADCAST.sub(lambda m: m.group(1), text)
+    text = _RE_SUBTEAM.sub(lambda m: (m.group(1) or "team").strip(), text)
+    text = _RE_LINK.sub(lambda m: (m.group(2) or "").strip(), text)
+    # Slack escapes &, <, > in message text. Decode for spoken readability.
+    text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+    # Collapse the whitespace that markup removal can leave behind.
+    text = _RE_WHITESPACE_RUN.sub(" ", text)
+    return text.strip()
+
 # Parsers for the Slack MCP's ``response_format=detailed`` markdown output.
 # Each result block looks like::
 #
@@ -321,7 +362,10 @@ class SlackProducer:
         return msg
 
     def _emit_task(self, msg: dict) -> None:
-        text = (msg.get("text") or "").strip()
+        raw_text = (msg.get("text") or "").strip()
+        if not raw_text:
+            return
+        text = slack_to_plain_text(raw_text)
         if not text:
             return
         channel_id = msg.get("channel_id") or ""

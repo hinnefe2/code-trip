@@ -408,6 +408,108 @@ def test_producer_after_param_uses_state_ts(tmp_path: Path):
     assert p._after_param(state.last_search_ts()) == "1716000100"
 
 
+# --- slack_to_plain_text -------------------------------------------------
+
+
+def test_slack_to_plain_text_user_mention_with_display_name():
+    from code_trip2.producers.slack import slack_to_plain_text
+    out = slack_to_plain_text("<@U02L5V8H9RS|Henry Hinnefeld> can you check this?")
+    assert out == "Henry Hinnefeld can you check this?"
+
+
+def test_slack_to_plain_text_user_mention_without_display_name():
+    """Bare <@USERID> has no readable form — drop entirely."""
+    from code_trip2.producers.slack import slack_to_plain_text
+    out = slack_to_plain_text("hey <@U02L5V8H9RS> here is the question")
+    assert out == "hey here is the question"
+
+
+def test_slack_to_plain_text_channel_mention_with_name():
+    from code_trip2.producers.slack import slack_to_plain_text
+    assert slack_to_plain_text("in <#C123|general> earlier") == "in #general earlier"
+
+
+def test_slack_to_plain_text_channel_mention_without_name():
+    from code_trip2.producers.slack import slack_to_plain_text
+    assert slack_to_plain_text("see <#C123> for context") == "see a channel for context"
+
+
+def test_slack_to_plain_text_link_with_label():
+    from code_trip2.producers.slack import slack_to_plain_text
+    out = slack_to_plain_text("see <https://example.com/x|the docs> please")
+    assert out == "see the docs please"
+
+
+def test_slack_to_plain_text_bare_link_is_dropped():
+    from code_trip2.producers.slack import slack_to_plain_text
+    out = slack_to_plain_text("ref <https://example.com/x> and read")
+    assert out == "ref and read"
+
+
+def test_slack_to_plain_text_broadcasts():
+    from code_trip2.producers.slack import slack_to_plain_text
+    assert slack_to_plain_text("<!channel> heads up") == "channel heads up"
+    assert slack_to_plain_text("<!here> deploying") == "here deploying"
+
+
+def test_slack_to_plain_text_subteam_mention():
+    from code_trip2.producers.slack import slack_to_plain_text
+    assert (
+        slack_to_plain_text("<!subteam^S0123|@platform-eng> please review")
+        == "platform-eng please review"
+    )
+
+
+def test_slack_to_plain_text_decodes_slack_html_entities():
+    from code_trip2.producers.slack import slack_to_plain_text
+    assert slack_to_plain_text("foo &amp; bar &lt;= baz") == "foo & bar <= baz"
+
+
+def test_slack_to_plain_text_realistic_message():
+    """The actual @-mention text from a recent live poll."""
+    from code_trip2.producers.slack import slack_to_plain_text
+    raw = (
+        "<@U02L5V8H9RS|Henry Hinnefeld> we talked about this briefly in the "
+        "past, but any chance we could get a weekly round up / digest? "
+        "<https://x.slack.com/archives/C074G552R8A/p1779300838350159|Example 1> "
+        "and <https://x.slack.com/archives/C074G552R8A/p1779302538982649|example 2> "
+        "in <#C074G552R8A|xteam-delivery>"
+    )
+    out = slack_to_plain_text(raw)
+    assert "U02L5V8H9RS" not in out
+    assert "slack.com" not in out
+    assert "Henry Hinnefeld" in out
+    assert "Example 1" in out
+    assert "example 2" in out
+    assert "#xteam-delivery" in out
+
+
+def test_producer_emit_task_cleans_slack_markup(tmp_path: Path):
+    """End-to-end: a task's body should already have the markup stripped."""
+    fixture = (
+        "### Result 1 of 1\n"
+        "Channel: #ai-tools (ID: C123)\n"
+        "From: Katie Fox (ID: U999) \n"
+        "Message_ts: 1716000020.000000\n"
+        "Permalink: [link](https://x.slack.com/archives/C123/p1716000020000000?thread_ts=1716000020.000000)\n"
+        "Text: \n"
+        "<@U02L5V8H9RS|Henry Hinnefeld> can you look at <https://example.com|the PR>?\n"
+        "\n"
+        "---\n\n"
+    )
+    p, q, mcp, _state = _producer(tmp_path)
+    p._user_id = "U02L5V8H9RS"
+    mcp.call_tool.return_value = {"results": fixture}
+    p._poll_once()
+    [t] = q.all()
+    assert "U02L5V8H9RS" not in t.body
+    assert "example.com" not in t.body
+    assert "Henry Hinnefeld" in t.body
+    assert "the PR" in t.body
+    # Headline is derived from the cleaned body.
+    assert "U02L5V8H9RS" not in t.headline
+
+
 def test_producer_after_param_falls_back_to_previous_workday_5pm(tmp_path: Path):
     p, _q, _mcp, _state = _producer(tmp_path)
     out = p._after_param(None)
