@@ -9,7 +9,9 @@ The orchestrator runs in one of two **app modes**:
   with an active task dispatches against that task's ``kind``.
 
 The flip is triggered by the ACT solo tap (see ``chords.handle_tap``).
-Each flip plays a mode chime and a short spoken label.
+Each flip plays a distinct mode chime; the two chimes are tuned to
+sound clearly different so the direction of the flip is audible
+without a spoken label.
 
 Auto-announce: when in queue mode with no active task, a background
 consumer thread pulls the highest-scoring pending task and announces it.
@@ -42,7 +44,11 @@ MODE_FOCUSED = "focused"
 
 
 def flip_mode(ctx: "Context") -> None:
-    """Toggle between queue and focused app-modes. Announces the result."""
+    """Toggle between queue and focused app-modes.
+
+    Only an earcon is played — the two mode chimes are distinct enough
+    that a spoken label would be redundant and noisy.
+    """
     new = MODE_QUEUE if ctx.app_mode != MODE_QUEUE else MODE_FOCUSED
     ctx.app_mode = new
     logger.info("App mode → %s", new)
@@ -50,7 +56,6 @@ def flip_mode(ctx: "Context") -> None:
         earcon.mode_chime(new)
     except earcon.EarconError:
         pass
-    _speak(ctx, f"{new} mode")
     ctx.log.event("app_mode", mode=new)
 
 

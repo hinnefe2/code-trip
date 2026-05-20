@@ -38,16 +38,21 @@ def _make_ctx(app_mode: str = "focused") -> modes.Context:
 # --- mode flip --------------------------------------------------------------
 
 
-def test_flip_mode_toggles_and_speaks():
+def test_flip_mode_toggles_and_plays_earcon_only():
+    """The two mode chimes are distinct enough to identify the mode by
+    ear; no spoken label is played on flip."""
     ctx = _make_ctx(app_mode="focused")
-    with patch.object(dispatch, "earcon"):
+    with patch.object(dispatch, "earcon") as earcon_mock:
         dispatch.flip_mode(ctx)
     assert ctx.app_mode == "queue"
-    ctx.tts.speak.assert_called_with("queue mode")
+    earcon_mock.mode_chime.assert_called_once_with("queue")
+    ctx.tts.speak.assert_not_called()
 
-    with patch.object(dispatch, "earcon"):
+    with patch.object(dispatch, "earcon") as earcon_mock:
         dispatch.flip_mode(ctx)
     assert ctx.app_mode == "focused"
+    earcon_mock.mode_chime.assert_called_once_with("focused")
+    ctx.tts.speak.assert_not_called()
 
 
 # --- queue-mode voice handling ----------------------------------------------

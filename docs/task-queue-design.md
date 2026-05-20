@@ -192,7 +192,7 @@ Decided (Q5/Q8): the system has **two modes**, switched by a single chord. This 
 - **Queue mode** — idle YES/NO/ACT taps drive the queue. PTT input dispatches against the currently-active task. This is the away-from-screen default.
 - **Focused-app mode** — today's behavior. YES=Enter, NO=Esc, NAV=down/per-app, PTT input goes through `_dispatch_by_focus`. The right tool when sitting at the screen doing focused work and the queue would just be noise.
 
-Mode transition is announced with a distinct earcon (two clearly different tones for the two modes, like the existing mode-change chime) and a short spoken label ("queue mode" / "focused mode"). No risk of being unsure which mode you're in.
+Mode transition is announced with a distinct earcon — two clearly different tones for the two modes. The chime alone is enough to tell which mode you flipped into; no spoken label.
 
 **Toggle binding: ACT solo tap.** ACT has no solo behavior today (it's chord-modifier-only in `chords.TAP_STROKES`), so this is a clean grab. Mode-independent — one tap toggles in either direction. Muscle memory transfers across modes.
 
@@ -256,7 +256,7 @@ These were the open questions in the draft; resolved by walking through them.
 2. **Topic inference — single topic per task, channel-only.** v1 producers tag with one string (tmux window for Claude, channel name for Slack, "inbox" for misc). No LLM at producer-time. Multi-topic / cross-cutting is a v2 problem; the `Task` dataclass keeps `topic: str` (not `list[str]`) but the field is treated as opaque by the scheduler so widening it later is mechanical.
 3. **Persistence — JSONL append-only log.** Producers append every event (add / state-change / done / drop) to `~/.code-trip/queue/queue-<date>.jsonl`. On startup, replay the last 24 hours of events to rebuild in-memory state; anything older is discarded. Matches the existing `session_log.py` style; inspectable with `cat` / `jq`.
 4. **Backpressure — auto-digest old per-topic items.** Per-topic soft cap (start ~5 pending). When exceeded, the older tasks for that topic are merged into a single digest task ("3 unread in #general") that lives at the position of the oldest item. Pulling the digest expands it. Preserves the signal that there's activity without forcing the user to grind through 47 individual Slack lines.
-5. **Macropad — binary mode flip.** Two modes (queue / focused-app); single chord toggles between them with an earcon + spoken label. See "Two interaction modes" above.
+5. **Macropad — binary mode flip.** Two modes (queue / focused-app); ACT solo tap toggles between them. Two distinct earcons identify the resulting mode; no spoken label. See "Two interaction modes" above.
 6. **Announcement — headline only, body on demand.** Pull plays ~5–10 seconds: kind + topic + one-line headline. The body is held; user taps NAV (or says "go on") to play it via the existing chunked-playback path. Default behavior across all task kinds; specific producers can opt out if their body is the headline.
 7. **Idle behavior — silence.** Empty queue = no audio. No transition chime, no heartbeat. The first producer event after empty plays as a normal announcement.
 8. **Coexistence with app-focus dispatch — via the Q5 mode flip.** Focused-app mode preserves today's `_dispatch_by_focus` verbatim. Queue mode is the new behavior. No implicit fallback; mode is always explicit and announced.
