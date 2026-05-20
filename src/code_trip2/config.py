@@ -56,6 +56,10 @@ class Config:
     startup_mode: str = "focused"           # "queue" | "focused"
     # slack (via the claude.ai Slack MCP — auth piggy-backs on claude CLI)
     slack_poll_interval: float = 60.0
+    # Channels to watch for *every* new message (not just @-mentions).
+    # Channel names without the leading #. Resolved to IDs on first poll
+    # via slack_search_channels.
+    slack_watch_channels: tuple[str, ...] = ()
     # linear (MCP — server choice TBD, still stubbed)
     linear_mcp_command: str = ""
     linear_mcp_args: tuple[str, ...] = ()
@@ -144,6 +148,10 @@ def load_config(path: Path | str) -> Config:
     slack_cfg = data.get("slack", {})
     if "poll_interval" in slack_cfg:
         kw["slack_poll_interval"] = float(slack_cfg["poll_interval"])
+    if "watch_channels" in slack_cfg:
+        kw["slack_watch_channels"] = tuple(
+            str(c).lstrip("#") for c in slack_cfg["watch_channels"]
+        )
 
     linear_cfg = data.get("linear", {})
     if "mcp_command" in linear_cfg:

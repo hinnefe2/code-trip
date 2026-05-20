@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 _LAST_SEARCH_KEY = "last_search_ts"
+_CHANNEL_KEY_PREFIX = "channel:"
 
 
 def default_state_path() -> Path:
@@ -57,6 +58,23 @@ class SlackState:
             if prior is not None and prior >= ts:
                 return
             self._data[_LAST_SEARCH_KEY] = ts
+        self._save()
+
+    # ---- per-channel cursor (for watched channels) ----------------------
+
+    def last_channel_ts(self, channel_id: str) -> str | None:
+        with self._lock:
+            return self._data.get(_CHANNEL_KEY_PREFIX + channel_id)
+
+    def set_last_channel_ts(self, channel_id: str, ts: str) -> None:
+        if not ts or not channel_id:
+            return
+        key = _CHANNEL_KEY_PREFIX + channel_id
+        with self._lock:
+            prior = self._data.get(key)
+            if prior is not None and prior >= ts:
+                return
+            self._data[key] = ts
         self._save()
 
     def all(self) -> dict[str, str]:

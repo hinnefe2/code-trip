@@ -182,8 +182,11 @@ def test_slack_state_handles_corrupt_file(tmp_path: Path):
 # --- SlackProducer -------------------------------------------------------
 
 
-def _producer(tmp_path: Path, *, poll_interval=30.0):
-    cfg = SimpleNamespace(slack_poll_interval=poll_interval)
+def _producer(tmp_path: Path, *, poll_interval=30.0, watch_channels=()):
+    cfg = SimpleNamespace(
+        slack_poll_interval=poll_interval,
+        slack_watch_channels=tuple(watch_channels),
+    )
     state = SlackState(path=tmp_path / "slack-state.json")
     mcp = MagicMock(spec=ClaudeMCPClient)
     mcp.enabled = True
@@ -218,6 +221,40 @@ def test_producer_setup_returns_true_and_caches_user_id(tmp_path: Path):
     mcp.call_tool.return_value = {"id": "UABC"}
     assert p._setup_in_thread() is True
     assert p._user_id == "UABC"
+
+
+def test_producer_setup_resolves_watch_channels(tmp_path: Path):
+    p, _q, mcp, _state = _producer(tmp_path, watch_channels=("team-ai",))
+    # First call: user profile. Second: channel search.
+    mcp.call_tool.side_effect = [
+        {"id": "UABC"},
+        {"results": (
+            "# Search Results for: team-ai\n"
+            "### Channel 1 of 2\n"
+            "Name: team-ai\n"
+            "ID: C0TEAMAI\n"
+            "Members: 42\n"
+            "---\n"
+            "### Channel 2 of 2\n"
+            "Name: team-ai-deprecated\n"
+            "ID: C0OLD\n"
+            "---\n"
+        )},
+    ]
+    assert p._setup_in_thread() is True
+    assert p._watched == {"team-ai": "C0TEAMAI"}
+
+
+def test_producer_setup_tolerates_failed_channel_lookup(tmp_path: Path):
+    """A bad channel name shouldn't keep the producer from running the
+    mention search."""
+    p, _q, mcp, _state = _producer(tmp_path, watch_channels=("nope",))
+    mcp.call_tool.side_effect = [
+        {"id": "UABC"},
+        ClaudeMCPError("network glitch"),
+    ]
+    assert p._setup_in_thread() is True
+    assert p._watched == {}
 
 
 def test_producer_start_spawns_thread_without_blocking(tmp_path: Path):
@@ -429,6 +466,97 @@ def test_producer_poll_resilient_to_mcp_errors(tmp_path: Path):
     mcp.call_tool.side_effect = ClaudeMCPError("network")
     p._poll_once()  # should not raise
     assert q.all() == []
+
+
+# --- watched-channel polling ---------------------------------------------
+
+
+_CHANNEL_READ_FIXTURE = (
+    "# Recent messages in #team-ai\n"
+    "### Result 1 of 2\n"
+    "From: Linear (ID: UBOT) [BOT]\n"
+    "Message_ts: 1716000002.000000\n"
+    "Permalink: [link](https://x.slack.com/archives/C0TEAMAI/p1716000002000000?thread_ts=1716000002.000000)\n"
+    "Text: \n"
+    "Created issue ABC-123\n"
+    "\n"
+    "---\n\n"
+    "### Result 2 of 2\n"
+    "From: Alice (ID: UALICE) \n"
+    "Message_ts: 1716000001.000000\n"
+    "Permalink: [link](https://x.slack.com/archives/C0TEAMAI/p1716000001000000?thread_ts=1716000001.000000)\n"
+    "Text: \n"
+    "morning team\n"
+    "\n"
+    "---\n\n"
+)
+
+
+def test_poll_watched_channel_emits_every_message_including_bots(tmp_path: Path):
+    """Unlike the mention search, watched channels include bot messages —
+    the user opted into 'every new message in this channel'."""
+    p, q, mcp, state = _producer(tmp_path, watch_channels=("team-ai",))
+    p._user_id = "UME"
+    p._watched = {"team-ai": "C0TEAMAI"}
+    mcp.call_tool.return_value = {"results": _CHANNEL_READ_FIXTURE}
+    p._poll_watched_channel("team-ai", "C0TEAMAI")
+
+    tasks = q.all()
+    assert len(tasks) == 2  # bot AND human
+    by_ts = {t.source["ts"]: t for t in tasks}
+    bot_task = by_ts["1716000002.000000"]
+    assert "Linear" in bot_task.headline
+    assert bot_task.source["channel_id"] == "C0TEAMAI"
+    assert bot_task.topic == "slack-team-ai"
+    human = by_ts["1716000001.000000"]
+    assert "Alice" in human.headline
+    assert "morning team" in human.body
+    assert state.last_channel_ts("C0TEAMAI") == "1716000002.000000"
+
+
+def test_poll_watched_channel_respects_per_channel_cursor(tmp_path: Path):
+    p, q, mcp, state = _producer(tmp_path, watch_channels=("team-ai",))
+    p._user_id = "UME"
+    p._watched = {"team-ai": "C0TEAMAI"}
+    state.set_last_channel_ts("C0TEAMAI", "1716000002.000000")
+    mcp.call_tool.return_value = {"results": _CHANNEL_READ_FIXTURE}
+    p._poll_watched_channel("team-ai", "C0TEAMAI")
+    # Both messages are at or before the cursor — should emit nothing.
+    assert q.all() == []
+
+
+def test_poll_watched_channel_cursor_is_independent_of_mention_cursor(tmp_path: Path):
+    """Mention search and channel poll use different cursors so they
+    don't interfere with each other's state."""
+    p, _q, _mcp, state = _producer(tmp_path, watch_channels=("team-ai",))
+    state.set_last_search_ts("1716000099.000000")
+    state.set_last_channel_ts("C0TEAMAI", "1716000050.000000")
+    # Each cursor advances independently.
+    state.set_last_channel_ts("C0TEAMAI", "1716000060.000000")
+    assert state.last_search_ts() == "1716000099.000000"  # unchanged
+    assert state.last_channel_ts("C0TEAMAI") == "1716000060.000000"
+
+
+def test_poll_watched_channel_resilient_to_mcp_errors(tmp_path: Path):
+    p, q, mcp, _state = _producer(tmp_path, watch_channels=("team-ai",))
+    p._watched = {"team-ai": "C0TEAMAI"}
+    mcp.call_tool.side_effect = ClaudeMCPError("network down")
+    p._poll_watched_channel("team-ai", "C0TEAMAI")  # should not raise
+    assert q.all() == []
+
+
+def test_poll_once_calls_both_paths(tmp_path: Path):
+    """_poll_once should run the mention search AND a read per watched
+    channel."""
+    p, _q, mcp, _state = _producer(tmp_path, watch_channels=("team-ai", "general"))
+    p._user_id = "UME"
+    p._watched = {"team-ai": "C0TEAMAI", "general": "C0GEN"}
+    mcp.call_tool.return_value = {"results": ""}
+    p._poll_once()
+    # One mention search + two channel reads.
+    tool_names = [c.args[0] for c in mcp.call_tool.call_args_list]
+    assert tool_names.count("slack_search_public_and_private") == 1
+    assert tool_names.count("slack_read_channel") == 2
 
 
 def test_producer_after_param_uses_state_ts(tmp_path: Path):

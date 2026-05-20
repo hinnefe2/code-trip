@@ -1,20 +1,26 @@
-"""SlackProducer: cross-channel @-mention polling via the claude.ai Slack MCP.
+"""SlackProducer: cross-channel @-mention + watched-channel polling.
 
-Single tool call per poll tick: ``slack_search_public_and_private``
-with the user's own ID as the query. That catches @-mentions in any
-channel (public, private, DM, group DM) — the producer doesn't need a
-per-channel list, doesn't need a workspace install, and doesn't need
-its own Slack credentials. All auth is piggy-backed off claude.ai via
-:class:`ClaudeMCPClient`.
+Goes through the claude.ai Slack MCP via :class:`ClaudeMCPClient`,
+piggy-backing on whatever auth claude.ai already holds. Two polling
+paths run per tick:
+
+1. **Mention search** — ``slack_search_public_and_private`` with the
+   user's own ID as the query. Catches @-mentions in any channel
+   (public, private, DM, group DM).
+2. **Watched-channel reads** — for each channel name in
+   ``config.slack_watch_channels``, ``slack_read_channel`` since the
+   last seen timestamp. Surfaces *every* new message in that channel
+   (not just @-mentions). Channel names are resolved to IDs once on
+   first poll via ``slack_search_channels``.
 
 **Known limitation:** DMs that don't @-mention the user won't surface.
 The Slack MCP exposed by claude.ai doesn't have a clean
 "list-all-DMs-since-X" tool, and a heuristic search query would either
-miss messages or burn tokens. Out of scope for this pass.
+miss messages or burn tokens. Workaround: add the DM you care about to
+``slack_watch_channels`` once we figure out the channel-id-for-DM path.
 
 On startup the producer makes one ``slack_read_user_profile`` call to
-discover the current user's ID, then loops mention searches at the
-configured interval.
+discover the current user's ID, then loops at the configured interval.
 """
 
 from __future__ import annotations
@@ -147,6 +153,9 @@ class SlackProducer:
         # Tiny cache to suppress duplicates within a session (state file
         # already handles cross-restart dedup).
         self._recent_ids: set[str] = set()
+        # Watched-channel name → channel_id. Populated by setup; empty
+        # if config has no watch list or resolution fails.
+        self._watched: dict[str, str] = {}
 
     # ---- lifecycle ------------------------------------------------------
 
@@ -216,12 +225,15 @@ class SlackProducer:
                 return
 
     def _setup_in_thread(self) -> bool:
-        """Resolve user_id from inside the worker thread.
+        """Resolve user_id (and watched channel IDs) from inside the
+        worker thread.
 
         Returns ``True`` if setup succeeded and the poll loop should
         proceed, ``False`` otherwise (failed MCP call or empty user_id).
         Split out from :meth:`_run` so tests can drive the setup path
-        without sitting through the 2 s startup stagger.
+        without sitting through the 2 s startup stagger. Channel
+        resolution failures don't block setup — the producer still
+        runs the mention search, just with no watched-channel coverage.
         """
         try:
             self._user_id = self._fetch_user_id()
@@ -231,10 +243,70 @@ class SlackProducer:
         if not self._user_id:
             logger.warning("SlackProducer: empty user_id from slack_read_user_profile; idling.")
             return False
-        logger.info("SlackProducer: ready (user_id=%s)", self._user_id)
+        self._watched = self._resolve_watch_channels(self._config.slack_watch_channels)
+        logger.info(
+            "SlackProducer: ready (user_id=%s, watched=%s)",
+            self._user_id,
+            sorted(self._watched.keys()) or "[]",
+        )
         return True
 
+    def _resolve_watch_channels(self, names: tuple[str, ...]) -> dict[str, str]:
+        """Map channel name → channel_id via ``slack_search_channels``.
+
+        Each lookup is one MCP call. We only need exact-name matches;
+        if Slack returns a fuzzy/partial match list we filter it down.
+        Failures are logged-and-skipped — one bad channel name doesn't
+        kill the producer.
+        """
+        resolved: dict[str, str] = {}
+        for name in names:
+            try:
+                result = self._mcp.call_tool(
+                    "slack_search_channels",
+                    {"query": name, "limit": 10, "response_format": "detailed"},
+                )
+            except ClaudeMCPError as exc:
+                logger.warning("Could not look up channel '#%s': %s", name, exc)
+                continue
+            cid = self._extract_exact_channel_id(result, name)
+            if cid:
+                resolved[name] = cid
+            else:
+                logger.warning("Channel '#%s' not found in search results.", name)
+        return resolved
+
+    def _extract_exact_channel_id(self, result: dict, name: str) -> str | None:
+        """Pull the channel ID for an exact-name match out of
+        ``slack_search_channels``'s detailed text response."""
+        text = result.get("results") or result.get("result") or ""
+        if not isinstance(text, str):
+            return None
+        # The detailed output lists each channel with a "Name: <n>" and
+        # "ID: <C…>" pair, sometimes inline. Look for the block matching
+        # our wanted name and pull the ID out.
+        # Format observed in slack_read_channel-style responses:
+        #   Name: team-ai
+        #   ID: C0…
+        # Fall back to a broader regex that matches "#<name> (ID: C…)".
+        for m in re.finditer(
+            r"(?:^Name:\s*|#)" + re.escape(name) + r"(?=\s|$|\))" +
+            r"[\s\S]{0,200}?(?:ID:\s*|\(ID:\s*)([CG][A-Z0-9]+)",
+            text,
+            re.MULTILINE,
+        ):
+            return m.group(1)
+        return None
+
     def _poll_once(self) -> None:
+        self._poll_mentions()
+        for name, channel_id in self._watched.items():
+            self._poll_watched_channel(name, channel_id)
+        # Cap the in-memory dedup set so it doesn't grow unbounded.
+        if len(self._recent_ids) > 500:
+            self._recent_ids = set(sorted(self._recent_ids)[-250:])
+
+    def _poll_mentions(self) -> None:
         last_ts = self._state.last_search_ts()
         after = self._after_param(last_ts)
         try:
@@ -282,16 +354,84 @@ class SlackProducer:
             self._state.set_last_search_ts(ts)
 
         logger.info(
-            "SlackProducer: poll found %d matches (%d emitted, %d bot, %d already-seen)",
+            "SlackProducer: mention poll — %d matches (%d emitted, %d bot, %d already-seen)",
             len(messages),
             emitted,
             skipped_bot,
             skipped_old,
         )
 
-        # Cap the in-memory dedup set so it doesn't grow unbounded.
-        if len(self._recent_ids) > 500:
-            self._recent_ids = set(sorted(self._recent_ids)[-250:])
+    def _poll_watched_channel(self, channel_name: str, channel_id: str) -> None:
+        """Pull every new message from a watched channel (no @-mention
+        filter, no bot filter — the user opted in to seeing everything)."""
+        last_ts = self._state.last_channel_ts(channel_id)
+        args: dict = {"channel_id": channel_id, "limit": 30, "response_format": "detailed"}
+        if last_ts:
+            args["oldest"] = last_ts
+        try:
+            result = self._mcp.call_tool("slack_read_channel", args)
+        except ClaudeMCPError as exc:
+            logger.warning(
+                "SlackProducer: read channel '#%s' failed: %s", channel_name, exc
+            )
+            return
+
+        messages = self._extract_channel_messages(result, channel_name, channel_id)
+        emitted = 0
+        skipped_old = 0
+        # Sort ascending so the cursor advances correctly through each
+        # message — the MCP returns newest-first.
+        messages.sort(key=lambda m: m.get("ts") or "")
+        for msg in messages:
+            ts = msg.get("ts") or ""
+            if not ts:
+                continue
+            if last_ts and ts <= last_ts:
+                skipped_old += 1
+                continue
+            if ts in self._recent_ids:
+                skipped_old += 1
+                continue
+            try:
+                self._emit_task(msg)
+                emitted += 1
+            except Exception:
+                logger.exception("Failed to emit Slack task for ts=%s", ts)
+            self._recent_ids.add(ts)
+            self._state.set_last_channel_ts(channel_id, ts)
+
+        logger.info(
+            "SlackProducer: channel '#%s' — %d messages (%d emitted, %d already-seen)",
+            channel_name,
+            len(messages),
+            emitted,
+            skipped_old,
+        )
+
+    def _extract_channel_messages(
+        self, result: dict, channel_name: str, channel_id: str
+    ) -> list[dict]:
+        """Parse ``slack_read_channel``'s detailed markdown.
+
+        Format mirrors the search detailed output but without per-block
+        Channel: lines (we already know which channel we asked for), so
+        we inject channel_name / channel_id ourselves.
+        """
+        if isinstance(result.get("messages"), list):
+            return result["messages"]
+        text = result.get("results") or result.get("result") or ""
+        if not isinstance(text, str) or not text.strip():
+            return []
+        blocks = _BLOCK_SPLIT_RE.split(text)
+        out: list[dict] = []
+        for block in blocks[1:]:
+            parsed = self._parse_block(block)
+            if parsed is None:
+                continue
+            parsed.setdefault("channel_id", channel_id)
+            parsed.setdefault("channel_name", channel_name)
+            out.append(parsed)
+        return out
 
     def _after_param(self, last_ts: str | None) -> str:
         """Compute the ``after`` argument for the search call.
@@ -329,7 +469,14 @@ class SlackProducer:
         # The split keeps the chunks between headers; the first one is the
         # preamble (e.g. "# Search Results for: …") and we drop it.
         blocks = _BLOCK_SPLIT_RE.split(text)
-        return [parsed for b in blocks[1:] if (parsed := self._parse_block(b))]
+        out: list[dict] = []
+        for b in blocks[1:]:
+            parsed = self._parse_block(b)
+            # Search results must have a channel_id (the Channel: line);
+            # without one we can't route a reply. Drop those.
+            if parsed and parsed.get("channel_id"):
+                out.append(parsed)
+        return out
 
     def _parse_block(self, block: str) -> dict | None:
         """Pull (channel, sender, ts, thread_ts, text, is_bot) out of one
@@ -371,7 +518,7 @@ class SlackProducer:
             # Time, Reply count, etc. — ignore for now.
 
         body = "\n".join(text_lines).strip()
-        if not msg.get("ts") or not msg.get("channel_id") or not body:
+        if not msg.get("ts") or not body:
             return None
         msg["text"] = body
         msg.setdefault("thread_ts", msg["ts"])
