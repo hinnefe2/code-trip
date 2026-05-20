@@ -220,17 +220,21 @@ Each producer is an independent module under `src/code_trip2/producers/`. Each r
 - New hook: write a small JSON line to `/tmp/claude-events/<window>-<timestamp>.json` with `{window, finished_at, last_user_msg}`. Producer watches the directory (`watchdog` or just polling `os.listdir` every second), reads each new file, deletes it, and emits a `Task(kind="claude_reply", topic=window, ...)`. The headline can be a short capture-pane snippet.
 - Migration: keep the touch-file behavior as a fallback for the active window's `wait_done` (today's blocking-wait flow), so a half-migrated state still works.
 
-**MCP integration strategy.** Producers that need external services (Slack, Linear, later Gmail) talk to **locally-hosted MCP servers** via the official Python MCP SDK (`pip install mcp`). Each server runs as a child process of the orchestrator (stdio transport) and is given its own credentials via env vars (Slack bot token, Linear API key, etc.). No Claude agent in the loop — the orchestrator is a direct MCP client. This is more setup than going through `claude -p`, but the round-trip is fast, deterministic, and doesn't depend on parsing model output.
+**Producer access strategy — pick the simplest path per service.** Producers are free to use whatever they need to reach their external service:
 
-A small shared module (`producers/mcp_client.py`) wraps the boilerplate: start the server subprocess, hold the session, expose typed methods over `call_tool`. Each producer imports it and calls the tools it needs.
+- Direct service SDK (e.g., `slack_sdk`, `linear-api`) when one exists and is well-maintained. Skips a process boundary and keeps the producer in one language.
+- Local MCP server via the Python MCP SDK (`pip install mcp`) when the service has no good Python client or when the MCP server already does useful work (auth, rate limiting, normalization) we'd otherwise reimplement.
+- A small shared `producers/mcp_client.py` exists for the second pattern: spawns the server subprocess, holds the session, exposes a sync `call_tool` over an internal asyncio bridge.
 
-**`producers/slack.py`** — Slack via a local Slack MCP server (the project's own — e.g., the reference Slack MCP server pointed at a workspace-scoped bot token). Poll-based: `search_messages` / `conversations_history` for unreads / mentions across a configured channel list, every ~30s. New mention → `Task(kind="slack_msg", topic=f"slack-{channel}")`. Reply path is also via the same server.
+The original design pushed everything through MCP. In practice that adds latency and an extra runtime dependency for services that already ship clean Python clients. So MCP becomes the fallback, not the default.
 
-**`producers/linear.py`** — Linear via a local Linear MCP server with the user's API key. Replaces today's `claude -p` + JSON-extraction hack in `_linear_refresh`. Producer polls `list_issues` for assigned + recently-updated tickets and surfaces high-priority changes as tasks. Direct MCP calls remove the need for the dedicated `linear` tmux window and the regex JSON-extraction path entirely.
+**`producers/slack.py`** — Slack via `slack_sdk` (direct Web API). Bot token from env (`SLACK_BOT_TOKEN`). On startup the producer resolves configured channel names → IDs once via `conversations.list`. Per poll tick (~30 s) it calls `conversations.history` for each channel since the last-seen timestamp, passes each new message through a small LLM relevance filter, and emits `Task(kind="slack_msg", topic=f"slack-{name}")` for the survivors. Reply path also uses `slack_sdk` (`chat.postMessage` with `thread_ts`).
+
+**`producers/linear.py`** — Linear via the Linear MCP server (still). The official Linear MCP server is well-maintained and packages auth + GraphQL into a clean tool surface; reimplementing that in Python would be more work than wiring the MCP path. Replaces today's `claude -p` + JSON-extraction hack in `_linear_refresh`. Polls `list_issues` for assigned + recently-updated tickets.
 
 **`producers/manual.py`** — voice phrases like "remind me to read this" capture the most recent URL from the active tmux pane (we already have this logic in `chords._open_last_pane_url`) and add a `web` task.
 
-Out of scope for v1: Gmail, calendar. Same MCP pattern applies when they're added.
+Out of scope for v1: Gmail, calendar. Each picks its own pattern when added — Gmail will probably go through a direct Python client; calendar via MCP (the Google APIs are heavy).
 
 ### What stays the same
 
@@ -266,8 +270,8 @@ These were the open questions in the draft; resolved by walking through them.
 - **Default startup mode.** Probably queue mode (matches the "always away from screen" framing) but worth letting `config.toml` set it.
 - **Scoring constants.** First-pass values will be guesses; tuning comes from the offline log replay tool once there's real usage.
 - **Digest UX details.** Whether expanding a digest pulls all its items into the queue as separate tasks, or plays them in a single announcement sequence. Lean toward the latter — keeps the queue clean.
-- **Which Slack/Linear MCP servers specifically.** There are multiple reference + community MCP servers per service. Pick when the producer is being built; the `mcp_client.py` wrapper isolates the choice.
-- **MCP server lifecycle.** Spawn-per-producer vs. one persistent server per service for the orchestrator's life. Lean persistent — fewer subprocess starts, MCP sessions are cheap to hold open.
+- **Which Linear MCP server specifically.** Multiple options exist. Decide when the Linear producer body is built.
+- **MCP server lifecycle (for producers that use MCP).** Spawn-per-producer vs. one persistent server per service for the orchestrator's life. Lean persistent — fewer subprocess starts, MCP sessions are cheap to hold open.
 
 ---
 
@@ -288,7 +292,7 @@ Each phase ends with a usable system; nothing is half-finished mid-phase.
 ## What this doc does *not* commit to
 
 - Specific scoring constants (left for tuning via offline log replay)
-- Specific MCP server implementations chosen for Slack and Linear
+- Specific Linear MCP server implementation
 - Whether to keep the `modes.py` filename or rename to `dispatch.py`
 - Tree structure (deferred unless flat-list-with-topics proves insufficient)
 - Digest expansion UX (single announcement vs. exploded into N tasks)

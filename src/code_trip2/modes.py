@@ -77,6 +77,9 @@ class Context:
     # value, ``chords`` suppresses synthesized keystrokes so YES/NO/NAV
     # taps don't scroll the alternate-screen buffer.
     tui_host_app: str | None = None
+    # slack_sdk WebClient — set if a bot token was configured. Used by
+    # dispatch._respond_slack to thread-reply to active slack_msg tasks.
+    slack_client: object | None = None
 
     def __post_init__(self) -> None:
         if not self.active_window:

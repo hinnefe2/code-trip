@@ -8,6 +8,7 @@ dependencies = [
     "pynput>=1.7",
     "openai>=1.0",
     "rich>=13",
+    "slack_sdk>=3.27",
     "tomli>=2.0; python_version < '3.11'",
 ]
 

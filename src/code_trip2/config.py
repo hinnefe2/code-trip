@@ -54,10 +54,13 @@ class Config:
     summarizer_max_chars: int = 600
     # task-queue
     startup_mode: str = "focused"           # "queue" | "focused"
-    # mcp producers (skeletons in v1; need a local MCP server command to start)
-    slack_channels: tuple[str, ...] = ()
-    slack_mcp_command: str = ""
-    slack_mcp_args: tuple[str, ...] = ()
+    # slack (direct slack_sdk; bot token + channel name list)
+    slack_channels: tuple[str, ...] = ()        # channel names, resolved to IDs at start
+    slack_bot_token: str = ""                   # falls back to $SLACK_BOT_TOKEN
+    slack_user_id: str = ""                     # auto-detected via auth.test if empty
+    slack_poll_interval: float = 30.0
+    slack_filter_extra: str = ""                # appended to the relevance-filter prompt
+    # linear (MCP — server choice TBD, still stubbed)
     linear_mcp_command: str = ""
     linear_mcp_args: tuple[str, ...] = ()
 
@@ -145,10 +148,18 @@ def load_config(path: Path | str) -> Config:
     slack_cfg = data.get("slack", {})
     if "channels" in slack_cfg:
         kw["slack_channels"] = tuple(slack_cfg["channels"])
-    if "mcp_command" in slack_cfg:
-        kw["slack_mcp_command"] = slack_cfg["mcp_command"]
-    if "mcp_args" in slack_cfg:
-        kw["slack_mcp_args"] = tuple(slack_cfg["mcp_args"])
+    if "bot_token" in slack_cfg:
+        kw["slack_bot_token"] = slack_cfg["bot_token"]
+    else:
+        env_token = os.environ.get("SLACK_BOT_TOKEN")
+        if env_token:
+            kw["slack_bot_token"] = env_token
+    if "user_id" in slack_cfg:
+        kw["slack_user_id"] = slack_cfg["user_id"]
+    if "poll_interval" in slack_cfg:
+        kw["slack_poll_interval"] = float(slack_cfg["poll_interval"])
+    if "filter_extra" in slack_cfg:
+        kw["slack_filter_extra"] = slack_cfg["filter_extra"]
 
     linear_cfg = data.get("linear", {})
     if "mcp_command" in linear_cfg:

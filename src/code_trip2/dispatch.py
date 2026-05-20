@@ -263,7 +263,7 @@ def _dispatch_task_response(ctx: "Context", task: Task, transcript: str) -> None
         _respond_claude(ctx, task, transcript)
         return
     if task.kind == "slack_msg":
-        _speak(ctx, "Slack reply is not yet implemented.")
+        _respond_slack(ctx, task, transcript)
         return
     _speak(ctx, "No response action for this task.")
 
@@ -282,6 +282,37 @@ def _respond_claude(ctx: "Context", task: Task, transcript: str) -> None:
     ctx.current_task = None
     ctx.log.event(
         "queue_turn", task_id=task.id, kind=task.kind, topic=task.topic, sent=transcript
+    )
+    _speak(ctx, "Sent.")
+
+
+def _respond_slack(ctx: "Context", task: Task, transcript: str) -> None:
+    """Reply in the Slack thread the task came from."""
+    client = ctx.slack_client
+    if client is None:
+        _speak(ctx, "Slack client is not configured.")
+        return
+    channel_id = task.source.get("channel_id")
+    thread_ts = task.source.get("thread_ts") or task.source.get("ts")
+    if not channel_id:
+        _speak(ctx, "Missing Slack channel for this task.")
+        return
+    try:
+        client.chat_postMessage(
+            channel=channel_id, thread_ts=thread_ts, text=transcript
+        )
+    except Exception as exc:
+        logger.exception("Slack reply failed")
+        _speak(ctx, f"Could not send Slack reply: {exc}")
+        return
+    ctx.queue.mark_done(task.id)
+    ctx.current_task = None
+    ctx.log.event(
+        "queue_turn",
+        task_id=task.id,
+        kind=task.kind,
+        topic=task.topic,
+        sent=transcript,
     )
     _speak(ctx, "Sent.")
 
