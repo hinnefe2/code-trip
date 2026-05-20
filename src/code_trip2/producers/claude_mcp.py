@@ -86,6 +86,10 @@ class ClaudeMCPClient:
 
         tool_id = f"mcp__{self.server_id}__{tool_name}"
         prompt = self._format_prompt(tool_name, args)
+        # The prompt goes on stdin, not as a positional arg, because
+        # ``--allowedTools`` is variadic (``<tools...>``) and will silently
+        # swallow a trailing prompt as a second tool name. claude --print
+        # reads from stdin when no positional prompt is given.
         cmd = [
             self.binary,
             "--print",
@@ -102,11 +106,14 @@ class ClaudeMCPClient:
             str(self.max_budget_usd),
             "--allowedTools",
             tool_id,
-            prompt,
         ]
         try:
             proc = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=self.timeout
+                cmd,
+                input=prompt,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout,
             )
         except subprocess.TimeoutExpired as exc:
             raise ClaudeMCPError(f"claude timed out after {self.timeout}s") from exc

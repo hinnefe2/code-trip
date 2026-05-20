@@ -127,6 +127,28 @@ def test_claude_mcp_command_passes_expected_args():
     assert cmd[model_idx + 1] == "haiku"
 
 
+def test_claude_mcp_prompt_goes_via_stdin_not_as_arg():
+    """Regression: ``--allowedTools`` is variadic, so a trailing positional
+    prompt gets eaten as a second tool name. The prompt must go through
+    stdin instead."""
+    c = _mk_client()
+    stdout = _stream_event('{"id": "U1"}')
+    with patch("code_trip2.producers.claude_mcp.subprocess.run") as run:
+        run.return_value = SimpleNamespace(stdout=stdout, stderr="", returncode=0)
+        c.call_tool("slack_read_user_profile", {"foo": "bar"})
+    kwargs = run.call_args.kwargs
+    cmd = run.call_args.args[0]
+    # Prompt must be passed via stdin.
+    assert "input" in kwargs and "slack_read_user_profile" in kwargs["input"]
+    assert "foo" in kwargs["input"]
+    # Prompt must NOT appear in cmd args (which would let --allowedTools
+    # absorb it).
+    assert kwargs["input"] not in cmd
+    # The last token of cmd should be the allowed tool id, with no
+    # trailing positional argument.
+    assert cmd[-1] == "mcp__claude_ai_Slack__slack_read_user_profile"
+
+
 # --- SlackState ----------------------------------------------------------
 
 
