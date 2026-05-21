@@ -220,30 +220,46 @@ def test_yes_tap_suppressed_in_focused_mode_when_tui_host_focused(monkeypatch):
     send.assert_not_called()
 
 
-def test_render_keymap_in_queue_mode_shows_queue_actions():
+def test_render_keymap_in_queue_mode_shows_only_queue_relevant_keys():
     ctx = _make_ctx(app_mode="queue")
     layout = tui.render(ctx, supervisor=None)
     out = _render_to_string(layout)
     assert "Macropad" in out
-    assert "PTT" in out and "YES" in out and "NO" in out and "ACT" in out and "NAV" in out
-    # YES/NO/ACT meaning is queue-flavored.
+    # Queue-flavored solo taps.
     assert "accept" in out or "expand" in out
     assert "skip task" in out
     assert "→ focused" in out
-    # Chord rows are mode-independent.
+    assert "advance audio" in out  # NAV in queue context advances playback
+    # NAV-modifier chords still useful (user often glances at the screen).
     assert "NAV+" in out
-    assert "ACT+" in out
+    # ACT+NO is a shell-input affordance — irrelevant when away from screen.
+    assert "ACT+" not in out
+    assert "Ctrl+U" not in out
+    assert "clear line" not in out
 
 
-def test_render_keymap_in_focused_mode_shows_focused_actions():
+def test_render_keymap_in_focused_mode_shows_full_chord_set():
     ctx = _make_ctx(app_mode="focused")
     layout = tui.render(ctx, supervisor=None)
     out = _render_to_string(layout)
     assert "Macropad" in out
-    # YES/NO/ACT show keyboard-style meanings in focused mode.
+    # Keyboard-style solo taps.
     assert "Enter" in out
     assert "Esc" in out
     assert "→ queue" in out
+    assert "per-app" in out
+    # All chord rows shown.
+    assert "NAV+" in out
+    assert "ACT+" in out
+    assert "Ctrl+U" in out
+
+
+def test_keymap_panel_height_changes_with_mode():
+    """Queue mode keymap renders fewer rows, so the panel reserves less
+    vertical space; focused mode reserves more."""
+    queue_ctx = _make_ctx(app_mode="queue")
+    focused_ctx = _make_ctx(app_mode="focused")
+    assert tui._keymap_panel_size(queue_ctx) < tui._keymap_panel_size(focused_ctx)
 
 
 def test_render_producers_status_uses_supervisor():

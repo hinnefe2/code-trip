@@ -184,21 +184,20 @@ def _topics_panel(ctx: "Context") -> Panel:
 
 
 def _keymap_panel(ctx: "Context") -> Panel:
-    """Mode-aware reminder of what each macropad key does.
+    """Mode-aware macropad reference.
 
-    YES/NO solo tap meaning depends on app-mode (queue vs focused), so
-    the panel re-renders that row when the mode flips. Chord rows
-    (NAV+x, ACT+NO) are mode-independent and shown verbatim.
+    Each mode renders only the keys/chords that are useful in that
+    mode's workflow:
+
+    - **Queue mode** (away from screen, audio-driven): solo taps drive
+      the queue, NAV-tap advances playback. NAV-modifier chords still
+      shown because the user often glances at the laptop to switch
+      apps. ``ACT+NO`` (Ctrl+U) is omitted — it's purely a shell-input
+      affordance.
+    - **Focused mode** (at the screen): solo taps are keyboard-style
+      (Enter / Esc), NAV-tap does per-app navigation, and the full
+      set of chords (including ``ACT+NO`` Ctrl+U) is shown.
     """
-    if ctx.app_mode == "queue":
-        yes_solo = "accept / expand"
-        no_solo = "skip task"
-        act_solo = "→ focused"
-    else:
-        yes_solo = "Enter"
-        no_solo = "Esc"
-        act_solo = "→ queue"
-
     def _key(name: str) -> Text:
         return Text(name, style="bold cyan")
 
@@ -206,14 +205,6 @@ def _keymap_panel(ctx: "Context") -> Panel:
         return Text(text, style="white")
 
     sep = Text("   ")
-
-    solo = Text.assemble(
-        _key("PTT"), " ", _act("hold to talk"), sep,
-        _key("YES"), " ", _act(yes_solo), sep,
-        _key("NO"), " ", _act(no_solo), sep,
-        _key("ACT"), " ", _act(act_solo), sep,
-        _key("NAV"), " ", _act("per-app"),
-    )
     nav_chords = Text.assemble(
         Text("NAV+", style="bold magenta"),
         _key("PTT"), " ", _act("speak app"), sep,
@@ -221,12 +212,40 @@ def _keymap_panel(ctx: "Context") -> Panel:
         _key("NO"), " ", _act("prev"), sep,
         _key("ACT"), " ", _act("cycle app"),
     )
-    act_chords = Text.assemble(
-        Text("ACT+", style="bold magenta"),
-        _key("NO"), " ", _act("Ctrl+U (clear line)"),
-    )
-    body = Group(solo, nav_chords, act_chords)
+
+    if ctx.app_mode == "queue":
+        solo = Text.assemble(
+            _key("PTT"), " ", _act("hold to talk"), sep,
+            _key("YES"), " ", _act("accept / expand"), sep,
+            _key("NO"), " ", _act("skip task"), sep,
+            _key("ACT"), " ", _act("→ focused"), sep,
+            _key("NAV"), " ", _act("advance audio"),
+        )
+        body = Group(solo, nav_chords)
+    else:
+        solo = Text.assemble(
+            _key("PTT"), " ", _act("hold to talk"), sep,
+            _key("YES"), " ", _act("Enter"), sep,
+            _key("NO"), " ", _act("Esc"), sep,
+            _key("ACT"), " ", _act("→ queue"), sep,
+            _key("NAV"), " ", _act("per-app"),
+        )
+        act_chords = Text.assemble(
+            Text("ACT+", style="bold magenta"),
+            _key("NO"), " ", _act("Ctrl+U (clear line)"),
+        )
+        body = Group(solo, nav_chords, act_chords)
+
     return Panel(body, title="Macropad", border_style="bright_black")
+
+
+def _keymap_panel_size(ctx: "Context") -> int:
+    """Total layout rows the macropad panel should reserve.
+
+    Queue mode renders two content rows, focused mode renders three.
+    Add 2 for the panel border.
+    """
+    return 4 if ctx.app_mode == "queue" else 5
 
 
 def _producers_panel(supervisor: "ProducerSupervisor | None") -> Panel:
@@ -249,7 +268,7 @@ def render(ctx: "Context", supervisor: "ProducerSupervisor | None") -> Layout:
     layout.split_column(
         Layout(_header(ctx), name="header", size=3),
         Layout(name="body"),
-        Layout(_keymap_panel(ctx), name="keymap", size=5),
+        Layout(_keymap_panel(ctx), name="keymap", size=_keymap_panel_size(ctx)),
         Layout(_producers_panel(supervisor), name="producers", size=3),
     )
     layout["body"].split_row(
