@@ -257,6 +257,42 @@ def test_producer_setup_tolerates_failed_channel_lookup(tmp_path: Path):
     assert p._watched == {}
 
 
+def test_producer_run_retries_setup_after_transient_failure(tmp_path: Path):
+    """A one-time setup failure shouldn't permanently kill the thread.
+    The producer should retry on the next poll-interval tick."""
+    p, _q, mcp, _state = _producer(tmp_path, poll_interval=0.01)
+    calls = []
+
+    def call_tool(name, args):
+        calls.append(name)
+        if name == "slack_read_user_profile" and len(calls) == 1:
+            raise ClaudeMCPError("transient")
+        if name == "slack_read_user_profile":
+            return {"id": "UABC"}
+        return {"results": ""}
+
+    mcp.call_tool.side_effect = call_tool
+
+    import threading as _t, time as _time
+    # Stagger uses _stop.wait(2.0). Override the stop event with a
+    # short-lived one for the test.
+    t = _t.Thread(target=p._run, daemon=True)
+    p._stop.clear()
+    t.start()
+    # Wait for two setup attempts + one poll attempt to land.
+    deadline = _time.monotonic() + 5.0
+    while _time.monotonic() < deadline:
+        if calls.count("slack_read_user_profile") >= 2:
+            break
+        _time.sleep(0.05)
+    p._stop.set()
+    t.join(timeout=2.0)
+    assert calls.count("slack_read_user_profile") >= 2, (
+        f"expected at least two setup attempts, got calls={calls}"
+    )
+    assert p._user_id == "UABC"
+
+
 def test_producer_start_spawns_thread_without_blocking(tmp_path: Path):
     """Critical: start() must not block on the user_id fetch, even when
     that fetch takes a long time. The fetch happens inside the worker

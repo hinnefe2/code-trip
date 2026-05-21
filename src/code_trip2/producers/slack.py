@@ -214,8 +214,13 @@ class SlackProducer:
         # orchestrator starts.
         if self._stop.wait(2.0):
             return
-        if not self._setup_in_thread():
-            return
+        # Retry setup until it succeeds. A transient claude --print
+        # failure (auth blip, rate-limit, etc) should not permanently
+        # disable the producer for the rest of the session — the thread
+        # stays alive and retries every poll interval.
+        while not self._setup_in_thread():
+            if self._stop.wait(self._config.slack_poll_interval):
+                return
         while not self._stop.is_set():
             try:
                 self._poll_once()
