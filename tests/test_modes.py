@@ -322,34 +322,60 @@ def test_empty_transcript_is_noop(monkeypatch):
 # --- chord tap routing during playback ------------------------------------
 
 
-def test_nav_tap_advances_playback_when_active(monkeypatch):
+def test_nav_tap_flips_mode_even_during_playback(monkeypatch):
+    """NAV solo tap flips app-mode regardless of playback state. The
+    earlier 'advance chunk' behavior on NAV is gone — chunks auto-
+    advance via the playback worker."""
+    from code_trip2 import dispatch
     ctx = _real_ctx()
     ctx.playback_queue = ["a", "b"]
+    ctx.app_mode = "focused"
     sent: list = []
     monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
+    flipped: list = []
+    monkeypatch.setattr(dispatch, "flip_mode", lambda c: flipped.append(c))
 
     chords.handle_tap(ctx, "nav")
 
-    assert sent == []  # no keystroke
-    ctx.tts.stop.assert_called_once()
-    assert ctx.playback_queue == ["a", "b"]  # advance keeps queue
+    assert flipped == [ctx]
+    assert sent == []
+    ctx.tts.stop.assert_not_called()
+    assert ctx.playback_queue == ["a", "b"]
 
 
-def test_no_tap_stops_playback_when_active(monkeypatch):
+def test_act_tap_stops_playback_when_active(monkeypatch):
+    """ACT solo tap interrupts TTS playback (was: NO tap)."""
     ctx = _real_ctx()
     ctx.playback_queue = ["a", "b"]
     sent: list = []
     monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
 
-    chords.handle_tap(ctx, "no")
+    chords.handle_tap(ctx, "act")
 
     assert sent == []
     ctx.tts.stop.assert_called_once()
-    assert ctx.playback_queue == []
+    assert ctx.playback_queue == []  # stop_playback clears the queue
+
+
+def test_no_tap_skips_task_during_playback_in_queue_mode(monkeypatch):
+    """NO no longer stops playback as a side effect — in queue mode it
+    just skips the current task (which on its own ends the announce-
+    ment via the worker draining)."""
+    from code_trip2 import dispatch
+    ctx = _real_ctx()
+    ctx.app_mode = "queue"
+    ctx.playback_queue = ["a"]
+    skipped: list = []
+    monkeypatch.setattr(dispatch, "queue_no_tap", lambda c: skipped.append(c))
+
+    chords.handle_tap(ctx, "no")
+
+    assert skipped == [ctx]
 
 
 def test_yes_tap_unchanged_during_playback(monkeypatch):
     ctx = _real_ctx()
+    ctx.app_mode = "focused"  # YES in focused mode = Enter keystroke
     ctx.playback_queue = ["a"]
     sent: list = []
     monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
@@ -359,17 +385,16 @@ def test_yes_tap_unchanged_during_playback(monkeypatch):
     assert sent == [chords._TAP_YES]
 
 
-def test_taps_pass_through_when_idle(monkeypatch):
-    ctx = _real_ctx()  # queue empty, tts not playing
+def test_no_tap_when_idle_in_focused_mode_sends_escape(monkeypatch):
+    ctx = _real_ctx()
+    ctx.app_mode = "focused"  # queue empty, tts not playing
     sent: list = []
     monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
-    # Frontmost neither in terminal_apps nor Chrome → default keystrokes.
     monkeypatch.setattr(window, "active_app", lambda: "TextEdit")
 
-    chords.handle_tap(ctx, "nav")
     chords.handle_tap(ctx, "no")
 
-    assert sent == [chords._TAP_NAV, chords._TAP_NO]
+    assert sent == [chords._TAP_NO]
 
 
 # --- chunked playback worker (integration with mocked tts) ----------------

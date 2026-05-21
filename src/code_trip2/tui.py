@@ -218,8 +218,8 @@ def _keymap_panel(ctx: "Context") -> Panel:
             _key("PTT"), " ", _act("hold to talk"), sep,
             _key("YES"), " ", _act("accept / expand"), sep,
             _key("NO"), " ", _act("skip task"), sep,
-            _key("ACT"), " ", _act("→ focused"), sep,
-            _key("NAV"), " ", _act("advance audio"),
+            _key("NAV"), " ", _act("→ focused"), sep,
+            _key("ACT"), " ", _act("stop audio"),
         )
         body = Group(solo, nav_chords)
     else:
@@ -227,8 +227,8 @@ def _keymap_panel(ctx: "Context") -> Panel:
             _key("PTT"), " ", _act("hold to talk"), sep,
             _key("YES"), " ", _act("Enter"), sep,
             _key("NO"), " ", _act("Esc"), sep,
-            _key("ACT"), " ", _act("→ queue"), sep,
-            _key("NAV"), " ", _act("per-app"),
+            _key("NAV"), " ", _act("→ queue"), sep,
+            _key("ACT"), " ", _act("per-app"),
         )
         act_chords = Text.assemble(
             Text("ACT+", style="bold magenta"),

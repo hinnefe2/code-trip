@@ -228,8 +228,9 @@ def test_render_keymap_in_queue_mode_shows_only_queue_relevant_keys():
     # Queue-flavored solo taps.
     assert "accept" in out or "expand" in out
     assert "skip task" in out
+    # NAV solo flips mode; ACT solo interrupts audio.
     assert "→ focused" in out
-    assert "advance audio" in out  # NAV in queue context advances playback
+    assert "stop audio" in out
     # NAV-modifier chords still useful (user often glances at the screen).
     assert "NAV+" in out
     # ACT+NO is a shell-input affordance — irrelevant when away from screen.
@@ -246,6 +247,7 @@ def test_render_keymap_in_focused_mode_shows_full_chord_set():
     # Keyboard-style solo taps.
     assert "Enter" in out
     assert "Esc" in out
+    # NAV solo flips mode; ACT solo does per-app.
     assert "→ queue" in out
     assert "per-app" in out
     # All chord rows shown.

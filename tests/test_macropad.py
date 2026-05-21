@@ -479,127 +479,150 @@ def test_tap_no_sends_escape(monkeypatch):
     assert sent[0].chords[0].key == keyboard.Key.esc
 
 
-def test_tap_nav_in_other_app_sends_down(monkeypatch):
+# --- NAV solo tap: app-mode flip ----------------------------------------
+
+
+def test_tap_nav_flips_mode(monkeypatch):
+    """NAV solo tap toggles the app-mode (queue ↔ focused) regardless
+    of focused app or playback state."""
+    from code_trip2 import dispatch
     ctx = _ctx()
+    ctx.app_mode = "focused"
     sent: list[KeyStroke] = []
     monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
-    # Frontmost is something neither in terminal_apps nor Chrome.
-    monkeypatch.setattr(window, "active_app", lambda: "TextEdit")
+    flipped: list = []
+    monkeypatch.setattr(dispatch, "flip_mode", lambda c: flipped.append(c))
 
     chords.handle_tap(ctx, "nav")
-    assert sent == [chords._TAP_NAV]
-    assert sent[0].chords[0].key == keyboard.Key.down
+
+    assert flipped == [ctx]
+    assert sent == []  # no synthesized keystroke
 
 
-def test_tap_nav_active_app_error_falls_through_to_down(monkeypatch):
+def test_tap_nav_during_playback_still_flips_mode(monkeypatch):
+    """The 'advance playback' meaning that used to live on NAV-during-
+    playback is gone — chunks auto-advance now, NAV is just mode flip."""
+    from code_trip2 import dispatch
+    ctx = _ctx(queue=["chunk a", "chunk b"])
+    flipped: list = []
+    monkeypatch.setattr(dispatch, "flip_mode", lambda c: flipped.append(c))
+
+    chords.handle_tap(ctx, "nav")
+
+    assert flipped == [ctx]
+    ctx.tts.stop.assert_not_called()
+
+
+# --- ACT solo tap: stop audio / per-app handler -------------------------
+
+
+def test_tap_act_during_playback_stops_audio(monkeypatch):
+    """In any mode, ACT-tap while TTS is speaking interrupts playback."""
+    ctx = _ctx(queue=["chunk a"])  # playback_queue non-empty → is_playing
+    monkeypatch.setattr(window, "active_app", lambda: "kitty")
+
+    chords.handle_tap(ctx, "act")
+
+    ctx.tts.stop.assert_called_once()
+
+
+def test_tap_act_in_queue_mode_no_playback_is_noop(monkeypatch):
+    """User is away from the screen, no audio playing — ACT does nothing
+    rather than firing focused-app behavior."""
     ctx = _ctx()
+    ctx.app_mode = "queue"
     sent: list[KeyStroke] = []
     monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
-    monkeypatch.setattr(
-        window, "active_app", lambda: (_ for _ in ()).throw(window.WindowError("x"))
-    )
+    opened: list[list[str]] = []
+    monkeypatch.setattr(chords.subprocess, "run", lambda cmd, **kw: opened.append(cmd))
 
-    chords.handle_tap(ctx, "nav")
-    assert sent == [chords._TAP_NAV]
+    chords.handle_tap(ctx, "act")
+
+    assert sent == []
+    assert opened == []
+    ctx.tts.stop.assert_not_called()
 
 
-def test_tap_nav_in_chrome_opens_new_tab(monkeypatch):
+def test_tap_act_in_focused_mode_chrome_opens_new_tab(monkeypatch):
     ctx = _ctx()
+    ctx.app_mode = "focused"
     sent: list[KeyStroke] = []
     monkeypatch.setattr(window, "active_app", lambda: "Google Chrome")
     monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
 
-    chords.handle_tap(ctx, "nav")
+    chords.handle_tap(ctx, "act")
 
     assert sent == [chords._CHROME_NEW_TAB]
     assert sent[0].chords[0].key == "t"
     assert sent[0].chords[0].modifiers == (keyboard.Key.cmd,)
 
 
-def test_tap_nav_in_terminal_opens_last_pane_url(monkeypatch):
+def test_tap_act_in_focused_mode_terminal_opens_last_pane_url(monkeypatch):
     ctx = _ctx()
+    ctx.app_mode = "focused"
     monkeypatch.setattr(window, "active_app", lambda: "kitty")
     pane = (
         "Earlier output https://old.example.com/x referenced.\n"
-        "Then a status update.\n"
         "Final URL is https://github.com/owner/repo/pull/42 here.\n"
         ">\n"
     )
     monkeypatch.setattr(chords.remote, "capture", lambda *a, **kw: pane)
     opened: list[list[str]] = []
     monkeypatch.setattr(
-        chords.subprocess,
-        "run",
+        chords.subprocess, "run",
         lambda cmd, **kw: opened.append(cmd) or MagicMock(),
     )
     monkeypatch.setattr(chords.earcon, "completion", lambda: None)
 
-    chords.handle_tap(ctx, "nav")
+    chords.handle_tap(ctx, "act")
 
     assert opened == [["open", "-a", "Google Chrome", "https://github.com/owner/repo/pull/42"]]
 
 
-def test_tap_nav_in_terminal_strips_trailing_punctuation(monkeypatch):
+def test_tap_act_in_focused_mode_terminal_strips_trailing_punctuation(monkeypatch):
     ctx = _ctx()
+    ctx.app_mode = "focused"
     monkeypatch.setattr(window, "active_app", lambda: "kitty")
     monkeypatch.setattr(
         chords.remote, "capture", lambda *a, **kw: "see https://example.com/path."
     )
     opened: list[list[str]] = []
     monkeypatch.setattr(
-        chords.subprocess,
-        "run",
+        chords.subprocess, "run",
         lambda cmd, **kw: opened.append(cmd) or MagicMock(),
     )
     monkeypatch.setattr(chords.earcon, "completion", lambda: None)
 
-    chords.handle_tap(ctx, "nav")
+    chords.handle_tap(ctx, "act")
 
     assert opened[0][-1] == "https://example.com/path"
 
 
-def test_tap_nav_in_terminal_no_url_speaks_error(monkeypatch):
+def test_tap_act_in_focused_mode_terminal_no_url_speaks_error(monkeypatch):
     ctx = _ctx()
+    ctx.app_mode = "focused"
     monkeypatch.setattr(window, "active_app", lambda: "kitty")
     monkeypatch.setattr(chords.remote, "capture", lambda *a, **kw: "no urls here")
     monkeypatch.setattr(chords.earcon, "error", lambda: None)
-    called: list[list[str]] = []
-    monkeypatch.setattr(chords.subprocess, "run", lambda cmd, **kw: called.append(cmd))
 
-    chords.handle_tap(ctx, "nav")
+    chords.handle_tap(ctx, "act")
 
-    assert called == []
     ctx.tts.speak.assert_called_once()
     assert "url" in ctx.tts.speak.call_args.args[0].lower()
 
 
-def test_tap_nav_in_terminal_capture_error_speaks_error(monkeypatch):
+def test_tap_act_in_focused_mode_in_other_app_is_silent(monkeypatch):
+    """Frontmost app isn't terminal or Chrome and there's no playback;
+    ACT is a silent no-op (no Down arrow fallback any more)."""
     ctx = _ctx()
-    monkeypatch.setattr(window, "active_app", lambda: "kitty")
+    ctx.app_mode = "focused"
+    sent: list[KeyStroke] = []
+    monkeypatch.setattr(window, "active_app", lambda: "TextEdit")
+    monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
 
-    def boom(*_a, **_kw):
-        raise chords.remote.RemoteError("ssh down")
+    chords.handle_tap(ctx, "act")
 
-    monkeypatch.setattr(chords.remote, "capture", boom)
-    monkeypatch.setattr(chords.earcon, "error", lambda: None)
-
-    chords.handle_tap(ctx, "nav")
-
-    ctx.tts.speak.assert_called_once()
-    assert "ssh down" in ctx.tts.speak.call_args.args[0]
-
-
-def test_tap_nav_playback_active_still_advances(monkeypatch):
-    ctx = _ctx(queue=["chunk a", "chunk b"])
-    monkeypatch.setattr(window, "active_app", lambda: "kitty")
-    opened: list[list[str]] = []
-    monkeypatch.setattr(chords.subprocess, "run", lambda cmd, **kw: opened.append(cmd))
-
-    chords.handle_tap(ctx, "nav")
-
-    # Playback advance wins over the URL-open behavior.
-    assert opened == []
-    ctx.tts.stop.assert_called_once()
+    assert sent == []
 
 
 def test_chord_act_no_sends_ctrl_u(monkeypatch):

@@ -71,12 +71,11 @@ APP_NAV: dict[str, tuple[KeyStroke, KeyStroke]] = {
 }
 
 
-# Solo taps — typed into whatever app currently has focus.
-# YES = Enter (default-accept in most prompts); NO = Esc (cancel).
-# NAV = Down arrow (next item in lists / completion menus).
+# Solo taps that synthesize a keystroke into the focused app. NAV solo
+# tap is no longer in here — NAV now flips app-mode (see handle_tap).
+# ACT solo tap is also handled inline (stop playback / per-app handler).
 _TAP_YES = KeyStroke(chords=(Chord(key=keyboard.Key.enter),))
 _TAP_NO = KeyStroke(chords=(Chord(key=keyboard.Key.esc),))
-_TAP_NAV = KeyStroke(chords=(Chord(key=keyboard.Key.down),))
 
 # Cmd+T = open new tab (focuses the URL bar by default in Chrome).
 _CHROME_NEW_TAB = KeyStroke(chords=(Chord(modifiers=(keyboard.Key.cmd,), key="t"),))
@@ -87,7 +86,6 @@ _ACT_NO_CLEAR_LINE = KeyStroke(chords=(Chord(modifiers=(keyboard.Key.ctrl,), key
 TAP_STROKES: dict[str, KeyStroke] = {
     "yes": _TAP_YES,
     "no": _TAP_NO,
-    "nav": _TAP_NAV,
 }
 
 
@@ -130,21 +128,39 @@ def _keystroke_targets_tui_host(ctx: "Context") -> bool:
 
 
 def handle_tap(ctx: "Context", name: str) -> None:
-    # Playback-aware: while audio is playing or chunks are queued, NAV/NO
-    # control playback instead of falling through to the focused app.
+    """Dispatch a macropad solo tap.
+
+    Key bindings (post-revamp):
+
+    - **NAV**: flip app-mode (queue ↔ focused). Mode-independent.
+    - **ACT**: stop TTS playback if speaking; otherwise per-app handler
+      (open URL in tmux, new tab in Chrome, etc).
+    - **YES/NO** in queue mode: drive the queue (accept/expand, skip).
+    - **YES/NO** in focused mode: synthesize Enter / Esc into the
+      focused app.
+    - **PTT**: handled at the macropad layer, not here.
+
+    Playback chunks auto-advance through ``_playback_loop``, so there's
+    no "next chunk" tap binding any more — ACT just stops playback
+    outright.
+    """
     from code_trip2 import dispatch, modes  # local import to avoid cycle
 
-    if modes.is_playback_active(ctx):
-        if name == "nav":
-            modes.advance_playback(ctx)
-            return
-        if name == "no":
+    # NAV solo: app-mode flip.
+    if name == "nav":
+        dispatch.flip_mode(ctx)
+        return
+
+    # ACT solo: interrupt playback if speaking. Otherwise, if we're in
+    # focused mode, run the per-app handler (open URL / Cmd+T / etc).
+    # In queue mode with no playback it's a silent no-op — the user is
+    # away from the screen, so a focused-app keystroke would be wrong.
+    if name == "act":
+        if modes.is_playback_active(ctx):
             modes.stop_playback(ctx)
             return
-
-    # ACT solo tap: app-mode flip (queue <-> focused). Mode-independent.
-    if name == "act":
-        dispatch.flip_mode(ctx)
+        if ctx.app_mode == dispatch.MODE_FOCUSED:
+            _act_tap_app_aware(ctx)
         return
 
     # Queue mode: YES/NO drive the queue rather than the focused app.
@@ -156,8 +172,6 @@ def handle_tap(ctx: "Context", name: str) -> None:
             dispatch.queue_no_tap(ctx)
             return
 
-    if name == "nav" and _nav_tap_app_aware(ctx):
-        return
     stroke = TAP_STROKES.get(name)
     if stroke is None:
         logger.warning("Unknown tap: %s", name)
@@ -165,8 +179,8 @@ def handle_tap(ctx: "Context", name: str) -> None:
     _send_stroke(ctx, stroke)
 
 
-def _nav_tap_app_aware(ctx: "Context") -> bool:
-    """Per-app NAV-tap behavior. Returns True if handled (skip default Down)."""
+def _act_tap_app_aware(ctx: "Context") -> bool:
+    """Per-app ACT-tap behavior. Returns True if handled (else no-op)."""
     try:
         app = window.active_app()
     except window.WindowError:
