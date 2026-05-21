@@ -233,8 +233,10 @@ def test_render_keymap_in_queue_mode_shows_only_queue_relevant_keys():
     assert "stop audio" in out
     # NAV-modifier chords still useful (user often glances at the screen).
     assert "NAV+" in out
-    # ACT+NO is a shell-input affordance — irrelevant when away from screen.
-    assert "ACT+" not in out
+    # ACT+NO in queue mode dismisses the current task (replaces the
+    # focused-mode-only Ctrl+U binding).
+    assert "ACT+" in out
+    assert "dismiss" in out
     assert "Ctrl+U" not in out
     assert "clear line" not in out
 
@@ -256,12 +258,12 @@ def test_render_keymap_in_focused_mode_shows_full_chord_set():
     assert "Ctrl+U" in out
 
 
-def test_keymap_panel_height_changes_with_mode():
-    """Queue mode keymap renders fewer rows, so the panel reserves less
-    vertical space; focused mode reserves more."""
+def test_keymap_panel_height_same_in_both_modes():
+    """Both modes now render three content rows: queue mode has ACT+NO
+    dismiss-task; focused mode has ACT+NO Ctrl+U."""
     queue_ctx = _make_ctx(app_mode="queue")
     focused_ctx = _make_ctx(app_mode="focused")
-    assert tui._keymap_panel_size(queue_ctx) < tui._keymap_panel_size(focused_ctx)
+    assert tui._keymap_panel_size(queue_ctx) == tui._keymap_panel_size(focused_ctx)
 
 
 def test_render_producers_status_uses_supervisor():

@@ -341,6 +341,21 @@ def queue_no_tap(ctx: "Context") -> None:
     _skip_current(ctx)
 
 
+def dismiss_current_task(ctx: "Context") -> None:
+    """ACT+NO chord in queue mode: mark current task done.
+
+    Distinct from :func:`queue_no_tap` (which just defers): this is
+    "permanently drop this task" — the user has decided they don't
+    care. Stops any in-flight announcement first so we don't keep
+    speaking about a task we just killed.
+    """
+    if ctx.current_task is None:
+        _speak(ctx, "Nothing active.")
+        return
+    modes.stop_playback(ctx)
+    _drop_current(ctx)
+
+
 # --- consumer / auto-announce thread --------------------------------------
 
 

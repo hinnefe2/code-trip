@@ -221,7 +221,11 @@ def _keymap_panel(ctx: "Context") -> Panel:
             _key("NAV"), " ", _act("→ focused"), sep,
             _key("ACT"), " ", _act("stop audio"),
         )
-        body = Group(solo, nav_chords)
+        act_chords = Text.assemble(
+            Text("ACT+", style="bold magenta"),
+            _key("NO"), " ", _act("dismiss task"),
+        )
+        body = Group(solo, nav_chords, act_chords)
     else:
         solo = Text.assemble(
             _key("PTT"), " ", _act("hold to talk"), sep,
@@ -242,10 +246,11 @@ def _keymap_panel(ctx: "Context") -> Panel:
 def _keymap_panel_size(ctx: "Context") -> int:
     """Total layout rows the macropad panel should reserve.
 
-    Queue mode renders two content rows, focused mode renders three.
-    Add 2 for the panel border.
+    Both modes now render three content rows (solo, NAV+ chord row,
+    and a third row that's either ACT+ Ctrl+U in focused mode or
+    ACT+ dismiss-task in queue mode). Add 2 for the panel border.
     """
-    return 4 if ctx.app_mode == "queue" else 5
+    return 5
 
 
 def _producers_panel(supervisor: "ProducerSupervisor | None") -> Panel:

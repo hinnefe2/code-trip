@@ -625,8 +625,9 @@ def test_tap_act_in_focused_mode_in_other_app_is_silent(monkeypatch):
     assert sent == []
 
 
-def test_chord_act_no_sends_ctrl_u(monkeypatch):
+def test_chord_act_no_in_focused_mode_sends_ctrl_u(monkeypatch):
     ctx = _ctx()
+    ctx.app_mode = "focused"
     sent: list[KeyStroke] = []
     monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
 
@@ -635,6 +636,23 @@ def test_chord_act_no_sends_ctrl_u(monkeypatch):
     stroke = sent[0].chords[0]
     assert stroke.key == "u"
     assert stroke.modifiers == (keyboard.Key.ctrl,)
+
+
+def test_chord_act_no_in_queue_mode_dismisses_task(monkeypatch):
+    """ACT+NO in queue mode dismisses the current task (mark done) —
+    the 'permanent' counterpart to NO-tap's 5-min defer."""
+    from code_trip2 import dispatch
+    ctx = _ctx()
+    ctx.app_mode = "queue"
+    dismissed: list = []
+    monkeypatch.setattr(dispatch, "dismiss_current_task", lambda c: dismissed.append(c))
+    sent: list[KeyStroke] = []
+    monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
+
+    chords.handle_chord(ctx, "act+no")
+
+    assert dismissed == [ctx]
+    assert sent == []  # no Ctrl+U leaking into the focused app
 
 
 def test_tap_unknown_is_noop(monkeypatch):

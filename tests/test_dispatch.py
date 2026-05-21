@@ -162,3 +162,24 @@ def test_queue_no_tap_with_nothing_active_speaks():
     ctx = _make_ctx(app_mode="queue")
     dispatch.queue_no_tap(ctx)
     ctx.tts.speak.assert_called_with("Nothing active.")
+
+
+def test_dismiss_current_task_marks_done_and_stops_playback():
+    """ACT+NO in queue mode: permanently drop the active task and
+    interrupt any in-flight announcement."""
+    ctx = _make_ctx(app_mode="queue")
+    t = ctx.queue.add(Task(headline="annoying msg"))
+    ctx.current_task = t
+    # Simulate active playback.
+    ctx.playback_queue = ["chunk1", "chunk2"]
+    dispatch.dismiss_current_task(ctx)
+    assert ctx.queue.get(t.id).state == "done"
+    assert ctx.current_task is None
+    ctx.tts.stop.assert_called()  # playback interrupted
+    assert ctx.playback_queue == []  # stop_playback clears the queue
+
+
+def test_dismiss_current_task_with_nothing_active_speaks():
+    ctx = _make_ctx(app_mode="queue")
+    dispatch.dismiss_current_task(ctx)
+    ctx.tts.speak.assert_called_with("Nothing active.")

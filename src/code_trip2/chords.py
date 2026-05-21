@@ -90,6 +90,8 @@ TAP_STROKES: dict[str, KeyStroke] = {
 
 
 def handle_chord(ctx: "Context", name: str) -> None:
+    from code_trip2 import dispatch  # local import to avoid cycle
+
     if name == "nav+yes":
         _nav(ctx, forward=True)
     elif name == "nav+no":
@@ -99,7 +101,14 @@ def handle_chord(ctx: "Context", name: str) -> None:
     elif name == "nav+ptt":
         _speak_active_app(ctx)
     elif name == "act+no":
-        _send_stroke(ctx, _ACT_NO_CLEAR_LINE)
+        # ACT+NO is mode-dependent: in queue mode it dismisses the
+        # current task (the "permanent skip" the user reaches for when
+        # NO-tap-as-defer keeps re-surfacing the same message). In
+        # focused mode it stays as Ctrl+U for shell input.
+        if ctx.app_mode == dispatch.MODE_QUEUE:
+            dispatch.dismiss_current_task(ctx)
+        else:
+            _send_stroke(ctx, _ACT_NO_CLEAR_LINE)
     else:
         logger.warning("Unknown chord: %s", name)
 
