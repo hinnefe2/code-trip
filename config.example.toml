@@ -49,3 +49,12 @@ tts_speed = 1.15
 
 [claude]
 wait_timeout = 300.0
+
+[email]
+# Polling cadence for the claude.ai Gmail MCP (seconds).
+poll_interval = 120.0
+# Gmail search query. ``after:<unix_ts>`` is appended automatically; the
+# default "unread inbox, not from me" approximates an action-needed view.
+search_query = "in:inbox -from:me is:unread"
+# Max threads per poll.
+max_results = 20

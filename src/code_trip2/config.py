@@ -60,6 +60,13 @@ class Config:
     # Channel names without the leading #. Resolved to IDs on first poll
     # via slack_search_channels.
     slack_watch_channels: tuple[str, ...] = ()
+    # email (via the claude.ai Gmail MCP — auth piggy-backs on claude CLI)
+    email_poll_interval: float = 120.0
+    # Gmail search syntax. ``after:<unix_ts>`` is appended automatically per
+    # poll. Defaults to "unread inbox, not from me" which approximates an
+    # action-needed view.
+    email_search_query: str = "in:inbox -from:me is:unread"
+    email_max_results: int = 20
     # linear (MCP — server choice TBD, still stubbed)
     linear_mcp_command: str = ""
     linear_mcp_args: tuple[str, ...] = ()
@@ -152,6 +159,14 @@ def load_config(path: Path | str) -> Config:
         kw["slack_watch_channels"] = tuple(
             str(c).lstrip("#") for c in slack_cfg["watch_channels"]
         )
+
+    email_cfg = data.get("email", {})
+    if "poll_interval" in email_cfg:
+        kw["email_poll_interval"] = float(email_cfg["poll_interval"])
+    if "search_query" in email_cfg:
+        kw["email_search_query"] = str(email_cfg["search_query"])
+    if "max_results" in email_cfg:
+        kw["email_max_results"] = int(email_cfg["max_results"])
 
     linear_cfg = data.get("linear", {})
     if "mcp_command" in linear_cfg:

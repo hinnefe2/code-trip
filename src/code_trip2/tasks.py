@@ -215,6 +215,37 @@ class TaskQueue:
             t.state = STATE_DROPPED
             self._fire_locked("drop", t)
 
+    def update_task(
+        self,
+        task_id: str,
+        *,
+        headline: str | None = None,
+        body: str | None = None,
+        source: dict | None = None,
+        created_at: float | None = None,
+    ) -> Task | None:
+        """Mutate fields on an existing task and fire an ``update`` event.
+
+        Used by producers that collapse a stream of messages in the same
+        thread into a single live task (e.g. SlackProducer): when a new
+        message arrives for an already-pending thread task, the producer
+        rewrites the body/headline rather than queueing a duplicate task.
+        """
+        with self._lock:
+            t = self._tasks.get(task_id)
+            if t is None:
+                return None
+            if headline is not None:
+                t.headline = headline
+            if body is not None:
+                t.body = body
+            if source is not None:
+                t.source = source
+            if created_at is not None:
+                t.created_at = created_at
+        self._fire("update", t)
+        return t
+
     def set_state(self, task_id: str, state: str) -> Task | None:
         with self._lock:
             t = self._tasks.get(task_id)

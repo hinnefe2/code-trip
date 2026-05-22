@@ -543,19 +543,53 @@ class SlackProducer:
         ts = msg.get("ts") or ""
         thread_ts = msg.get("thread_ts") or ts
         headline = f"{sender_name}: {text[:60]}"
+        source = {
+            "channel_id": channel_id,
+            "channel_name": channel_name,
+            "ts": ts,
+            "thread_ts": thread_ts,
+            "sender_id": sender_id,
+            "sender_name": sender_name,
+        }
+
+        # Collapse multiple messages in the same thread into a single
+        # pending task: if there's already a pending slack task for this
+        # (channel_id, thread_ts), overwrite its body/headline with the
+        # latest message instead of stacking N tasks for one conversation.
+        # Long threads still surface as one inbox item — the body is just
+        # the most recent message, not the whole transcript.
+        existing = self._find_pending_thread_task(channel_id, thread_ts)
+        if existing is not None:
+            self._queue.update_task(
+                existing.id,
+                headline=headline,
+                body=text,
+                source=source,
+                created_at=time.time(),
+            )
+            return
+
         task = Task(
             kind="slack_msg",
-            topic=f"slack-{channel_name}",
+            topic=channel_name,
             headline=headline,
             body=text,
-            source={
-                "channel_id": channel_id,
-                "channel_name": channel_name,
-                "ts": ts,
-                "thread_ts": thread_ts,
-                "sender_id": sender_id,
-                "sender_name": sender_name,
-            },
+            source=source,
             created_at=time.time(),
         )
         self._queue.add(task)
+
+    def _find_pending_thread_task(self, channel_id: str, thread_ts: str) -> Task | None:
+        """Locate a pending slack task for the same channel + thread."""
+        if not channel_id or not thread_ts:
+            return None
+        for task in self._queue.pending():
+            if task.kind != "slack_msg":
+                continue
+            src = task.source or {}
+            if (
+                src.get("channel_id") == channel_id
+                and src.get("thread_ts") == thread_ts
+            ):
+                return task
+        return None

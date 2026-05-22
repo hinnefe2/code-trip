@@ -137,6 +137,97 @@ class ClaudeMCPClient:
                 ) from parse_exc
             raise
 
+    def run_agent(
+        self,
+        *,
+        prompt: str,
+        timeout: float | None = None,
+        max_budget_usd: float | None = None,
+    ) -> str:
+        """Free-form Claude invocation: no single-tool constraint.
+
+        Used for skill execution where Claude orchestrates multiple MCP
+        tools toward a goal described in the prompt. Claude Code's own
+        skill discovery (``.claude/skills/``) handles matching the
+        user's request to a skill; this method just hands the prompt
+        over and reads back the final assistant text.
+
+        Unlike :meth:`call_tool`, ``--allowedTools`` is omitted so
+        Claude can use any MCP tool its configuration grants it. The
+        ``--permission-mode bypassPermissions`` flag keeps it from
+        prompting interactively. Budget cap defaults higher than
+        :meth:`call_tool` because skill flows tend to make several
+        tool calls.
+        """
+        if not self._available:
+            raise ClaudeMCPError("claude CLI not available")
+
+        budget = max_budget_usd if max_budget_usd is not None else max(self.max_budget_usd, 0.20)
+        deadline = timeout if timeout is not None else max(self.timeout, 120.0)
+        cmd = [
+            self.binary,
+            "--print",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--model",
+            self.model,
+            "--no-session-persistence",
+            "--disable-slash-commands",
+            "--permission-mode",
+            "bypassPermissions",
+            "--max-budget-usd",
+            str(budget),
+        ]
+        try:
+            proc = subprocess.run(
+                cmd,
+                input=prompt,
+                capture_output=True,
+                text=True,
+                timeout=deadline,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ClaudeMCPError(f"claude timed out after {deadline}s") from exc
+        if proc.returncode != 0:
+            raise ClaudeMCPError(
+                f"claude exited {proc.returncode}: "
+                f"{proc.stderr[:500].strip() or '(no stderr)'}"
+            )
+        return self._extract_final_assistant_text(proc.stdout)
+
+    @staticmethod
+    def _extract_final_assistant_text(stdout: str) -> str:
+        """Return the last assistant ``text`` content block from stream-json.
+
+        Skill runs interleave ``tool_use`` and ``tool_result`` blocks
+        with assistant ``text`` blocks; we want the final natural-
+        language summary, which is what the user hears spoken back.
+        """
+        last_text = ""
+        for line in stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            msg = event.get("message")
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("role") != "assistant":
+                continue
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    txt = (block.get("text") or "").strip()
+                    if txt:
+                        last_text = txt
+        return last_text
+
     # ---- internals ------------------------------------------------------
 
     def _format_prompt(self, tool_name: str, args: dict[str, Any]) -> str:

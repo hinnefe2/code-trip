@@ -205,3 +205,27 @@ def test_queue_count_by_kind_only_counts_pending():
     q.mark_done(a.id)
     counts = q.count_by_kind()
     assert counts == {"slack_msg": 1}
+
+
+def test_queue_update_task_mutates_fields_and_fires_event():
+    q = TaskQueue()
+    events: list[tuple[str, str]] = []
+    q.add_listener(lambda kind, t: events.append((kind, t.id)))
+    t = q.add(Task(headline="old", body="old body"))
+    out = q.update_task(
+        t.id,
+        headline="new",
+        body="new body",
+        source={"channel_id": "C1"},
+    )
+    assert out is not None
+    stored = q.get(t.id)
+    assert stored.headline == "new"
+    assert stored.body == "new body"
+    assert stored.source == {"channel_id": "C1"}
+    assert ("update", t.id) in events
+
+
+def test_queue_update_task_unknown_id_returns_none():
+    q = TaskQueue()
+    assert q.update_task("nope", headline="x") is None

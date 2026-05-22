@@ -10,7 +10,8 @@ Concrete producers live in sibling modules:
 
 - :mod:`code_trip2.producers.claude`  — watches the Stop-hook event dir
 - :mod:`code_trip2.producers.manual`  — voice-triggered manual adds
-- :mod:`code_trip2.producers.slack`   — Slack MCP (stub)
+- :mod:`code_trip2.producers.slack`   — Slack mention search + watched channels via claude.ai MCP
+- :mod:`code_trip2.producers.email`   — Gmail inbox poller via claude.ai MCP
 - :mod:`code_trip2.producers.linear`  — Linear MCP (stub)
 """
 

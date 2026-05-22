@@ -21,6 +21,7 @@ The consumer wakes on any queue mutation and on a short timer (for
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import threading
@@ -71,6 +72,82 @@ def handle_voice(ctx: "Context", transcript: str) -> None:
         _handle_queue_voice(ctx, t)
     else:
         modes.handle_voice(ctx, t)
+
+
+def handle_skill(ctx: "Context", transcript: str) -> None:
+    """ACT+PTT path: hand the transcript + task context to Claude.
+
+    The keypress (ACT held during PTT) flags the recording as a skill
+    invocation. We ship the transcript, the active task's source data,
+    and a brief preamble to ``claude --print``. Claude Code's own skill
+    discovery (project ``.claude/skills/``) matches the user's request
+    to a skill and runs it.
+
+    Requires an active task — the whole point is to act on it. If
+    nothing is active, we just say so.
+    """
+    t = transcript.strip()
+    if not t:
+        return
+    task = ctx.current_task
+    if task is None:
+        _speak(ctx, "Nothing active to act on.")
+        return
+    mcp = ctx.agent_mcp
+    if mcp is None or not getattr(mcp, "enabled", False):
+        _speak(ctx, "Agent MCP is not configured.")
+        return
+    prompt = _build_skill_prompt(task, t)
+    logger.info("Skill mode: invoking agent for task %s", task.id)
+    ctx.thinking.start()
+    try:
+        try:
+            summary = mcp.run_agent(prompt=prompt)
+        except Exception as exc:
+            logger.exception("Skill invocation failed")
+            _speak(ctx, f"Skill failed: {exc}")
+            return
+    finally:
+        ctx.thinking.stop()
+    ctx.queue.mark_done(task.id)
+    ctx.current_task = None
+    ctx.log.event(
+        "queue_turn",
+        task_id=task.id,
+        kind=task.kind,
+        topic=task.topic,
+        skill_transcript=t,
+        skill_summary=summary,
+    )
+    _speak(ctx, summary or "Done.")
+
+
+def _build_skill_prompt(task: Task, transcript: str) -> str:
+    """Build the prompt for an ACT+PTT skill invocation.
+
+    Hands Claude the task context plus the user's brief instruction.
+    Claude Code's skill discovery picks the matching skill from
+    ``.claude/skills/`` based on the skill descriptions.
+    """
+    try:
+        source_json = json.dumps(task.source, default=str)
+    except (TypeError, ValueError):
+        source_json = "{}"
+    return (
+        "You are completing a task inside a voice-driven inbox "
+        "orchestrator. The user just spoke a brief instruction. Use "
+        "the appropriate skill from `.claude/skills/` (and the MCP "
+        "tools it references) to do what they asked. Don't ask for "
+        "confirmation; act and report back in one sentence.\n"
+        "\n"
+        f"Task kind: {task.kind}\n"
+        f"Task topic: {task.topic}\n"
+        f"Task source: {source_json}\n"
+        f"Task headline: {task.headline}\n"
+        f"Task body:\n{task.body or '(empty)'}\n"
+        "\n"
+        f'User said: "{transcript}"'
+    )
 
 
 # --- queue-mode voice handlers --------------------------------------------
@@ -247,6 +324,9 @@ def _kind_label(task: Task) -> str:
         return f"Claude in {task.topic} replied"
     if task.kind == "slack_msg":
         return f"Slack in {task.topic}"
+    if task.kind == "email_msg":
+        sender = task.source.get("sender_name") or task.source.get("sender_email") or ""
+        return f"Email from {sender}" if sender else "Email"
     if task.kind == "note":
         return "Note"
     if task.kind == "web":
@@ -264,6 +344,9 @@ def _dispatch_task_response(ctx: "Context", task: Task, transcript: str) -> None
         return
     if task.kind == "slack_msg":
         _respond_slack(ctx, task, transcript)
+        return
+    if task.kind == "email_msg":
+        _respond_email(ctx, task, transcript)
         return
     _speak(ctx, "No response action for this task.")
 
@@ -284,6 +367,46 @@ def _respond_claude(ctx: "Context", task: Task, transcript: str) -> None:
         "queue_turn", task_id=task.id, kind=task.kind, topic=task.topic, sent=transcript
     )
     _speak(ctx, "Sent.")
+
+
+def _respond_email(ctx: "Context", task: Task, transcript: str) -> None:
+    """Draft a reply to the source email via the Gmail MCP.
+
+    The claude.ai Gmail MCP has no send tool — only ``create_draft``. We
+    don't actually send: the user reviews the draft from Gmail and sends
+    it themselves. That's the safer default for voice anyway.
+    """
+    mcp = ctx.email_mcp
+    if mcp is None:
+        _speak(ctx, "Gmail MCP is not configured.")
+        return
+    to_addr = task.source.get("sender_email") or ""
+    msg_id = task.source.get("message_id") or ""
+    subject = task.source.get("subject") or ""
+    if not to_addr:
+        _speak(ctx, "Missing sender email for this task.")
+        return
+    if not subject.lower().startswith("re:"):
+        subject = f"Re: {subject}" if subject else "Re:"
+    args: dict = {"to": [to_addr], "subject": subject, "body": transcript}
+    if msg_id:
+        args["replyToMessageId"] = msg_id
+    try:
+        mcp.call_tool("create_draft", args)
+    except Exception as exc:
+        logger.exception("Email draft failed")
+        _speak(ctx, f"Could not draft email: {exc}")
+        return
+    ctx.queue.mark_done(task.id)
+    ctx.current_task = None
+    ctx.log.event(
+        "queue_turn",
+        task_id=task.id,
+        kind=task.kind,
+        topic=task.topic,
+        sent=transcript,
+    )
+    _speak(ctx, "Drafted.")
 
 
 def _respond_slack(ctx: "Context", task: Task, transcript: str) -> None:
@@ -349,6 +472,10 @@ def dismiss_current_task(ctx: "Context") -> None:
     care. Stops any in-flight announcement first so we don't keep
     speaking about a task we just killed.
     """
+    logger.info(
+        "dismiss_current_task: current_task=%s",
+        ctx.current_task.id if ctx.current_task else None,
+    )
     if ctx.current_task is None:
         _speak(ctx, "Nothing active.")
         return

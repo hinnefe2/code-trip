@@ -105,6 +105,7 @@ def handle_chord(ctx: "Context", name: str) -> None:
         # current task (the "permanent skip" the user reaches for when
         # NO-tap-as-defer keeps re-surfacing the same message). In
         # focused mode it stays as Ctrl+U for shell input.
+        logger.info("Chord act+no fired in app_mode=%r", ctx.app_mode)
         if ctx.app_mode == dispatch.MODE_QUEUE:
             dispatch.dismiss_current_task(ctx)
         else:

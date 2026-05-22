@@ -218,6 +218,25 @@ def test_act_plus_no_fires_chord(monkeypatch):
     assert rec.taps == []
 
 
+def test_act_plus_ptt_sets_skill_mode_flag_and_records(monkeypatch):
+    """ACT+PTT records (not a chord); the skill_mode flag is set so the
+    transcript gets routed to the agent path on release."""
+    pad, rec, start, _finish = _make(monkeypatch)
+    pad._on_press(keyboard.Key.f14)  # ACT down
+    pad._on_press(keyboard.Key.f13)  # PTT under ACT — starts a skill-mode recording
+    start.assert_called_once()
+    assert pad._skill_mode is True
+    # No chord fires — ACT+PTT is a modifier on a recording, not a one-shot chord.
+    assert rec.chords == []
+
+
+def test_ptt_alone_does_not_set_skill_mode(monkeypatch):
+    pad, _rec, start, _finish = _make(monkeypatch)
+    pad._on_press(keyboard.Key.f13)
+    start.assert_called_once()
+    assert pad._skill_mode is False
+
+
 def test_act_plus_yes_is_noop(monkeypatch):
     pad, rec, *_ = _make(monkeypatch)
     pad._on_press(keyboard.Key.f14)  # ACT

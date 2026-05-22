@@ -6,7 +6,7 @@ You're picking up work on the **`task-queue`** branch of [code-trip](../README.m
 
 Replacing the original five-mode FSM (`IDLE` / `DICTATE` / `WORK` / `NAVIGATING` / `LINEAR` / `SLACK`) with a **task-queue** interaction model. The user no longer cycles between modes to "go check Slack" or "talk to Claude." Instead:
 
-- **Producers** (background threads) push tasks into a queue: Slack @-mentions, Claude Stop-hook events from a remote tmux session, manual voice notes.
+- **Producers** (background threads) push tasks into a queue: Slack @-mentions, Gmail inbox, Claude Stop-hook events from a remote tmux session, manual voice notes.
 - A **consumer thread** auto-announces the highest-scoring pending task whenever the user is idle in queue mode.
 - The user **engages** via voice (PTT) or macropad chord on the announced task.
 - The mental model: an old paper inbox. Take the top item, deal with it, take the next.
@@ -28,11 +28,12 @@ Physical layout (left to right): **PTT · YES · NO · ACT · NAV**
 
 | Key | Queue mode (solo tap) | Focused mode (solo tap) |
 |---|---|---|
-| PTT (hold) | Record audio for STT | Same |
+| PTT (hold) | Record audio for STT — transcript routes to source reply (slack reply, email draft, claude reply) | Same |
 | YES | Accept / expand current task (or pull next if idle) | `Enter` into focused app |
 | NO | Skip current task (5-min defer) | `Esc` into focused app |
 | NAV | → flip to focused mode | → flip to queue mode |
 | ACT | Stop audio (if playing); else no-op | Stop audio; else per-app handler (open URL in tmux, ⌘T in Chrome) |
+| ACT+PTT (hold both) | Skill mode — transcript + active task context ships to `claude --print`; Claude Code picks the matching skill from `.claude/skills/` | Same |
 
 Chords (mostly mode-independent):
 
@@ -54,6 +55,7 @@ producers (threads)         queue              consumer / dispatch
 state on disk: ~/.code-trip/queue/queue-YYYY-MM-DD.jsonl
                               /scoring-YYYY-MM-DD.jsonl
                               /slack-state.json
+                              /email-state.json
                               /logs/orchestrator.log
 ```
 
@@ -74,16 +76,23 @@ Topic-affinity scoring lives in `tasks.score()`. The consumer wakes on queue mut
 - **`producers/`**
   - `__init__.py` — `Producer` protocol + `ProducerSupervisor`.
   - `claude.py` — watches `/tmp/claude-events/*.json` over SSH for stop-hook events from the remote tmux.
-  - `slack.py` — via `claude.ai Slack` MCP (see below). Mention search + watched-channel polling.
+  - `slack.py` — via `claude.ai Slack` MCP (see below). Mention search + watched-channel polling. Topic = raw channel name (no `slack-` prefix). New messages in an existing thread *update* the live task rather than queue a duplicate.
+  - `email.py` — via `claude.ai Gmail` MCP. Polls `search_threads` with the configured query + `after:<unix_ts>` cursor. One pending task per thread (same dedup model as Slack). Reply path creates a *draft* via `create_draft` — the claude.ai Gmail MCP has no send tool, and draft-only is safer for voice anyway.
   - `claude_mcp.py` — wrapper around `claude --print` for invoking MCP tools. Parses the `tool_result` block out of stream-json output; ignores LLM prose. The whole "MCP proxy via Claude CLI" mechanism lives here.
   - `manual.py` — voice-driven manual task add (a no-op start/stop; logic is in dispatch).
   - `linear.py` — stub.
-- **`slack_state.py`** — per-channel `last_ts` cursors persisted as JSON.
+- **`slack_state.py`** / **`email_state.py`** — per-producer cursors persisted as JSON.
 - **`tui.py`** — Rich live dashboard (`--tui` flag). Also: TUI-host detection + keystroke suppression so synthesized Enter/Esc/Down doesn't scroll the alternate-screen buffer.
 - **`remote.py`** — SSH + tmux helpers (`send-keys`, `capture-pane`, `wait_done`).
 - **`window.py`** — macOS-only: active-app, app activation, keystroke synthesis.
 
 `docs/task-queue-design.md` is the source-of-truth design doc. Most non-obvious architectural calls are explained there with rationale.
+
+## Skill-based task completion
+
+ACT+PTT routes a transcript through Claude instead of through the per-kind reply path. Used for actions like "accept and archive" on a calendar-invite email — Claude reads the task context, picks a matching skill from `.claude/skills/<name>/SKILL.md` (project-scoped, **not** `~/.claude/skills`), and executes via the MCP tools the skill references. On success the task is marked done and the orchestrator speaks Claude's one-sentence summary.
+
+The orchestrator doesn't have a skill registry — skill discovery and matching happen entirely on the Claude side via its own `.claude/skills/` mechanism. To add a new completion action, just drop another `SKILL.md` in `.claude/skills/<name>/` and write its `description` so Claude can route to it. See `.claude/skills/accept-invite/SKILL.md` for the template.
 
 ## Important design decisions (and the *why* behind them)
 
@@ -101,9 +110,9 @@ Topic-affinity scoring lives in `tasks.score()`. The consumer wakes on queue mut
 
 ## Current state at a glance
 
-- **Working**: Task queue + scoring + persistence; mode flip; TUI dashboard with mode-aware keymap; Slack producer (@-mentions across all channels + per-channel polling for "watched" channels); Claude Stop-hook producer over SSH to a remote tmux; manual voice-add; summarizer LLM; persistent-stream TTS playback.
+- **Working**: Task queue + scoring + persistence; mode flip; TUI dashboard with mode-aware keymap; Slack producer (@-mentions across all channels + per-channel polling for "watched" channels); Gmail producer (configurable Gmail-syntax search, draft-only reply); Claude Stop-hook producer over SSH to a remote tmux; manual voice-add; summarizer LLM; persistent-stream TTS playback. Slack + Gmail both collapse a stream of in-thread messages into one live task.
 - **Stubbed**: Linear producer (no MCP wiring).
-- **Known gaps**: DMs that don't @-mention the user aren't surfaced (claude.ai Slack MCP doesn't expose a clean "all DMs since X"). Slack reply via voice works but without LLM body-shaping (you reply with literal STT text).
+- **Known gaps**: DMs that don't @-mention the user aren't surfaced (claude.ai Slack MCP doesn't expose a clean "all DMs since X"). Slack/email reply via voice works but without LLM body-shaping (you reply with literal STT text). Gmail send goes through `create_draft` — the user has to open Gmail to actually send.
 
 ## Run / test / debug
 
@@ -120,7 +129,8 @@ source venv-codetrip/bin/activate
 python -m pytest \
   tests/test_tasks.py tests/test_queue_log.py tests/test_dispatch.py \
   tests/test_summarizer.py tests/test_modes.py tests/test_macropad.py \
-  tests/test_tui.py tests/test_tts_client.py tests/test_slack.py
+  tests/test_tui.py tests/test_tts_client.py tests/test_slack.py \
+  tests/test_email.py
 ```
 
 **Do NOT run `pytest tests/` whole-directory** — there are several stale test files (`test_audio_recorder.py`, `test_browse.py`, `test_intent_classifier.py`, `test_keypad.py`, `test_mode_fsm.py`, `test_orchestrator.py`, `test_push_to_talk.py`, `test_remote_tmux.py`, `test_review.py`, `test_ship.py`, `test_stt_client.py`, `test_summarizer.py`'s old version, `test_work.py`) that import from the defunct `code_trip` package (note no `2`) and error on collection.
@@ -133,6 +143,7 @@ When the user wants a "clean slate" they may delete one or more of:
 
 - `~/.code-trip/queue/queue-*.jsonl` — clears the persisted task queue
 - `~/.code-trip/slack-state.json` — clears the Slack mention/channel cursors (next poll re-pulls from 5pm of the most recent weekday)
+- `~/.code-trip/email-state.json` — clears the Gmail cursor (next poll re-pulls from 5pm of the most recent weekday)
 - `~/.code-trip/logs/orchestrator.log` — clears the log
 
 These are independent; a fresh queue without resetting the Slack cursor means "I cleared my queue but new Slack messages won't backfill."

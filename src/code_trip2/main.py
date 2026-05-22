@@ -12,11 +12,13 @@ from pathlib import Path
 from code_trip2 import earcon
 from code_trip2.chords import handle_chord, handle_tap
 from code_trip2.config import Config, load_config
-from code_trip2.dispatch import QueueConsumer, handle_voice
+from code_trip2.dispatch import QueueConsumer, handle_skill, handle_voice
 from code_trip2.macropad import Macropad, resolve_key
 from code_trip2.modes import Context, stop_playback
 from code_trip2.producers import ProducerSupervisor
+from code_trip2.email_state import EmailState
 from code_trip2.producers.claude import ClaudeProducer
+from code_trip2.producers.email import EmailProducer
 from code_trip2.producers.linear import LinearProducer
 from code_trip2.producers.manual import ManualProducer
 from code_trip2.producers.slack import SlackProducer
@@ -87,6 +89,15 @@ def run(config: Config, *, tui: bool = False) -> None:
             "Slack MCP via claude CLI not available; Slack producer will "
             "stay idle. Install claude CLI to enable."
         )
+    email_mcp = ClaudeMCPClient(server_id="claude_ai_Gmail")
+    if not email_mcp.enabled:
+        logger.info(
+            "Gmail MCP via claude CLI not available; Email producer will "
+            "stay idle. Install claude CLI to enable."
+        )
+    # Free-form skill invocation (ACT+PTT). server_id is unused — run_agent
+    # doesn't restrict to a single tool.
+    agent_mcp = ClaudeMCPClient(server_id="agent")
 
     ctx = Context(
         config=config,
@@ -98,6 +109,8 @@ def run(config: Config, *, tui: bool = False) -> None:
         summarizer=summarizer,
         tui_host_app=tui_host_app,
         slack_mcp=slack_mcp,
+        email_mcp=email_mcp,
+        agent_mcp=agent_mcp,
         app_mode=config.startup_mode if config.startup_mode in ("queue", "focused") else "focused",
     )
 
@@ -105,6 +118,7 @@ def run(config: Config, *, tui: bool = False) -> None:
     supervisor = ProducerSupervisor()
     supervisor.add(ClaudeProducer(config=config, queue=queue, summarizer=summarizer))
     supervisor.add(SlackProducer(config=config, queue=queue, mcp=slack_mcp, state=SlackState()))
+    supervisor.add(EmailProducer(config=config, queue=queue, mcp=email_mcp, state=EmailState()))
     supervisor.add(LinearProducer(config=config, queue=queue))
     supervisor.add(ManualProducer())
 
@@ -113,7 +127,7 @@ def run(config: Config, *, tui: bool = False) -> None:
 
     shutdown = threading.Event()
 
-    def _process_audio(path: Path) -> None:
+    def _process_audio(path: Path, skill_mode: bool) -> None:
         if stt is None:
             logger.warning("on_audio fired in non-openai STT mode; ignoring %s", path)
             return
@@ -127,13 +141,18 @@ def run(config: Config, *, tui: bool = False) -> None:
             except Exception:
                 pass
             return
-        logger.info("Transcribed: %s", transcript)
-        handle_voice(ctx, transcript)
+        logger.info("Transcribed (skill_mode=%s): %s", skill_mode, transcript)
+        if skill_mode:
+            handle_skill(ctx, transcript)
+        else:
+            handle_voice(ctx, transcript)
 
-    def on_audio(path: Path) -> None:
+    def on_audio(path: Path, *, skill_mode: bool = False) -> None:
         # Run STT + dispatch off the macropad listener thread so taps stay
         # responsive while a turn is in flight (wait_done can take 5–15s).
-        threading.Thread(target=_process_audio, args=(path,), daemon=True).start()
+        threading.Thread(
+            target=_process_audio, args=(path, skill_mode), daemon=True
+        ).start()
 
     def on_ptt_press() -> None:
         # PTT-press while Claude is speaking should stop playback so the

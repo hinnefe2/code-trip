@@ -81,6 +81,14 @@ class Context:
     # if the claude CLI is available. dispatch._respond_slack uses it to
     # thread-reply to active slack_msg tasks.
     slack_mcp: object | None = None
+    # ClaudeMCPClient pointing at the claude.ai Gmail MCP. Used by
+    # dispatch._respond_email to draft a reply to an email_msg task.
+    email_mcp: object | None = None
+    # ClaudeMCPClient used for free-form skill invocation (ACT+PTT).
+    # No fixed server_id — claude.ai's skill discovery loads the
+    # matching skill from ``.claude/skills/`` and uses whatever MCP
+    # tools that skill needs.
+    agent_mcp: object | None = None
 
     def __post_init__(self) -> None:
         if not self.active_window:

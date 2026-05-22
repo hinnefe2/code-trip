@@ -183,3 +183,62 @@ def test_dismiss_current_task_with_nothing_active_speaks():
     ctx = _make_ctx(app_mode="queue")
     dispatch.dismiss_current_task(ctx)
     ctx.tts.speak.assert_called_with("Nothing active.")
+
+
+# --- handle_skill (ACT+PTT) ------------------------------------------------
+
+
+def test_handle_skill_invokes_agent_and_marks_task_done():
+    ctx = _make_ctx(app_mode="queue")
+    mcp = MagicMock()
+    mcp.enabled = True
+    mcp.run_agent.return_value = "Accepted 'Lunch' and archived the email."
+    ctx.agent_mcp = mcp
+    t = ctx.queue.add(Task(
+        kind="email_msg",
+        topic="alice",
+        headline="Calendar invite",
+        body="Please join...",
+        source={"thread_id": "T1", "message_id": "M1", "subject": "Lunch"},
+    ))
+    ctx.current_task = t
+    dispatch.handle_skill(ctx, "accept and archive")
+    mcp.run_agent.assert_called_once()
+    prompt = mcp.run_agent.call_args.kwargs["prompt"]
+    assert "accept and archive" in prompt
+    assert "T1" in prompt  # thread_id baked into the prompt
+    assert "email_msg" in prompt
+    assert ctx.queue.get(t.id).state == "done"
+    assert ctx.current_task is None
+    ctx.tts.speak.assert_called_with("Accepted 'Lunch' and archived the email.")
+
+
+def test_handle_skill_with_no_active_task_speaks():
+    ctx = _make_ctx(app_mode="queue")
+    ctx.agent_mcp = MagicMock(enabled=True)
+    dispatch.handle_skill(ctx, "do something")
+    ctx.tts.speak.assert_called_with("Nothing active to act on.")
+    ctx.agent_mcp.run_agent.assert_not_called()
+
+
+def test_handle_skill_without_agent_mcp_speaks_error():
+    ctx = _make_ctx(app_mode="queue")
+    ctx.agent_mcp = None
+    t = ctx.queue.add(Task(headline="x"))
+    ctx.current_task = t
+    dispatch.handle_skill(ctx, "do something")
+    ctx.tts.speak.assert_called_with("Agent MCP is not configured.")
+    assert ctx.queue.get(t.id).state != "done"
+
+
+def test_handle_skill_agent_error_keeps_task_active():
+    ctx = _make_ctx(app_mode="queue")
+    mcp = MagicMock()
+    mcp.enabled = True
+    mcp.run_agent.side_effect = RuntimeError("budget exceeded")
+    ctx.agent_mcp = mcp
+    t = ctx.queue.add(Task(kind="email_msg", source={"thread_id": "T1"}))
+    ctx.current_task = t
+    dispatch.handle_skill(ctx, "accept invite")
+    assert ctx.queue.get(t.id).state != "done"
+    assert ctx.current_task is t

@@ -385,7 +385,7 @@ def test_producer_poll_emits_tasks_from_detailed_markdown(tmp_path: Path):
     assert len(tasks) == 2
     by_ts = {t.source["ts"]: t for t in tasks}
     t1 = by_ts["1716000001.000000"]
-    assert t1.topic == "slack-random"
+    assert t1.topic == "random"
     assert "Alice" in t1.headline
     assert "deploy" in t1.body
     assert t1.source["channel_id"] == "CRAND"
@@ -543,7 +543,7 @@ def test_poll_watched_channel_emits_every_message_including_bots(tmp_path: Path)
     bot_task = by_ts["1716000002.000000"]
     assert "Linear" in bot_task.headline
     assert bot_task.source["channel_id"] == "C0TEAMAI"
-    assert bot_task.topic == "slack-team-ai"
+    assert bot_task.topic == "team-ai"
     human = by_ts["1716000001.000000"]
     assert "Alice" in human.headline
     assert "morning team" in human.body
@@ -837,3 +837,85 @@ def test_dispatch_task_response_routes_slack_kind():
     ctx.current_task = task
     dispatch._dispatch_task_response(ctx, task, "responding now")
     mcp.call_tool.assert_called_once()
+
+
+# --- thread dedup --------------------------------------------------------
+
+
+def _thread_fixture(thread_ts: str, msg_ts: str, body: str, sender: str = "Alice") -> str:
+    return (
+        f"### Result 1 of 1\n"
+        f"Channel: #ai-tools (ID: CTHREAD)\n"
+        f"From: {sender} (ID: U{sender.upper()}) \n"
+        f"Message_ts: {msg_ts}\n"
+        f"Permalink: [link](https://x.slack.com/archives/CTHREAD/p{msg_ts.replace('.','')}"
+        f"?thread_ts={thread_ts}&cid=CTHREAD)\n"
+        f"Text: \n"
+        f"{body}\n\n"
+        f"---\n\n"
+    )
+
+
+def test_producer_collapses_thread_replies_into_single_task(tmp_path: Path):
+    """Two messages in the same thread should produce ONE pending task
+    (the second message updates the first), not two — long Slack threads
+    shouldn't pile up dozens of inbox items."""
+    p, q, mcp, _state = _producer(tmp_path)
+    p._user_id = "UME"
+
+    # First poll: an initial message in a thread.
+    mcp.call_tool.return_value = {
+        "results": _thread_fixture("1716000100.000000", "1716000100.000000", "first message")
+    }
+    p._poll_once()
+    assert len(q.all()) == 1
+    first = q.all()[0]
+    assert "first message" in first.body
+
+    # Second poll: a follow-up in the same thread (different msg_ts, same thread_ts).
+    mcp.call_tool.return_value = {
+        "results": _thread_fixture("1716000100.000000", "1716000200.000000", "follow-up message", sender="Bob")
+    }
+    p._poll_once()
+
+    pending = q.pending()
+    assert len(pending) == 1, "thread reply should update the existing task, not stack"
+    assert pending[0].id == first.id
+    assert "follow-up message" in pending[0].body
+    assert "Bob" in pending[0].headline
+
+
+def test_producer_separate_threads_get_separate_tasks(tmp_path: Path):
+    """Two messages with different thread_ts produce two tasks."""
+    p, q, mcp, _state = _producer(tmp_path)
+    p._user_id = "UME"
+    mcp.call_tool.return_value = {
+        "results": (
+            _thread_fixture("1716000300.000000", "1716000300.000000", "thread one")
+            + _thread_fixture("1716000400.000000", "1716000400.000000", "thread two", sender="Charlie")
+        )
+    }
+    p._poll_once()
+    assert len(q.pending()) == 2
+
+
+def test_producer_does_not_collapse_into_done_threads(tmp_path: Path):
+    """If the user has already dismissed (marked done) a thread task,
+    a new message in the same thread should create a fresh task — not
+    silently update the dismissed one."""
+    p, q, mcp, _state = _producer(tmp_path)
+    p._user_id = "UME"
+    mcp.call_tool.return_value = {
+        "results": _thread_fixture("1716000500.000000", "1716000500.000000", "first")
+    }
+    p._poll_once()
+    [first] = q.all()
+    q.mark_done(first.id)
+
+    mcp.call_tool.return_value = {
+        "results": _thread_fixture("1716000500.000000", "1716000600.000000", "follow-up after dismiss")
+    }
+    p._poll_once()
+    pending = q.pending()
+    assert len(pending) == 1
+    assert pending[0].id != first.id

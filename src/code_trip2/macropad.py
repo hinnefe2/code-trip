@@ -71,7 +71,7 @@ def resolve_key(name: str) -> keyboard.Key | keyboard.KeyCode:
 @dataclass
 class Macropad:
     keymap: dict[str, keyboard.Key | keyboard.KeyCode]
-    on_audio: Callable[[Path], None]
+    on_audio: Callable[..., None]  # (path, *, skill_mode: bool)
     on_chord: Callable[[str], None]
     on_tap: Callable[[str], None] | None = None
     on_ptt_press: Callable[[], None] | None = None
@@ -91,6 +91,11 @@ class Macropad:
     _held: set[str] = field(default_factory=set, init=False, repr=False)
     _nav_chorded: bool = field(default=False, init=False, repr=False)
     _act_chorded: bool = field(default=False, init=False, repr=False)
+    # ACT+PTT (ACT held when PTT pressed) flags the current recording as
+    # "skill mode" — the transcript gets routed to a free-form Claude
+    # invocation against the active task instead of the per-kind reply
+    # path. Cleared each time recording finishes.
+    _skill_mode: bool = field(default=False, init=False, repr=False)
     _suppress_vks: set[int] = field(default_factory=set, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -166,6 +171,11 @@ class Macropad:
             if nav_modifier:
                 self._fire_chord("nav+ptt")
             else:
+                # ACT held during PTT = skill mode (the transcript will
+                # be routed to a free-form Claude call instead of a
+                # source reply). NAV+PTT is a chord (handled above) and
+                # doesn't record; ACT+PTT is a modifier on a recording.
+                self._skill_mode = "act" in self._held
                 if self.on_ptt_press is not None:
                     try:
                         self.on_ptt_press()
@@ -235,6 +245,8 @@ class Macropad:
             self._recording = False
             frames = self._frames
             self._frames = []
+            skill_mode = self._skill_mode
+            self._skill_mode = False
 
         audio = np.concatenate(frames) if frames else np.empty(0, dtype="int16")
         min_samples = int(MIN_RECORDING_SECONDS * self.sample_rate)
@@ -253,7 +265,7 @@ class Macropad:
             wf.setframerate(self.sample_rate)
             wf.writeframes(audio.tobytes())
         try:
-            self.on_audio(path)
+            self.on_audio(path, skill_mode=skill_mode)
         except Exception:
             logger.exception("on_audio callback failed")
 
