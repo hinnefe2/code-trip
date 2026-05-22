@@ -184,73 +184,82 @@ def _topics_panel(ctx: "Context") -> Panel:
 
 
 def _keymap_panel(ctx: "Context") -> Panel:
-    """Mode-aware macropad reference.
+    """Mode-aware macropad reference, rendered as a grid.
 
-    Each mode renders only the keys/chords that are useful in that
-    mode's workflow:
+    Columns are the five physical keys; rows are the chord prefixes
+    (none / NAV / ACT). Each cell shows what that key does under that
+    prefix, or "—" when the combination is unbound (or is itself the
+    held modifier).
 
-    - **Queue mode** (away from screen, audio-driven): solo taps drive
-      the queue, NAV-tap advances playback. NAV-modifier chords still
-      shown because the user often glances at the laptop to switch
-      apps. ``ACT+NO`` (Ctrl+U) is omitted — it's purely a shell-input
-      affordance.
-    - **Focused mode** (at the screen): solo taps are keyboard-style
-      (Enter / Esc), NAV-tap does per-app navigation, and the full
-      set of chords (including ``ACT+NO`` Ctrl+U) is shown.
+    - **Queue mode** (away from screen, audio-driven): solo YES/NO
+      drive the queue, ACT stops audio, NAV flips back to focused.
+      ``ACT+NO`` dismisses the current task. ``ACT+NO`` Ctrl+U is
+      omitted — it's purely a shell-input affordance.
+    - **Focused mode** (at the screen): solo YES/NO synthesize
+      Enter/Esc, ACT does per-app navigation, NAV flips to queue.
+      ``ACT+NO`` is the Ctrl+U "clear line" binding.
     """
-    def _key(name: str) -> Text:
-        return Text(name, style="bold cyan")
-
-    def _act(text: str) -> Text:
-        return Text(text, style="white")
-
-    sep = Text("   ")
-    nav_chords = Text.assemble(
-        Text("NAV+", style="bold magenta"),
-        _key("PTT"), " ", _act("speak app"), sep,
-        _key("YES"), " ", _act("next"), sep,
-        _key("NO"), " ", _act("prev"), sep,
-        _key("ACT"), " ", _act("cycle app"),
-    )
-
     if ctx.app_mode == "queue":
-        solo = Text.assemble(
-            _key("PTT"), " ", _act("hold to talk"), sep,
-            _key("YES"), " ", _act("accept / expand"), sep,
-            _key("NO"), " ", _act("skip task"), sep,
-            _key("NAV"), " ", _act("→ focused"), sep,
-            _key("ACT"), " ", _act("stop audio"),
-        )
-        act_chords = Text.assemble(
-            Text("ACT+", style="bold magenta"),
-            _key("NO"), " ", _act("dismiss task"),
-        )
-        body = Group(solo, nav_chords, act_chords)
+        bindings: dict[tuple[str | None, str], str] = {
+            (None, "TALK"): "hold to talk",
+            (None, "YES"): "accept / expand",
+            (None, "NO"): "skip task",
+            (None, "NAV"): "→ focused",
+            (None, "ACT"): "stop audio",
+            ("NAV", "TALK"): "speak app",
+            ("NAV", "YES"): "next",
+            ("NAV", "NO"): "prev",
+            ("NAV", "ACT"): "cycle app",
+            ("ACT", "NO"): "dismiss task",
+        }
     else:
-        solo = Text.assemble(
-            _key("PTT"), " ", _act("hold to talk"), sep,
-            _key("YES"), " ", _act("Enter"), sep,
-            _key("NO"), " ", _act("Esc"), sep,
-            _key("NAV"), " ", _act("→ queue"), sep,
-            _key("ACT"), " ", _act("per-app"),
-        )
-        act_chords = Text.assemble(
-            Text("ACT+", style="bold magenta"),
-            _key("NO"), " ", _act("Ctrl+U (clear line)"),
-        )
-        body = Group(solo, nav_chords, act_chords)
+        bindings = {
+            (None, "TALK"): "hold to talk",
+            (None, "YES"): "Enter",
+            (None, "NO"): "Esc",
+            (None, "NAV"): "→ queue",
+            (None, "ACT"): "per-app",
+            ("NAV", "TALK"): "speak app",
+            ("NAV", "YES"): "next",
+            ("NAV", "NO"): "prev",
+            ("NAV", "ACT"): "cycle app",
+            ("ACT", "NO"): "Ctrl+U (clear line)",
+        }
 
-    return Panel(body, title="Macropad", border_style="bright_black")
+    columns = ("NAV", "ACT", "NO", "YES", "TALK")
+    rows: tuple[str | None, ...] = (None, "NAV", "ACT")
+
+    table = Table.grid(expand=True, padding=(0, 1))
+    table.add_column(width=5, no_wrap=True)
+    for _ in columns:
+        table.add_column(justify="center", overflow="fold", ratio=1)
+
+    header = [Text("")]
+    for col in columns:
+        header.append(Text(col, style="bold cyan"))
+    table.add_row(*header)
+
+    for prefix in rows:
+        label = Text("") if prefix is None else Text(f"{prefix}+", style="bold magenta")
+        cells: list[Text] = [label]
+        for col in columns:
+            action = bindings.get((prefix, col))
+            if action is None:
+                cells.append(Text("—", style="dim"))
+            else:
+                cells.append(Text(action, style="white"))
+        table.add_row(*cells)
+
+    return Panel(table, title="Macropad", border_style="bright_black")
 
 
 def _keymap_panel_size(ctx: "Context") -> int:
     """Total layout rows the macropad panel should reserve.
 
-    Both modes now render three content rows (solo, NAV+ chord row,
-    and a third row that's either ACT+ Ctrl+U in focused mode or
-    ACT+ dismiss-task in queue mode). Add 2 for the panel border.
+    Grid has a header row plus three prefix rows (none / NAV+ / ACT+),
+    so 4 content rows plus 2 for the panel border.
     """
-    return 5
+    return 6
 
 
 def _producers_panel(supervisor: "ProducerSupervisor | None") -> Panel:
