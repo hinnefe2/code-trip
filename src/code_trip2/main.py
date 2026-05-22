@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
+import queue as queue_lib
+import select
 import signal
 import sys
 import threading
+import time
 from pathlib import Path
 
 from code_trip2 import earcon
@@ -172,6 +176,99 @@ def run(config: Config, *, tui: bool = False) -> None:
             target=_process_audio, args=(path, skill_mode), daemon=True
         ).start()
 
+    # --- local-STT (Superwhisper / clipboard-paste) integration ----------
+    #
+    # In local STT mode the macropad presses ``ptt_forward_key`` while PTT
+    # is held; the external STT tool (Superwhisper) records, transcribes,
+    # populates the clipboard, and pastes into whatever app is focused.
+    # The orchestrator never captures the audio.
+    #
+    # To make voice work in queue mode we just read the paste from
+    # stdin: when the user keeps the TUI's host terminal focused, the
+    # Cmd+V from Superwhisper lands as stdin bytes for our process. We
+    # accumulate the bytes in a worker thread, emit when there's a
+    # quiet pause (the paste doesn't end with a newline), and dispatch
+    # via ``handle_voice`` / ``handle_skill`` — matching the next paste
+    # to the most recent PTT release's skill-mode flag via a small
+    # FIFO that the macropad pushes to on PTT release.
+    #
+    # Focused mode is intentionally hands-off: Superwhisper's paste
+    # *is* the action there (typing into Slack, kitty, etc.), so the
+    # orchestrator drops any stdin lines that arrive while not in
+    # queue mode and discards stale skill-mode flags.
+
+    ptt_release_skill_q: queue_lib.Queue[bool] = queue_lib.Queue()
+    _BRACKETED_PASTE_RE = (b"\x1b[200~", b"\x1b[201~")
+
+    def on_ptt_release(skill_mode: bool) -> None:
+        # Only push when in queue mode — otherwise Superwhisper pasted
+        # into some other app and we won't see a stdin transcript to
+        # match the flag against.
+        if ctx.app_mode == "queue":
+            ptt_release_skill_q.put(skill_mode)
+
+    def _stdin_paste_loop() -> None:
+        """Continuously read stdin in chunks; emit transcripts on quiet pauses.
+
+        Superwhisper's paste arrives as a burst of bytes without a
+        trailing newline, so ``readline()`` would block forever. We
+        ``select()`` on stdin, accumulate whatever bytes arrive, and
+        treat a 250 ms quiet stretch after the first byte as "paste
+        done". Bracketed-paste escape markers (``\\x1b[200~`` /
+        ``\\x1b[201~``) are stripped — some terminals emit them in
+        alt-screen mode, some don't.
+        """
+        try:
+            fd = sys.stdin.fileno()
+        except (AttributeError, OSError):
+            logger.info("stdin has no fileno; paste reader disabled.")
+            return
+        buffer = b""
+        last_byte_at: float | None = None
+        while not shutdown.is_set():
+            try:
+                ready, _, _ = select.select([fd], [], [], 0.1)
+            except (OSError, ValueError):
+                return  # stdin closed (e.g. on shutdown)
+            if ready:
+                try:
+                    chunk = os.read(fd, 4096)
+                except OSError:
+                    return
+                if not chunk:
+                    return  # EOF
+                buffer += chunk
+                last_byte_at = time.time()
+                continue
+            if buffer and last_byte_at is not None and (time.time() - last_byte_at) > 0.25:
+                text = buffer
+                for marker in _BRACKETED_PASTE_RE:
+                    text = text.replace(marker, b"")
+                transcript = text.decode("utf-8", errors="replace").strip()
+                buffer = b""
+                last_byte_at = None
+                if transcript:
+                    _dispatch_stdin_transcript(transcript)
+
+    def _dispatch_stdin_transcript(transcript: str) -> None:
+        if ctx.app_mode != "queue":
+            # Drain any stale flag and stay out of the focused-mode
+            # paste path entirely.
+            try:
+                ptt_release_skill_q.get_nowait()
+            except queue_lib.Empty:
+                pass
+            return
+        try:
+            skill_mode = ptt_release_skill_q.get_nowait()
+        except queue_lib.Empty:
+            skill_mode = False
+        logger.info("stdin transcript (skill_mode=%s): %s", skill_mode, transcript)
+        if skill_mode:
+            handle_skill(ctx, transcript)
+        else:
+            handle_voice(ctx, transcript)
+
     def on_ptt_press() -> None:
         # PTT-press while Claude is speaking should stop playback so the
         # mic input isn't talking over TTS.
@@ -200,6 +297,7 @@ def run(config: Config, *, tui: bool = False) -> None:
         on_chord=on_chord,
         on_tap=on_tap,
         on_ptt_press=on_ptt_press,
+        on_ptt_release=on_ptt_release,
         ptt_forward_key=ptt_forward_key,
         sample_rate=config.sample_rate,
         device=config.audio_device,
@@ -225,6 +323,13 @@ def run(config: Config, *, tui: bool = False) -> None:
     macropad.start()
     supervisor.start_all()
     consumer.start()
+    if config.stt_provider != "openai":
+        # Reader runs only when the external STT tool is in charge of
+        # capture+transcribe (e.g. Superwhisper). In openai mode the
+        # orchestrator captures audio itself and dispatches via
+        # ``on_audio``, so there's nothing pasted into stdin.
+        threading.Thread(target=_stdin_paste_loop, daemon=True).start()
+        logger.info("Started stdin paste reader for local STT mode.")
     dashboard = Dashboard(ctx, supervisor=supervisor) if tui else None
     if dashboard is not None:
         dashboard.start()

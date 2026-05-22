@@ -88,6 +88,13 @@ Topic-affinity scoring lives in `tasks.score()`. The consumer wakes on queue mut
 
 `docs/task-queue-design.md` is the source-of-truth design doc. Most non-obvious architectural calls are explained there with rationale.
 
+## STT engine choice
+
+Two engines, picked once via `stt.provider` in `config.toml`:
+
+- `openai` — orchestrator captures audio with sounddevice on PTT, sends to Whisper API, dispatches the transcript via `on_audio`.
+- `local` (Superwhisper-style) — PTT forwards `stt.local.hotkey` to the external STT tool. That tool records, transcribes, populates the clipboard, and pastes (Cmd+V) into the focused app. In queue mode, the orchestrator reads that paste off **stdin** — a background reader thread accumulates bytes, emits on a ~250 ms quiet pause, strips bracketed-paste markers, and dispatches. The macropad pushes a `skill_mode` flag (ACT+PTT) into a small FIFO on PTT release; the stdin reader pops one per transcript to choose between `handle_voice` and `handle_skill`. Focused mode is intentionally hands-off: the orchestrator drops any stdin lines that arrive when `app_mode != "queue"` so Superwhisper's paste (into Slack, kitty, …) remains the only effect. The user is expected to keep the TUI's host terminal focused while in queue mode for the paste to land in our stdin.
+
 ## Skill-based task completion
 
 ACT+PTT routes a transcript through Claude instead of through the per-kind reply path. Used for actions like "accept and archive" on a calendar-invite email — Claude reads the task context, picks a matching skill from `.claude/skills/<name>/SKILL.md` (project-scoped, **not** `~/.claude/skills`), and executes via the MCP tools the skill references. On success the task is marked done and the orchestrator speaks Claude's one-sentence summary.

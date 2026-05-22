@@ -75,6 +75,12 @@ class Macropad:
     on_chord: Callable[[str], None]
     on_tap: Callable[[str], None] | None = None
     on_ptt_press: Callable[[], None] | None = None
+    # Fires on PTT release when the forward-key path was used (local STT
+    # mode — no audio captured here, the external STT tool will paste
+    # its transcript into the focused app). The orchestrator wires this
+    # to a stdin paste reader so it knows whether the next pasted
+    # transcript should route to handle_skill vs handle_voice.
+    on_ptt_release: Callable[[bool], None] | None = None
     ptt_forward_key: keyboard.Key | keyboard.KeyCode | None = None
     sample_rate: int = 16_000
     device: int | str | None = None
@@ -171,10 +177,11 @@ class Macropad:
             if nav_modifier:
                 self._fire_chord("nav+ptt")
             else:
-                # ACT held during PTT = skill mode (the transcript will
-                # be routed to a free-form Claude call instead of a
-                # source reply). NAV+PTT is a chord (handled above) and
-                # doesn't record; ACT+PTT is a modifier on a recording.
+                # ACT held during PTT = skill mode: the transcript
+                # routes to a free-form Claude call instead of the
+                # source reply path. The audio capture path is decided
+                # by STT config (openai-capture vs key-forwarded local
+                # STT) — skill mode only affects dispatch, not capture.
                 self._skill_mode = "act" in self._held
                 if self.on_ptt_press is not None:
                     try:
@@ -201,7 +208,19 @@ class Macropad:
         self._held.discard(name)
         if name == "ptt":
             if self._forwarding:
+                # Capture-and-clear ``_skill_mode`` here too (parallel to
+                # ``_finish_recording``) so the next PTT cycle starts
+                # clean. The flag rides along to ``on_ptt_release`` so
+                # the orchestrator can match the upcoming pasted
+                # transcript to the right dispatch path.
+                skill_mode = self._skill_mode
+                self._skill_mode = False
                 self._release_forward_if_held()
+                if self.on_ptt_release is not None:
+                    try:
+                        self.on_ptt_release(skill_mode)
+                    except Exception:
+                        logger.exception("on_ptt_release failed")
             else:
                 self._finish_recording()
         elif name == "nav":

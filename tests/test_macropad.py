@@ -32,6 +32,7 @@ class Recorder:
     chords: list[str] = field(default_factory=list)
     taps: list[str] = field(default_factory=list)
     audio: list[Path] = field(default_factory=list)
+    ptt_releases: list[bool] = field(default_factory=list)
 
     def on_chord(self, name: str) -> None:
         self.chords.append(name)
@@ -41,6 +42,9 @@ class Recorder:
 
     def on_audio(self, path: Path) -> None:
         self.audio.append(path)
+
+    def on_ptt_release(self, skill_mode: bool) -> None:
+        self.ptt_releases.append(skill_mode)
 
 
 def _make(monkeypatch: pytest.MonkeyPatch) -> tuple[Macropad, Recorder, MagicMock, MagicMock]:
@@ -237,6 +241,8 @@ def test_ptt_alone_does_not_set_skill_mode(monkeypatch):
     assert pad._skill_mode is False
 
 
+
+
 def test_act_plus_yes_is_noop(monkeypatch):
     pad, rec, *_ = _make(monkeypatch)
     pad._on_press(keyboard.Key.f14)  # ACT
@@ -264,6 +270,7 @@ def _make_forward(monkeypatch: pytest.MonkeyPatch):
         on_audio=rec.on_audio,
         on_chord=rec.on_chord,
         on_tap=rec.on_tap,
+        on_ptt_release=rec.on_ptt_release,
         ptt_forward_key=keyboard.Key.home,
     )
     monkeypatch.setattr(pad, "_get_controller", lambda: controller)
@@ -286,6 +293,20 @@ def test_forward_mode_presses_and_releases_key(monkeypatch):
     controller.release.assert_called_once_with(keyboard.Key.home)
     finish.assert_not_called()
     assert pad._forwarding is False
+    # PTT release in forward mode fires on_ptt_release so the orchestrator
+    # can match the upcoming pasted transcript to the right dispatch.
+    assert rec.ptt_releases == [False]
+
+
+def test_forward_mode_act_plus_ptt_signals_skill_mode_on_release(monkeypatch):
+    pad, rec, _controller, _start, _finish = _make_forward(monkeypatch)
+    pad._on_press(keyboard.Key.f14)  # ACT down
+    pad._on_press(keyboard.Key.f13)  # PTT under ACT
+    pad._on_release(keyboard.Key.f13)
+    pad._on_release(keyboard.Key.f14)
+    assert rec.ptt_releases == [True]
+    # And the flag was cleared so the next PTT cycle starts clean.
+    assert pad._skill_mode is False
 
 
 def test_forward_mode_no_audio_callback(monkeypatch):
