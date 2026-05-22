@@ -1,6 +1,11 @@
 ---
 name: accept-invite
 description: Accept a Google Calendar invite that arrived as an email and archive the email. Use when the user wants to accept / RSVP yes / confirm attendance for an invite that's currently sitting in their inbox.
+allowed-tools:
+  - mcp__claude_ai_Google_Calendar__list_events
+  - mcp__claude_ai_Google_Calendar__respond_to_event
+  - mcp__claude_ai_Gmail__get_thread
+  - mcp__claude_ai_Gmail__unlabel_thread
 ---
 
 # Accept invite + archive email

@@ -98,11 +98,17 @@ def handle_skill(ctx: "Context", transcript: str) -> None:
         _speak(ctx, "Agent MCP is not configured.")
         return
     prompt = _build_skill_prompt(task, t)
-    logger.info("Skill mode: invoking agent for task %s", task.id)
+    logger.info(
+        "Skill mode: invoking agent for task %s with %d allowed tools",
+        task.id, len(ctx.agent_allowed_tools),
+    )
     ctx.thinking.start()
     try:
         try:
-            summary = mcp.run_agent(prompt=prompt)
+            summary = mcp.run_agent(
+                prompt=prompt,
+                allowed_tools=ctx.agent_allowed_tools,
+            )
         except Exception as exc:
             logger.exception("Skill invocation failed")
             _speak(ctx, f"Skill failed: {exc}")

@@ -94,6 +94,8 @@ ACT+PTT routes a transcript through Claude instead of through the per-kind reply
 
 The orchestrator doesn't have a skill registry — skill discovery and matching happen entirely on the Claude side via its own `.claude/skills/` mechanism. To add a new completion action, just drop another `SKILL.md` in `.claude/skills/<name>/` and write its `description` so Claude can route to it. See `.claude/skills/accept-invite/SKILL.md` for the template.
 
+Each `SKILL.md` declares an `allowed-tools` list in its YAML frontmatter. The orchestrator unions those at startup and passes the result to `--allowedTools` whenever it invokes `claude --print` for skill mode (`src/code_trip2/skills.py`). Net effect: Claude can only reach for MCP tools that some skill has already said it needs — adding a new tool to the trust boundary requires adding a new skill (or amending an existing one).
+
 ## Important design decisions (and the *why* behind them)
 
 1. **Slack auth goes through `claude --print`**, not a Slack app. Rationale: installing a workspace Slack app is a setup-friction wall. claude.ai already holds the user's Slack OAuth via its hosted Slack MCP. The orchestrator shells out to `claude --print --allowedTools=mcp__claude_ai_Slack__<tool>` for each call. Per-call cost ~$0.02-0.03 (the full MCP catalog gets loaded into context); the user is on a Max Pro subscription so this is moot, but worth knowing.

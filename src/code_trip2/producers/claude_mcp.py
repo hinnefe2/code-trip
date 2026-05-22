@@ -141,6 +141,7 @@ class ClaudeMCPClient:
         self,
         *,
         prompt: str,
+        allowed_tools: list[str] | tuple[str, ...] = (),
         timeout: float | None = None,
         max_budget_usd: float | None = None,
     ) -> str:
@@ -152,12 +153,16 @@ class ClaudeMCPClient:
         user's request to a skill; this method just hands the prompt
         over and reads back the final assistant text.
 
-        Unlike :meth:`call_tool`, ``--allowedTools`` is omitted so
-        Claude can use any MCP tool its configuration grants it. The
-        ``--permission-mode bypassPermissions`` flag keeps it from
-        prompting interactively. Budget cap defaults higher than
-        :meth:`call_tool` because skill flows tend to make several
-        tool calls.
+        ``allowed_tools`` is the union of ``allowed-tools`` declared by
+        every available skill — passed through to ``--allowedTools`` so
+        Claude can't reach for any tool a skill doesn't already say it
+        needs. Pass an empty list/tuple to leave the flag off (Claude
+        can use any configured MCP tool); skill files should declare
+        their tools instead.
+
+        ``--permission-mode bypassPermissions`` skips interactive
+        prompts. Budget cap defaults higher than :meth:`call_tool`
+        because skill flows tend to make several tool calls.
         """
         if not self._available:
             raise ClaudeMCPError("claude CLI not available")
@@ -179,6 +184,11 @@ class ClaudeMCPClient:
             "--max-budget-usd",
             str(budget),
         ]
+        if allowed_tools:
+            # ``--allowedTools`` is variadic; must come last so the variadic
+            # capture doesn't swallow a subsequent flag. Prompt goes on
+            # stdin (same reason as :meth:`call_tool`).
+            cmd += ["--allowedTools", *allowed_tools]
         try:
             proc = subprocess.run(
                 cmd,

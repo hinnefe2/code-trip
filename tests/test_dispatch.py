@@ -194,6 +194,7 @@ def test_handle_skill_invokes_agent_and_marks_task_done():
     mcp.enabled = True
     mcp.run_agent.return_value = "Accepted 'Lunch' and archived the email."
     ctx.agent_mcp = mcp
+    ctx.agent_allowed_tools = ("mcp__svc__tool_a", "mcp__svc__tool_b")
     t = ctx.queue.add(Task(
         kind="email_msg",
         topic="alice",
@@ -204,10 +205,13 @@ def test_handle_skill_invokes_agent_and_marks_task_done():
     ctx.current_task = t
     dispatch.handle_skill(ctx, "accept and archive")
     mcp.run_agent.assert_called_once()
-    prompt = mcp.run_agent.call_args.kwargs["prompt"]
+    call = mcp.run_agent.call_args
+    prompt = call.kwargs["prompt"]
     assert "accept and archive" in prompt
     assert "T1" in prompt  # thread_id baked into the prompt
     assert "email_msg" in prompt
+    # allowed_tools propagates from Context to the agent call.
+    assert call.kwargs["allowed_tools"] == ("mcp__svc__tool_a", "mcp__svc__tool_b")
     assert ctx.queue.get(t.id).state == "done"
     assert ctx.current_task is None
     ctx.tts.speak.assert_called_with("Accepted 'Lunch' and archived the email.")

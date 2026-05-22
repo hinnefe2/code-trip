@@ -25,6 +25,7 @@ from code_trip2.producers.slack import SlackProducer
 from code_trip2.queue_log import QueueLog
 from code_trip2.producers.claude_mcp import ClaudeMCPClient
 from code_trip2.session_log import SessionLogger, default_session_path
+from code_trip2.skills import load_skill_allowed_tools
 from code_trip2.slack_state import SlackState
 from code_trip2.stt_client import STTClient, STTClientError
 from code_trip2.summarizer import Summarizer
@@ -98,6 +99,22 @@ def run(config: Config, *, tui: bool = False) -> None:
     # Free-form skill invocation (ACT+PTT). server_id is unused — run_agent
     # doesn't restrict to a single tool.
     agent_mcp = ClaudeMCPClient(server_id="agent")
+    # Union of allowed-tools declared by every skill in .claude/skills/.
+    # Loaded once on startup; constrains what run_agent will let Claude
+    # touch. Resolves relative to CWD because the user runs the
+    # orchestrator from the project root.
+    skills_dir = Path.cwd() / ".claude" / "skills"
+    agent_allowed_tools = load_skill_allowed_tools(skills_dir)
+    if agent_allowed_tools:
+        logger.info(
+            "Loaded %d allowed-tools across project skills from %s",
+            len(agent_allowed_tools), skills_dir,
+        )
+    else:
+        logger.info(
+            "No skill allowed-tools found at %s; ACT+PTT will run Claude "
+            "without --allowedTools restriction.", skills_dir,
+        )
 
     ctx = Context(
         config=config,
@@ -111,6 +128,7 @@ def run(config: Config, *, tui: bool = False) -> None:
         slack_mcp=slack_mcp,
         email_mcp=email_mcp,
         agent_mcp=agent_mcp,
+        agent_allowed_tools=agent_allowed_tools,
         app_mode=config.startup_mode if config.startup_mode in ("queue", "focused") else "focused",
     )
 

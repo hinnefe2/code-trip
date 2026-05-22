@@ -149,6 +149,75 @@ def test_claude_mcp_prompt_goes_via_stdin_not_as_arg():
     assert cmd[-1] == "mcp__claude_ai_Slack__slack_read_user_profile"
 
 
+# --- ClaudeMCPClient.run_agent ------------------------------------------
+
+
+def _assistant_text_event(text: str) -> str:
+    return json.dumps({
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": text}],
+        },
+    })
+
+
+def test_run_agent_passes_allowed_tools_after_other_flags():
+    c = _mk_client()
+    stdout = _assistant_text_event("Did the thing.")
+    with patch("code_trip2.producers.claude_mcp.subprocess.run") as run:
+        run.return_value = SimpleNamespace(stdout=stdout, stderr="", returncode=0)
+        result = c.run_agent(
+            prompt="please do X",
+            allowed_tools=["mcp__svc__a", "mcp__svc__b"],
+        )
+    assert result == "Did the thing."
+    cmd = run.call_args.args[0]
+    # --allowedTools is variadic and must come LAST so it doesn't swallow
+    # a subsequent flag as a tool name.
+    assert "--allowedTools" in cmd
+    idx = cmd.index("--allowedTools")
+    assert cmd[idx + 1 :] == ["mcp__svc__a", "mcp__svc__b"]
+    # Prompt is on stdin, not in argv.
+    assert run.call_args.kwargs["input"] == "please do X"
+
+
+def test_run_agent_omits_allowed_tools_when_list_empty():
+    c = _mk_client()
+    stdout = _assistant_text_event("ok")
+    with patch("code_trip2.producers.claude_mcp.subprocess.run") as run:
+        run.return_value = SimpleNamespace(stdout=stdout, stderr="", returncode=0)
+        c.run_agent(prompt="hi")
+    cmd = run.call_args.args[0]
+    assert "--allowedTools" not in cmd
+
+
+def test_run_agent_extracts_last_assistant_text():
+    """Skill flows interleave tool_use / tool_result / text blocks; we
+    want the final natural-language summary, not an intermediate one."""
+    c = _mk_client()
+    stdout = "\n".join([
+        _assistant_text_event("Searching calendar..."),
+        json.dumps({"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "content": "[{...}]"},
+        ]}}),
+        _assistant_text_event("Accepted 'Lunch' and archived the email."),
+    ])
+    with patch("code_trip2.producers.claude_mcp.subprocess.run") as run:
+        run.return_value = SimpleNamespace(stdout=stdout, stderr="", returncode=0)
+        out = c.run_agent(prompt="accept invite", allowed_tools=["t1"])
+    assert out == "Accepted 'Lunch' and archived the email."
+
+
+def test_run_agent_raises_on_nonzero_exit():
+    c = _mk_client()
+    with patch("code_trip2.producers.claude_mcp.subprocess.run") as run:
+        run.return_value = SimpleNamespace(stdout="", stderr="oh no", returncode=2)
+        with pytest.raises(ClaudeMCPError) as exc:
+            c.run_agent(prompt="x")
+    assert "exited 2" in str(exc.value)
+
+
 # --- SlackState ----------------------------------------------------------
 
 

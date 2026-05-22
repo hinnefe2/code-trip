@@ -89,6 +89,10 @@ class Context:
     # matching skill from ``.claude/skills/`` and uses whatever MCP
     # tools that skill needs.
     agent_mcp: object | None = None
+    # Union of ``allowed-tools`` declared in every project skill's
+    # frontmatter. Passed to ``run_agent`` so Claude can't reach for a
+    # tool that isn't in any skill's declared set.
+    agent_allowed_tools: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.active_window:
