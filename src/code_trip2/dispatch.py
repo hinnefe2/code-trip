@@ -21,10 +21,10 @@ The consumer wakes on any queue mutation and on a short timer (for
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
-import threading
 import time
 from typing import TYPE_CHECKING
 
@@ -493,7 +493,7 @@ def dismiss_current_task(ctx: "Context") -> None:
 
 
 class QueueConsumer:
-    """Background thread that auto-announces when queue mode is idle.
+    """Async task that auto-announces when queue mode is idle.
 
     Wakes on every queue mutation and on a short poll interval (so
     ``ready_at`` snoozed tasks surface when their time arrives).
@@ -502,34 +502,31 @@ class QueueConsumer:
     def __init__(self, ctx: "Context", *, poll_interval: float = 2.0) -> None:
         self._ctx = ctx
         self._poll = poll_interval
-        self._wake = threading.Event()
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
+        self._wake = asyncio.Event()
+        self._stop = asyncio.Event()
 
     def attach(self) -> None:
         """Subscribe to queue events so producer adds wake the consumer."""
         self._ctx.queue.add_listener(self._on_event)
 
-    def start(self) -> None:
-        if self._thread is not None and self._thread.is_alive():
-            return
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
+    def request_stop(self) -> None:
         self._stop.set()
+        # Also pop the wait so the loop exits promptly instead of
+        # sitting through the rest of the poll interval.
         self._wake.set()
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-            self._thread = None
 
     def _on_event(self, _kind: str, _task: Task) -> None:
+        # Sync listener fired from queue mutations; safe to call
+        # asyncio.Event.set() because every mutation now originates on
+        # the same loop thread.
         self._wake.set()
 
-    def _run(self) -> None:
+    async def run(self) -> None:
         while not self._stop.is_set():
-            self._wake.wait(timeout=self._poll)
+            try:
+                await asyncio.wait_for(self._wake.wait(), timeout=self._poll)
+            except asyncio.TimeoutError:
+                pass
             self._wake.clear()
             if self._stop.is_set():
                 break

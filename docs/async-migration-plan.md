@@ -1,6 +1,6 @@
 # Asyncio migration plan
 
-> **Status:** Phases 1–2 landed 2026-05-26 on the `async-migration` branch.
+> **Status:** Phases 1–3 landed 2026-05-26 on the `async-migration` branch.
 
 ## Motivation
 
@@ -97,12 +97,11 @@ After this phase, nothing about the rest of the orchestrator has changed. The as
 
 ### Phase 3 — Convert TaskQueue + listener pattern
 
-- `threading.Lock` → `asyncio.Lock` throughout `tasks.py`.
-- `add_listener` accepts both sync and async callbacks; `_fire` checks with `inspect.iscoroutinefunction` and either calls directly or `await`s.
-- `QueueLog.record` becomes `async def` (writes JSONL via `await asyncio.to_thread(self._append, …)` or `aiofiles` — pick `to_thread` to avoid the dep; the writes are tiny).
-- `QueueConsumer` becomes an async task with `asyncio.Event` for wakeup.
-
-**Migration trick to keep tests green incrementally:** `_fire` stays backward-compatible — sync listeners keep working until each is migrated.
+- Drop `threading.Lock` from `tasks.py` and `queue_log.py`. Every method is a non-awaiting compute body, so single-loop discipline already serializes them — no lock needed. (The original plan called for `asyncio.Lock`; we don't have anywhere it'd actually do work.)
+- Listeners stay **sync-only**. `_fire` just calls them inline. The original plan proposed `inspect.iscoroutinefunction` runtime detection so async listeners could be scheduled via `loop.create_task`; we don't have async listeners and runtime type-sniffing is hacky. If a listener ever needs to do async work, it can write `asyncio.create_task(...)` itself — that's explicit and obvious.
+- `QueueLog.record` stays sync. The proposed `async def` + `asyncio.to_thread` adds nothing for tiny JSONL appends and would force every sync caller (e.g. `dispatch._announce_next`, which becomes async in Phase 4) to either await or `create_task` it. Phase 4 leaves it sync too.
+- `QueueConsumer` becomes an async task: `async def run()`, `asyncio.Event` for wakeup, `request_stop()` for shutdown. The listener (`_on_event`) stays sync — it just sets the asyncio.Event, which is safe because every queue mutation now originates on the loop thread.
+- `main.py` spawns the consumer with `asyncio.create_task(consumer.run())` and awaits it during teardown with the same wait-then-cancel pattern as the producer supervisor.
 
 ### Phase 4 — Convert dispatch + handle_voice + handle_skill
 

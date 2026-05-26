@@ -438,7 +438,7 @@ async def main_async(config: Config, *, tui: bool = False) -> None:
 
     macropad.start()
     supervisor.start_all()
-    consumer.start()
+    consumer_task = asyncio.create_task(consumer.run(), name="consumer")
     if config.stt_provider != "openai":
         # Reader runs only when the external STT tool is in charge of
         # capture+transcribe (e.g. Superwhisper). In openai mode the
@@ -454,7 +454,15 @@ async def main_async(config: Config, *, tui: bool = False) -> None:
     finally:
         if dashboard is not None:
             dashboard.stop()
-        consumer.stop()
+        consumer.request_stop()
+        try:
+            await asyncio.wait_for(consumer_task, timeout=2.0)
+        except asyncio.TimeoutError:
+            consumer_task.cancel()
+            try:
+                await consumer_task
+            except (asyncio.CancelledError, Exception):
+                pass
         await supervisor.stop_all()
         macropad.stop()
         thinking.stop()

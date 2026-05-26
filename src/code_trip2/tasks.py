@@ -17,13 +17,15 @@ reserved.
 
 from __future__ import annotations
 
+import logging
 import math
-import threading
 import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Iterable
+
+logger = logging.getLogger(__name__)
 
 
 # --- scoring constants ----------------------------------------------------
@@ -169,39 +171,41 @@ def score(task: Task, *, now: float, recent: RecentTopics) -> float:
 
 
 class TaskQueue:
-    """Thread-safe collection of tasks keyed by id.
+    """Collection of tasks keyed by id.
 
-    Producers call :meth:`add` from background threads; the consumer
-    (voice loop) calls :meth:`peek` / :meth:`pull`. All public operations
-    acquire an internal lock.
+    Single-event-loop discipline replaces the previous ``threading.Lock``:
+    every public method is a non-awaiting compute body, so they're atomic
+    with respect to other coroutines on the loop. Tests can also drive
+    the queue synchronously without a loop at all.
     """
 
     def __init__(self) -> None:
         self._tasks: dict[str, Task] = {}
-        self._lock = threading.Lock()
         self._listeners: list = []
 
     def add_listener(self, fn) -> None:
-        """Subscribe to mutations: fn(event_kind: str, task: Task)."""
-        with self._lock:
-            self._listeners.append(fn)
+        """Subscribe to mutations: ``fn(event_kind: str, task: Task)``.
+
+        Listeners must be sync. If a listener needs to do async work, it
+        should call ``asyncio.create_task(...)`` itself — keeping that
+        explicit is clearer than having the queue auto-schedule.
+        """
+        self._listeners.append(fn)
 
     # ----- mutations ------------------------------------------------------
 
     def add(self, task: Task) -> Task:
         """Add a task, applying per-topic backpressure if needed."""
-        with self._lock:
-            self._tasks[task.id] = task
-            self._enforce_topic_cap(task.topic)
+        self._tasks[task.id] = task
+        self._enforce_topic_cap(task.topic)
         self._fire("add", task)
         return task
 
     def _enforce_topic_cap(self, topic: str) -> None:
         """Drop oldest pending tasks for ``topic`` beyond the soft cap.
 
-        Called with ``_lock`` held. v1 just drops the oldest; an actual
-        digest task is a follow-up. The state-change still propagates via
-        the listener callback.
+        v1 just drops the oldest; an actual digest task is a follow-up.
+        The state-change still propagates via the listener callback.
         """
         pending = [
             t for t in self._tasks.values()
@@ -213,7 +217,7 @@ class TaskQueue:
         overflow = pending[: len(pending) - _PER_TOPIC_CAP]
         for t in overflow:
             t.state = STATE_DROPPED
-            self._fire_locked("drop", t)
+            self._fire("drop", t)
 
     def update_task(
         self,
@@ -231,27 +235,25 @@ class TaskQueue:
         message arrives for an already-pending thread task, the producer
         rewrites the body/headline rather than queueing a duplicate task.
         """
-        with self._lock:
-            t = self._tasks.get(task_id)
-            if t is None:
-                return None
-            if headline is not None:
-                t.headline = headline
-            if body is not None:
-                t.body = body
-            if source is not None:
-                t.source = source
-            if created_at is not None:
-                t.created_at = created_at
+        t = self._tasks.get(task_id)
+        if t is None:
+            return None
+        if headline is not None:
+            t.headline = headline
+        if body is not None:
+            t.body = body
+        if source is not None:
+            t.source = source
+        if created_at is not None:
+            t.created_at = created_at
         self._fire("update", t)
         return t
 
     def set_state(self, task_id: str, state: str) -> Task | None:
-        with self._lock:
-            t = self._tasks.get(task_id)
-            if t is None:
-                return None
-            t.state = state
+        t = self._tasks.get(task_id)
+        if t is None:
+            return None
+        t.state = state
         self._fire("state", t)
         return t
 
@@ -266,35 +268,30 @@ class TaskQueue:
 
     def defer(self, task_id: str, seconds: float, *, now: float | None = None) -> Task | None:
         ts = time.time() if now is None else now
-        with self._lock:
-            t = self._tasks.get(task_id)
-            if t is None:
-                return None
-            t.ready_at = ts + max(0.0, seconds)
-            t.state = STATE_PENDING
+        t = self._tasks.get(task_id)
+        if t is None:
+            return None
+        t.ready_at = ts + max(0.0, seconds)
+        t.state = STATE_PENDING
         self._fire("defer", t)
         return t
 
     # ----- reads ----------------------------------------------------------
 
     def pending(self) -> list[Task]:
-        with self._lock:
-            return [t for t in self._tasks.values() if t.state == STATE_PENDING]
+        return [t for t in self._tasks.values() if t.state == STATE_PENDING]
 
     def all(self) -> list[Task]:
-        with self._lock:
-            return list(self._tasks.values())
+        return list(self._tasks.values())
 
     def get(self, task_id: str) -> Task | None:
-        with self._lock:
-            return self._tasks.get(task_id)
+        return self._tasks.get(task_id)
 
     def count_by_kind(self) -> dict[str, int]:
         out: dict[str, int] = {}
-        with self._lock:
-            for t in self._tasks.values():
-                if t.state == STATE_PENDING:
-                    out[t.kind] = out.get(t.kind, 0) + 1
+        for t in self._tasks.values():
+            if t.state == STATE_PENDING:
+                out[t.kind] = out.get(t.kind, 0) + 1
         return out
 
     # ----- scoring views --------------------------------------------------
@@ -323,30 +320,16 @@ class TaskQueue:
 
     def load(self, tasks: Iterable[Task]) -> None:
         """Replace contents wholesale. Used by JSONL replay on startup."""
-        with self._lock:
-            self._tasks = {t.id: t for t in tasks}
+        self._tasks = {t.id: t for t in tasks}
 
     # ----- listeners ------------------------------------------------------
 
     def _fire(self, kind: str, task: Task) -> None:
-        # Snapshot listeners under the lock to avoid mutation during iteration.
-        with self._lock:
-            listeners = list(self._listeners)
-        for fn in listeners:
+        # Snapshot so a listener that itself mutates the listener list
+        # (none today, but cheap insurance) can't break this iteration.
+        for fn in list(self._listeners):
             try:
                 fn(kind, task)
             except Exception:
                 # Listener errors must not corrupt queue state.
-                pass
-
-    def _fire_locked(self, kind: str, task: Task) -> None:
-        # Variant used while already holding the lock (e.g. during cap
-        # enforcement). Snapshots a copy of the listener list.
-        listeners = list(self._listeners)
-        # Release-and-reacquire pattern would be safer, but for our usage
-        # listeners are cheap (just JSONL appends); inline-firing is fine.
-        for fn in listeners:
-            try:
-                fn(kind, task)
-            except Exception:
-                pass
+                logger.exception("Listener %r failed for %s event", fn, kind)

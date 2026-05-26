@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 import logging
-import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -46,14 +45,15 @@ def _iso_now() -> str:
 class QueueLog:
     """Append-only JSONL log for queue mutations + scoring decisions.
 
-    Two file handles, two daily rotations. Writes are guarded by a lock so
-    producer threads can call concurrently.
+    Two file handles, two daily rotations. With the orchestrator on a
+    single asyncio loop, every ``record`` call originates from a single
+    thread, so no write lock is needed — concurrent producer tasks can
+    only interleave at await points and ``_append`` doesn't await.
     """
 
     def __init__(self, dir_: Path | None = None) -> None:
         self.dir = dir_ or default_queue_dir()
         self.dir.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.Lock()
         self._queue_path = _today_path("queue", self.dir)
         self._scoring_path = _today_path("scoring", self.dir)
 
@@ -160,12 +160,11 @@ class QueueLog:
         except (TypeError, ValueError):
             logger.warning("Failed to encode log record", exc_info=True)
             return
-        with self._lock:
-            try:
-                with path.open("a", encoding="utf-8") as f:
-                    f.write(line)
-            except OSError:
-                logger.warning("Failed to write %s", path, exc_info=True)
+        try:
+            with path.open("a", encoding="utf-8") as f:
+                f.write(line)
+        except OSError:
+            logger.warning("Failed to write %s", path, exc_info=True)
 
 
 def ranked_with_logging(
