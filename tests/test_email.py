@@ -305,6 +305,7 @@ def _ctx_with_email_mcp(mcp):
 @pytest.mark.asyncio
 async def test_respond_email_creates_draft_via_mcp():
     mcp = MagicMock()
+    mcp.call_tool = AsyncMock()
     ctx = _ctx_with_email_mcp(mcp)
     task = Task(
         kind="email_msg",
@@ -336,6 +337,7 @@ async def test_respond_email_creates_draft_via_mcp():
 async def test_respond_email_preserves_existing_re_prefix():
     """Don't double-prefix the subject when it already starts with Re:."""
     mcp = MagicMock()
+    mcp.call_tool = AsyncMock()
     ctx = _ctx_with_email_mcp(mcp)
     task = Task(
         kind="email_msg",
@@ -366,6 +368,7 @@ async def test_respond_email_without_mcp_speaks_error():
 @pytest.mark.asyncio
 async def test_respond_email_without_sender_speaks_error():
     mcp = MagicMock()
+    mcp.call_tool = AsyncMock()
     ctx = _ctx_with_email_mcp(mcp)
     task = Task(kind="email_msg", source={"message_id": "M1", "subject": "x"})
     ctx.queue.add(task)
@@ -378,7 +381,7 @@ async def test_respond_email_without_sender_speaks_error():
 @pytest.mark.asyncio
 async def test_respond_email_api_error_keeps_task_active():
     mcp = MagicMock()
-    mcp.call_tool.side_effect = ClaudeMCPError("network down")
+    mcp.call_tool = AsyncMock(side_effect=ClaudeMCPError("network down"))
     ctx = _ctx_with_email_mcp(mcp)
     task = Task(
         kind="email_msg",
@@ -394,6 +397,7 @@ async def test_respond_email_api_error_keeps_task_active():
 @pytest.mark.asyncio
 async def test_dispatch_task_response_routes_email_kind():
     mcp = MagicMock()
+    mcp.call_tool = AsyncMock()
     ctx = _ctx_with_email_mcp(mcp)
     task = Task(
         kind="email_msg",

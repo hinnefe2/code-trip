@@ -17,7 +17,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-import subprocess
 from typing import TYPE_CHECKING
 
 from pynput import keyboard
@@ -108,30 +107,30 @@ async def handle_chord(ctx: "Context", name: str) -> None:
         if ctx.app_mode == dispatch.MODE_QUEUE:
             await dispatch.dismiss_current_task(ctx)
         else:
-            _send_stroke(ctx, _ACT_NO_CLEAR_LINE)
+            await _send_stroke(ctx, _ACT_NO_CLEAR_LINE)
     else:
         logger.warning("Unknown chord: %s", name)
 
 
-def _send_stroke(ctx: "Context", stroke: KeyStroke) -> None:
-    if _keystroke_targets_tui_host(ctx):
+async def _send_stroke(ctx: "Context", stroke: KeyStroke) -> None:
+    if await _keystroke_targets_tui_host(ctx):
         # The TUI's alternate-screen buffer would scroll on every Enter/Esc/Down.
         # Better to silently swallow than to corrupt the dashboard.
         logger.debug("Suppressing keystroke targeting TUI host app")
         return
     try:
-        window.send_keystroke(stroke)
+        await window.send_keystroke(stroke)
     except Exception as exc:
-        _speak_error(ctx, f"Could not send keystroke: {exc}")
+        await _speak_error(ctx, f"Could not send keystroke: {exc}")
 
 
-def _keystroke_targets_tui_host(ctx: "Context") -> bool:
+async def _keystroke_targets_tui_host(ctx: "Context") -> bool:
     """True when the frontmost app is the terminal hosting the TUI."""
     host = getattr(ctx, "tui_host_app", None)
     if not host:
         return False
     try:
-        return window.active_app() == host
+        return await window.active_app() == host
     except window.WindowError:
         return False
 
@@ -183,20 +182,20 @@ async def handle_tap(ctx: "Context", name: str) -> None:
     if stroke is None:
         logger.warning("Unknown tap: %s", name)
         return
-    _send_stroke(ctx, stroke)
+    await _send_stroke(ctx, stroke)
 
 
 async def _act_tap_app_aware(ctx: "Context") -> bool:
     """Per-app ACT-tap behavior. Returns True if handled (else no-op)."""
     try:
-        app = window.active_app()
+        app = await window.active_app()
     except window.WindowError:
         return False
     if app in ctx.config.terminal_apps:
         await _open_last_pane_url(ctx)
         return True
     if app == _CHROME_APP:
-        _send_stroke(ctx, _CHROME_NEW_TAB)
+        await _send_stroke(ctx, _CHROME_NEW_TAB)
         return True
     return False
 
@@ -205,9 +204,8 @@ async def _open_last_pane_url(ctx: "Context") -> None:
     """Capture the active tmux pane, find the most recent URL, open in Chrome."""
     host, opts = ctx.ssh
     try:
-        # remote.capture stays sync this phase; bridged via to_thread.
-        raw = await asyncio.to_thread(
-            remote.capture, host, opts, ctx.config.tmux_session, ctx.active_window, lines=200,
+        raw = await remote.capture(
+            host, opts, ctx.config.tmux_session, ctx.active_window, lines=200,
         )
     except remote.RemoteError as exc:
         await _speak_error(ctx, f"Could not read pane: {exc}")
@@ -219,14 +217,16 @@ async def _open_last_pane_url(ctx: "Context") -> None:
         return
     url = matches[-1].rstrip(_URL_TRIM)
     try:
-        # `open` returns quickly; sync subprocess is fine here.
-        subprocess.run(
-            ["open", "-a", _CHROME_APP, url],
-            check=True,
-            capture_output=True,
-            timeout=5.0,
+        proc = await asyncio.create_subprocess_exec(
+            "open", "-a", _CHROME_APP, url,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
         )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        _, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+        if proc.returncode != 0:
+            err = (stderr_b or b"").decode(errors="replace").strip()
+            raise RuntimeError(err or f"open exited {proc.returncode}")
+    except (asyncio.TimeoutError, OSError, RuntimeError) as exc:
         await _speak_error(ctx, f"Could not open URL: {exc}")
         return
     try:
@@ -237,7 +237,7 @@ async def _open_last_pane_url(ctx: "Context") -> None:
 
 async def _nav(ctx: "Context", forward: bool) -> None:
     try:
-        app = window.active_app()
+        app = await window.active_app()
     except window.WindowError as exc:
         await _speak_error(ctx, f"Could not read active app: {exc}")
         return
@@ -246,7 +246,7 @@ async def _nav(ctx: "Context", forward: bool) -> None:
         await _speak_error(ctx, f"No navigation for {app}.")
         return
     stroke = pair[0] if forward else pair[1]
-    _send_stroke(ctx, stroke)
+    await _send_stroke(ctx, stroke)
 
 
 async def _cycle_app(ctx: "Context") -> None:
@@ -254,7 +254,7 @@ async def _cycle_app(ctx: "Context") -> None:
     if not apps:
         return
     try:
-        current = window.active_app()
+        current = await window.active_app()
     except window.WindowError as exc:
         await _speak_error(ctx, f"Could not read active app: {exc}")
         return
@@ -264,14 +264,14 @@ async def _cycle_app(ctx: "Context") -> None:
     except ValueError:
         next_app = apps[0]
     try:
-        window.activate_app(next_app)
+        await window.activate_app(next_app)
     except window.WindowError as exc:
         await _speak_error(ctx, f"Could not activate {next_app}: {exc}")
 
 
 async def _speak_active_app(ctx: "Context") -> None:
     try:
-        app = window.active_app()
+        app = await window.active_app()
     except window.WindowError as exc:
         await _speak_error(ctx, f"Could not read active app: {exc}")
         return

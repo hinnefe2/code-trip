@@ -106,8 +106,7 @@ class EmailProducer:
         base_query = (self._config.email_search_query or "").strip()
         query = f"{base_query} after:{after}".strip()
         try:
-            result = await asyncio.to_thread(
-                self._mcp.call_tool,
+            result = await self._mcp.call_tool(
                 "search_threads",
                 {
                     "query": query,

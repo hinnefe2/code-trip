@@ -210,7 +210,7 @@ async def test_global_stop_clears_playback():
 @pytest.mark.asyncio
 async def test_global_status_speaks_app_and_window(monkeypatch):
     ctx = _real_ctx()
-    monkeypatch.setattr(window, "active_app", lambda: "kitty")
+    monkeypatch.setattr(window, "active_app", AsyncMock(return_value="kitty"))
     handled = await modes._try_global_commands(ctx, "status")
     assert handled is True
     msg = ctx.tts.speak.call_args.args[0]
@@ -244,8 +244,8 @@ async def test_voice_phrase_select_n_with_tickets(monkeypatch):
         {"id": "T-1", "title": "one", "branch": "t-1"},
         {"id": "T-2", "title": "two", "branch": "t-2"},
     ]
-    monkeypatch.setattr(modes.remote, "new_window", MagicMock())
-    monkeypatch.setattr(modes.remote, "send", MagicMock())
+    monkeypatch.setattr(modes.remote, "new_window", AsyncMock())
+    monkeypatch.setattr(modes.remote, "send", AsyncMock())
     handled = await modes._try_voice_phrase(ctx, "select 2")
     assert handled is True
     assert ctx.active_window == "t-2"
@@ -258,7 +258,7 @@ async def test_voice_phrase_list_windows(monkeypatch):
     monkeypatch.setattr(
         modes.remote,
         "list_windows",
-        lambda *a, **kw: [(0, "main", "/"), (1, "linear", "/x")],
+        AsyncMock(return_value=[(0, "main", "/"), (1, "linear", "/x")]),
     )
     handled = await modes._try_voice_phrase(ctx, "list windows")
     assert handled is True
@@ -269,7 +269,7 @@ async def test_voice_phrase_list_windows(monkeypatch):
 @pytest.mark.asyncio
 async def test_voice_phrase_switch_to(monkeypatch):
     ctx = _real_ctx()
-    sel = MagicMock()
+    sel = AsyncMock()
     monkeypatch.setattr(modes.remote, "select_window", sel)
     handled = await modes._try_voice_phrase(ctx, "switch to ticket-1")
     assert handled is True
@@ -284,7 +284,7 @@ async def test_voice_phrase_switch_to(monkeypatch):
 async def test_dispatch_terminal_app_routes_to_work(monkeypatch):
     ctx = _real_ctx(terminal_apps=("kitty", "iTerm2"))
     work_calls: list[str] = []
-    monkeypatch.setattr(window, "active_app", lambda: "kitty")
+    monkeypatch.setattr(window, "active_app", AsyncMock(return_value="kitty"))
 
     async def fake_work(c, t):
         work_calls.append(t)
@@ -298,7 +298,7 @@ async def test_dispatch_terminal_app_routes_to_work(monkeypatch):
 async def test_dispatch_non_terminal_app_routes_to_dictate(monkeypatch):
     ctx = _real_ctx()
     dictate_calls: list[str] = []
-    monkeypatch.setattr(window, "active_app", lambda: "Google Chrome")
+    monkeypatch.setattr(window, "active_app", AsyncMock(return_value="Google Chrome"))
 
     async def fake_dictate(c, t):
         dictate_calls.append(t)
@@ -313,7 +313,7 @@ async def test_dispatch_falls_back_to_work_on_active_app_error(monkeypatch):
     ctx = _real_ctx()
     work_calls: list[str] = []
 
-    def boom():
+    async def boom():
         raise window.WindowError("osascript broken")
 
     monkeypatch.setattr(window, "active_app", boom)
@@ -330,7 +330,7 @@ async def test_dispatch_falls_back_to_work_on_active_app_error(monkeypatch):
 async def test_dispatch_voice_phrase_wins_over_focus(monkeypatch):
     ctx = _real_ctx()
     ctx.tickets = [{"id": "T-1", "title": "one"}]
-    monkeypatch.setattr(window, "active_app", lambda: "Google Chrome")
+    monkeypatch.setattr(window, "active_app", AsyncMock(return_value="Google Chrome"))
     work_calls: list[str] = []
 
     async def fake_work(c, t):
@@ -346,7 +346,7 @@ async def test_dispatch_voice_phrase_wins_over_focus(monkeypatch):
 @pytest.mark.asyncio
 async def test_empty_transcript_is_noop(monkeypatch):
     ctx = _real_ctx()
-    monkeypatch.setattr(window, "active_app", lambda: "kitty")
+    monkeypatch.setattr(window, "active_app", AsyncMock(return_value="kitty"))
     await modes.handle_focused_voice(ctx, "   ")
     ctx.tts.speak.assert_not_called()
 
@@ -364,7 +364,7 @@ async def test_nav_tap_flips_mode_even_during_playback(monkeypatch):
     ctx.playback_queue = ["a", "b"]
     ctx.app_mode = "focused"
     sent: list = []
-    monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
+    monkeypatch.setattr(window, "send_keystroke", AsyncMock(side_effect=lambda s: sent.append(s)))
     flipped: list = []
     monkeypatch.setattr(dispatch, "flip_mode", lambda c: flipped.append(c))
 
@@ -382,7 +382,7 @@ async def test_act_tap_stops_playback_when_active(monkeypatch):
     ctx = _real_ctx()
     ctx.playback_queue = ["a", "b"]
     sent: list = []
-    monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
+    monkeypatch.setattr(window, "send_keystroke", AsyncMock(side_effect=lambda s: sent.append(s)))
 
     await chords.handle_tap(ctx, "act")
 
@@ -418,7 +418,7 @@ async def test_yes_tap_unchanged_during_playback(monkeypatch):
     ctx.app_mode = "focused"  # YES in focused mode = Enter keystroke
     ctx.playback_queue = ["a"]
     sent: list = []
-    monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
+    monkeypatch.setattr(window, "send_keystroke", AsyncMock(side_effect=lambda s: sent.append(s)))
 
     await chords.handle_tap(ctx, "yes")
 
@@ -430,8 +430,8 @@ async def test_no_tap_when_idle_in_focused_mode_sends_escape(monkeypatch):
     ctx = _real_ctx()
     ctx.app_mode = "focused"  # queue empty, tts not playing
     sent: list = []
-    monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
-    monkeypatch.setattr(window, "active_app", lambda: "TextEdit")
+    monkeypatch.setattr(window, "send_keystroke", AsyncMock(side_effect=lambda s: sent.append(s)))
+    monkeypatch.setattr(window, "active_app", AsyncMock(return_value="TextEdit"))
 
     await chords.handle_tap(ctx, "no")
 

@@ -91,7 +91,7 @@ class ClaudeProducer:
     async def _ensure_remote_dir(self, host: str, opts: tuple[str, ...]) -> None:
         cmd = f"mkdir -p {shlex.quote(EVENTS_DIR)}"
         try:
-            await self._ssh(host, opts, cmd, capture=False)
+            await remote._ssh(host, opts, cmd, capture=False)
         except remote.RemoteError:
             logger.warning("Could not create %s on remote", EVENTS_DIR)
 
@@ -99,7 +99,7 @@ class ClaudeProducer:
         cmd = (
             f"ls -1 {shlex.quote(EVENTS_DIR)} 2>/dev/null | grep -E '\\.json$' || true"
         )
-        out = await self._ssh(host, opts, cmd)
+        out = await remote._ssh(host, opts, cmd)
         return [line.strip() for line in out.splitlines() if line.strip()]
 
     async def _read_and_clear(
@@ -108,7 +108,7 @@ class ClaudeProducer:
         path = f"{EVENTS_DIR}/{filename}"
         cmd = f"cat {shlex.quote(path)} && rm -f {shlex.quote(path)}"
         try:
-            raw = await self._ssh(host, opts, cmd)
+            raw = await remote._ssh(host, opts, cmd)
         except remote.RemoteError:
             return None
         raw = raw.strip()
@@ -156,9 +156,8 @@ class ClaudeProducer:
         if not host:
             return None
         try:
-            # remote.capture stays sync until Phase 5; bridged via to_thread.
-            raw = await asyncio.to_thread(
-                remote.capture, host, opts, self._config.tmux_session, window, lines=400,
+            raw = await remote.capture(
+                host, opts, self._config.tmux_session, window, lines=400,
             )
         except remote.RemoteError as exc:
             logger.warning("ClaudeProducer: capture-pane failed for %s: %s", window, exc)
@@ -178,49 +177,3 @@ class ClaudeProducer:
             snippet = last_user_msg.strip().splitlines()[0][:80]
             return f"replied to: {snippet}"
         return "finished"
-
-    # --- async SSH ---------------------------------------------------------
-
-    async def _ssh(
-        self,
-        host: str,
-        opts: tuple[str, ...],
-        cmd: str,
-        *,
-        capture: bool = True,
-        timeout: float = 30.0,
-    ) -> str:
-        """Run one SSH command via asyncio.subprocess.
-
-        Phase 2 inlines this here rather than touching ``remote.py``;
-        Phase 5 makes ``remote._ssh`` itself async and this can be
-        replaced with a call to it. Same RemoteError contract.
-        """
-        argv = ["ssh", *opts, host, cmd]
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *argv,
-                stdout=asyncio.subprocess.PIPE if capture else asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-            )
-        except OSError as exc:
-            raise remote.RemoteError(f"SSH spawn failed: {cmd}: {exc}") from exc
-        try:
-            stdout_b, stderr_b = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout
-            )
-        except asyncio.TimeoutError as exc:
-            proc.kill()
-            try:
-                await proc.wait()
-            except Exception:
-                pass
-            raise remote.RemoteError(f"SSH timed out: {cmd}") from exc
-        if proc.returncode != 0:
-            stderr = (stderr_b or b"").decode(errors="replace")
-            raise remote.RemoteError(
-                f"SSH failed ({proc.returncode}): {cmd}\n{stderr}"
-            )
-        if capture:
-            return (stdout_b or b"").decode(errors="replace")
-        return ""

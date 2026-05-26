@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import io
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -171,42 +171,48 @@ def _stroke_ctx(*, tui_host_app=None):
     return ctx
 
 
-def test_send_stroke_fires_when_no_tui_host():
+@pytest.mark.asyncio
+async def test_send_stroke_fires_when_no_tui_host():
     ctx = _stroke_ctx(tui_host_app=None)
-    with patch("code_trip2.chords.window.send_keystroke") as send:
-        chords._send_stroke(ctx, _FAKE_STROKE)
-    send.assert_called_once_with(_FAKE_STROKE)
+    with patch("code_trip2.chords.window.send_keystroke", new_callable=AsyncMock) as send:
+        await chords._send_stroke(ctx, _FAKE_STROKE)
+    send.assert_awaited_once_with(_FAKE_STROKE)
 
 
-def test_send_stroke_suppressed_when_active_app_is_tui_host(monkeypatch):
+@pytest.mark.asyncio
+async def test_send_stroke_suppressed_when_active_app_is_tui_host(monkeypatch):
     ctx = _stroke_ctx(tui_host_app="kitty")
-    monkeypatch.setattr("code_trip2.chords.window.active_app", lambda: "kitty")
-    with patch("code_trip2.chords.window.send_keystroke") as send:
-        chords._send_stroke(ctx, _FAKE_STROKE)
+    monkeypatch.setattr("code_trip2.chords.window.active_app", AsyncMock(return_value="kitty"))
+    with patch("code_trip2.chords.window.send_keystroke", new_callable=AsyncMock) as send:
+        await chords._send_stroke(ctx, _FAKE_STROKE)
     send.assert_not_called()
 
 
-def test_send_stroke_fires_when_active_app_differs(monkeypatch):
+@pytest.mark.asyncio
+async def test_send_stroke_fires_when_active_app_differs(monkeypatch):
     ctx = _stroke_ctx(tui_host_app="kitty")
-    monkeypatch.setattr("code_trip2.chords.window.active_app", lambda: "Google Chrome")
-    with patch("code_trip2.chords.window.send_keystroke") as send:
-        chords._send_stroke(ctx, _FAKE_STROKE)
-    send.assert_called_once_with(_FAKE_STROKE)
+    monkeypatch.setattr(
+        "code_trip2.chords.window.active_app", AsyncMock(return_value="Google Chrome"),
+    )
+    with patch("code_trip2.chords.window.send_keystroke", new_callable=AsyncMock) as send:
+        await chords._send_stroke(ctx, _FAKE_STROKE)
+    send.assert_awaited_once_with(_FAKE_STROKE)
 
 
-def test_send_stroke_fires_when_active_app_lookup_errors(monkeypatch):
+@pytest.mark.asyncio
+async def test_send_stroke_fires_when_active_app_lookup_errors(monkeypatch):
     """If we can't determine focus, default to firing — failing open is
     less surprising than silent suppression."""
     from code_trip2 import window
 
-    def boom():
+    async def boom():
         raise window.WindowError("nope")
 
     ctx = _stroke_ctx(tui_host_app="kitty")
     monkeypatch.setattr("code_trip2.chords.window.active_app", boom)
-    with patch("code_trip2.chords.window.send_keystroke") as send:
-        chords._send_stroke(ctx, _FAKE_STROKE)
-    send.assert_called_once_with(_FAKE_STROKE)
+    with patch("code_trip2.chords.window.send_keystroke", new_callable=AsyncMock) as send:
+        await chords._send_stroke(ctx, _FAKE_STROKE)
+    send.assert_awaited_once_with(_FAKE_STROKE)
 
 
 @pytest.mark.asyncio
@@ -215,8 +221,8 @@ async def test_yes_tap_suppressed_in_focused_mode_when_tui_host_focused(monkeypa
     when the user is looking at the TUI host terminal."""
     ctx = _stroke_ctx(tui_host_app="kitty")
     ctx.app_mode = "focused"
-    monkeypatch.setattr("code_trip2.chords.window.active_app", lambda: "kitty")
-    with patch("code_trip2.chords.window.send_keystroke") as send:
+    monkeypatch.setattr("code_trip2.chords.window.active_app", AsyncMock(return_value="kitty"))
+    with patch("code_trip2.chords.window.send_keystroke", new_callable=AsyncMock) as send:
         await chords.handle_tap(ctx, "yes")
     send.assert_not_called()
 

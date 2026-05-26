@@ -7,9 +7,8 @@ keeps the per-call overhead low.
 
 from __future__ import annotations
 
+import asyncio
 import shlex
-import subprocess
-import time
 
 
 SIGNAL_PREFIX = "/tmp/claude-done-"
@@ -23,33 +22,78 @@ class WaitTimeout(RemoteError):
     pass
 
 
-def _ssh(host: str, opts: tuple[str, ...], cmd: str, *, capture: bool = True) -> str:
-    full = ["ssh", *opts, host, cmd]
+async def _ssh(
+    host: str,
+    opts: tuple[str, ...],
+    cmd: str,
+    *,
+    capture: bool = True,
+    timeout: float = 30.0,
+) -> str:
+    """Run one SSH command via asyncio.subprocess. Raises RemoteError on failure."""
+    argv = ["ssh", *opts, host, cmd]
     try:
-        r = subprocess.run(full, capture_output=capture, text=True, check=True, timeout=30)
-    except subprocess.CalledProcessError as e:
-        raise RemoteError(f"SSH failed ({e.returncode}): {cmd}\n{e.stderr}") from e
-    except subprocess.TimeoutExpired as e:
-        raise RemoteError(f"SSH timed out: {cmd}") from e
-    return r.stdout if capture else ""
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdout=asyncio.subprocess.PIPE if capture else asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as exc:
+        raise RemoteError(f"SSH spawn failed: {cmd}: {exc}") from exc
+    try:
+        stdout_b, stderr_b = await asyncio.wait_for(
+            proc.communicate(), timeout=timeout,
+        )
+    except asyncio.TimeoutError as exc:
+        proc.kill()
+        try:
+            await proc.wait()
+        except Exception:
+            pass
+        raise RemoteError(f"SSH timed out: {cmd}") from exc
+    if proc.returncode != 0:
+        stderr = (stderr_b or b"").decode(errors="replace")
+        raise RemoteError(f"SSH failed ({proc.returncode}): {cmd}\n{stderr}")
+    if capture:
+        return (stdout_b or b"").decode(errors="replace")
+    return ""
 
 
-def send(host: str, opts: tuple[str, ...], session: str, window: str, text: str, *, enter: bool = True) -> None:
+async def send(
+    host: str,
+    opts: tuple[str, ...],
+    session: str,
+    window: str,
+    text: str,
+    *,
+    enter: bool = True,
+) -> None:
     target = shlex.quote(f"{session}:{window}")
     cmd = f"tmux send-keys -t {target} {shlex.quote(text)}"
     if enter:
         cmd += " Enter"
-    _ssh(host, opts, cmd, capture=False)
+    await _ssh(host, opts, cmd, capture=False)
 
 
-def capture(host: str, opts: tuple[str, ...], session: str, window: str, *, lines: int = 100) -> str:
+async def capture(
+    host: str,
+    opts: tuple[str, ...],
+    session: str,
+    window: str,
+    *,
+    lines: int = 100,
+) -> str:
     target = shlex.quote(f"{session}:{window}")
-    return _ssh(host, opts, f"tmux capture-pane -t {target} -p -S -{lines}")
+    return await _ssh(host, opts, f"tmux capture-pane -t {target} -p -S -{lines}")
 
 
-def list_windows(host: str, opts: tuple[str, ...], session: str) -> list[tuple[int, str, str]]:
+async def list_windows(
+    host: str, opts: tuple[str, ...], session: str,
+) -> list[tuple[int, str, str]]:
     fmt = "#{window_index}\t#{window_name}\t#{pane_current_path}"
-    out = _ssh(host, opts, f"tmux list-windows -t {shlex.quote(session)} -F {shlex.quote(fmt)}")
+    out = await _ssh(
+        host, opts, f"tmux list-windows -t {shlex.quote(session)} -F {shlex.quote(fmt)}"
+    )
     rows: list[tuple[int, str, str]] = []
     for line in out.strip().splitlines():
         parts = line.split("\t", 2)
@@ -58,41 +102,53 @@ def list_windows(host: str, opts: tuple[str, ...], session: str) -> list[tuple[i
     return rows
 
 
-def new_window(host: str, opts: tuple[str, ...], session: str, name: str, *, cwd: str | None = None) -> None:
+async def new_window(
+    host: str, opts: tuple[str, ...], session: str, name: str, *, cwd: str | None = None,
+) -> None:
     cmd = f"tmux new-window -t {shlex.quote(session)} -n {shlex.quote(name)}"
     if cwd:
         cmd += f" -c {shlex.quote(cwd)}"
-    _ssh(host, opts, cmd, capture=False)
+    await _ssh(host, opts, cmd, capture=False)
 
 
-def select_window(host: str, opts: tuple[str, ...], session: str, window: str) -> None:
+async def select_window(
+    host: str, opts: tuple[str, ...], session: str, window: str,
+) -> None:
     target = shlex.quote(f"{session}:{window}")
-    _ssh(host, opts, f"tmux select-window -t {target}", capture=False)
+    await _ssh(host, opts, f"tmux select-window -t {target}", capture=False)
 
 
 def _signal_path(window: str) -> str:
     return f"{SIGNAL_PREFIX}{window}"
 
 
-def clear_signal(host: str, opts: tuple[str, ...], window: str) -> None:
+async def clear_signal(host: str, opts: tuple[str, ...], window: str) -> None:
     path = shlex.quote(_signal_path(window))
     try:
-        _ssh(host, opts, f"rm -f {path}", capture=False)
+        await _ssh(host, opts, f"rm -f {path}", capture=False)
     except RemoteError:
         pass
 
 
-def wait_done(host: str, opts: tuple[str, ...], window: str, *, timeout: float = 300.0, poll: float = 1.0) -> None:
+async def wait_done(
+    host: str,
+    opts: tuple[str, ...],
+    window: str,
+    *,
+    timeout: float = 300.0,
+    poll: float = 1.0,
+) -> None:
     """Poll for the Stop-hook signal file. Raises WaitTimeout on timeout."""
-    clear_signal(host, opts, window)
+    await clear_signal(host, opts, window)
     path = shlex.quote(_signal_path(window))
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
         try:
-            _ssh(host, opts, f"test -f {path}", capture=False)
-            clear_signal(host, opts, window)
+            await _ssh(host, opts, f"test -f {path}", capture=False)
+            await clear_signal(host, opts, window)
             return
         except RemoteError:
             pass
-        time.sleep(poll)
+        await asyncio.sleep(poll)
     raise WaitTimeout(f"Claude did not finish within {timeout}s in {window!r}")

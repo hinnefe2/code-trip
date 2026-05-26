@@ -29,11 +29,11 @@ case is the model refusing to call — which surfaces as a
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 import shutil
-import subprocess
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -42,6 +42,38 @@ logger = logging.getLogger(__name__)
 
 class ClaudeMCPError(Exception):
     pass
+
+
+async def _run_subprocess(
+    cmd: list[str], *, input_: str, timeout: float, what: str,
+) -> tuple[str, str, int]:
+    """Run ``cmd`` async with text I/O. Returns (stdout, stderr, returncode).
+
+    Raises :class:`ClaudeMCPError` on timeout (kills the process first).
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as exc:
+        raise ClaudeMCPError(f"{what} spawn failed: {exc}") from exc
+    try:
+        stdout_b, stderr_b = await asyncio.wait_for(
+            proc.communicate(input_.encode("utf-8")), timeout=timeout,
+        )
+    except asyncio.TimeoutError as exc:
+        proc.kill()
+        try:
+            await proc.wait()
+        except Exception:
+            pass
+        raise ClaudeMCPError(f"{what} timed out after {timeout}s") from exc
+    stdout = (stdout_b or b"").decode("utf-8", errors="replace")
+    stderr = (stderr_b or b"").decode("utf-8", errors="replace")
+    return stdout, stderr, proc.returncode or 0
 
 
 @dataclass
@@ -79,7 +111,7 @@ class ClaudeMCPClient:
     def enabled(self) -> bool:
         return self._available
 
-    def call_tool(self, tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+    async def call_tool(self, tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
         """Invoke ``server.<tool_name>(**args)`` and return the parsed result.
 
         Returns a dict (the tool's JSON response, parsed). Raises
@@ -112,32 +144,25 @@ class ClaudeMCPClient:
             "--allowedTools",
             tool_id,
         ]
-        try:
-            proc = subprocess.run(
-                cmd,
-                input=prompt,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise ClaudeMCPError(f"claude timed out after {self.timeout}s") from exc
+        stdout, stderr, returncode = await _run_subprocess(
+            cmd, input_=prompt, timeout=self.timeout, what="claude",
+        )
 
         # Try to parse the tool_result regardless of returncode. Claude can
         # exit nonzero *after* the tool ran successfully (e.g. budget hit
         # post-call, the model adding extra commentary, etc.) — we'd rather
         # surface the good result than throw it away.
         try:
-            return self._parse_stream_for_tool_result(proc.stdout, tool_id)
+            return self._parse_stream_for_tool_result(stdout, tool_id)
         except ClaudeMCPError as parse_exc:
-            if proc.returncode != 0:
+            if returncode != 0:
                 raise ClaudeMCPError(
-                    f"claude exited {proc.returncode}: "
-                    f"{proc.stderr[:500].strip() or '(no stderr)'}"
+                    f"claude exited {returncode}: "
+                    f"{stderr[:500].strip() or '(no stderr)'}"
                 ) from parse_exc
             raise
 
-    def run_agent(
+    async def run_agent(
         self,
         *,
         prompt: str,
@@ -189,22 +214,15 @@ class ClaudeMCPClient:
             # capture doesn't swallow a subsequent flag. Prompt goes on
             # stdin (same reason as :meth:`call_tool`).
             cmd += ["--allowedTools", *allowed_tools]
-        try:
-            proc = subprocess.run(
-                cmd,
-                input=prompt,
-                capture_output=True,
-                text=True,
-                timeout=deadline,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise ClaudeMCPError(f"claude timed out after {deadline}s") from exc
-        if proc.returncode != 0:
+        stdout, stderr, returncode = await _run_subprocess(
+            cmd, input_=prompt, timeout=deadline, what="claude",
+        )
+        if returncode != 0:
             raise ClaudeMCPError(
-                f"claude exited {proc.returncode}: "
-                f"{proc.stderr[:500].strip() or '(no stderr)'}"
+                f"claude exited {returncode}: "
+                f"{stderr[:500].strip() or '(no stderr)'}"
             )
-        return self._extract_final_assistant_text(proc.stdout)
+        return self._extract_final_assistant_text(stdout)
 
     @staticmethod
     def _extract_final_assistant_text(stdout: str) -> str:

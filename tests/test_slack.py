@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -45,28 +44,73 @@ def _mk_client(**kwargs) -> ClaudeMCPClient:
     return c
 
 
-def test_claude_mcp_client_disabled_when_binary_missing():
+def _patch_exec(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    stdout: str = "",
+    stderr: str = "",
+    returncode: int = 0,
+    hang: bool = False,
+) -> dict:
+    """Fake asyncio.create_subprocess_exec for claude_mcp tests.
+
+    Returns a dict that captures ``argv`` and ``input`` from the last
+    call. With ``hang=True`` the fake proc's communicate() never
+    returns — pair with a tiny client.timeout to exercise the
+    asyncio.TimeoutError path.
+    """
+    captured: dict = {"argv": None, "input": None}
+
+    async def fake_exec(*argv, **kwargs):
+        captured["argv"] = list(argv)
+        proc = MagicMock()
+
+        async def communicate(input=None):
+            captured["input"] = input.decode("utf-8") if input else None
+            if hang:
+                await asyncio.sleep(60)
+            return (stdout.encode("utf-8"), stderr.encode("utf-8"))
+
+        async def wait():
+            return returncode
+
+        proc.communicate = communicate
+        proc.wait = wait
+        proc.kill = MagicMock()
+        proc.returncode = returncode
+        return proc
+
+    monkeypatch.setattr(
+        "code_trip2.producers.claude_mcp.asyncio.create_subprocess_exec",
+        fake_exec,
+    )
+    return captured
+
+
+@pytest.mark.asyncio
+async def test_claude_mcp_client_disabled_when_binary_missing():
     with patch("code_trip2.producers.claude_mcp.shutil.which", return_value=None):
         c = ClaudeMCPClient()
     assert c.enabled is False
     with pytest.raises(ClaudeMCPError):
-        c.call_tool("anything", {})
+        await c.call_tool("anything", {})
 
 
-def test_claude_mcp_call_tool_parses_json_object_from_tool_result():
+@pytest.mark.asyncio
+async def test_claude_mcp_call_tool_parses_json_object_from_tool_result(monkeypatch):
     c = _mk_client()
     stdout = "\n".join([
         '{"type": "system", "subtype": "init"}',
         _stream_event('{"messages": [{"ts": "1.0", "text": "hi"}]}'),
         '{"type": "result", "is_error": false}',
     ])
-    with patch("code_trip2.producers.claude_mcp.subprocess.run") as run:
-        run.return_value = SimpleNamespace(stdout=stdout, stderr="", returncode=0)
-        result = c.call_tool("slack_search_public_and_private", {"query": "x"})
+    _patch_exec(monkeypatch, stdout=stdout)
+    result = await c.call_tool("slack_search_public_and_private", {"query": "x"})
     assert result == {"messages": [{"ts": "1.0", "text": "hi"}]}
 
 
-def test_claude_mcp_call_tool_handles_string_tool_result_content():
+@pytest.mark.asyncio
+async def test_claude_mcp_call_tool_handles_string_tool_result_content(monkeypatch):
     c = _mk_client()
     stdout = json.dumps({
         "type": "user",
@@ -77,46 +121,43 @@ def test_claude_mcp_call_tool_handles_string_tool_result_content():
             ],
         },
     })
-    with patch("code_trip2.producers.claude_mcp.subprocess.run") as run:
-        run.return_value = SimpleNamespace(stdout=stdout, stderr="", returncode=0)
-        assert c.call_tool("slack_read_user_profile", {}) == {"id": "U123"}
+    _patch_exec(monkeypatch, stdout=stdout)
+    assert await c.call_tool("slack_read_user_profile", {}) == {"id": "U123"}
 
 
-def test_claude_mcp_call_tool_raises_when_no_tool_result():
+@pytest.mark.asyncio
+async def test_claude_mcp_call_tool_raises_when_no_tool_result(monkeypatch):
     c = _mk_client()
-    stdout = '{"type": "system"}\n{"type": "result"}\n'
-    with patch("code_trip2.producers.claude_mcp.subprocess.run") as run:
-        run.return_value = SimpleNamespace(stdout=stdout, stderr="", returncode=0)
-        with pytest.raises(ClaudeMCPError) as exc:
-            c.call_tool("slack_send_message", {"channel_id": "C1", "message": "hi"})
+    _patch_exec(monkeypatch, stdout='{"type": "system"}\n{"type": "result"}\n')
+    with pytest.raises(ClaudeMCPError) as exc:
+        await c.call_tool("slack_send_message", {"channel_id": "C1", "message": "hi"})
     assert "No tool_result" in str(exc.value)
 
 
-def test_claude_mcp_call_tool_raises_on_nonzero_exit():
+@pytest.mark.asyncio
+async def test_claude_mcp_call_tool_raises_on_nonzero_exit(monkeypatch):
     c = _mk_client()
-    with patch("code_trip2.producers.claude_mcp.subprocess.run") as run:
-        run.return_value = SimpleNamespace(stdout="", stderr="boom", returncode=1)
-        with pytest.raises(ClaudeMCPError) as exc:
-            c.call_tool("slack_read_user_profile", {})
+    _patch_exec(monkeypatch, stdout="", stderr="boom", returncode=1)
+    with pytest.raises(ClaudeMCPError) as exc:
+        await c.call_tool("slack_read_user_profile", {})
     assert "exited 1" in str(exc.value)
 
 
-def test_claude_mcp_call_tool_raises_on_timeout():
-    c = _mk_client()
-    with patch("code_trip2.producers.claude_mcp.subprocess.run") as run:
-        run.side_effect = subprocess.TimeoutExpired(cmd=["claude"], timeout=60)
-        with pytest.raises(ClaudeMCPError) as exc:
-            c.call_tool("slack_read_user_profile", {})
+@pytest.mark.asyncio
+async def test_claude_mcp_call_tool_raises_on_timeout(monkeypatch):
+    c = _mk_client(timeout=0.01)
+    _patch_exec(monkeypatch, hang=True)
+    with pytest.raises(ClaudeMCPError) as exc:
+        await c.call_tool("slack_read_user_profile", {})
     assert "timed out" in str(exc.value)
 
 
-def test_claude_mcp_command_passes_expected_args():
+@pytest.mark.asyncio
+async def test_claude_mcp_command_passes_expected_args(monkeypatch):
     c = _mk_client(model="haiku", server_id="claude_ai_Slack", max_budget_usd=0.05)
-    stdout = _stream_event('{"id": "U1"}')
-    with patch("code_trip2.producers.claude_mcp.subprocess.run") as run:
-        run.return_value = SimpleNamespace(stdout=stdout, stderr="", returncode=0)
-        c.call_tool("slack_read_user_profile", {})
-    cmd = run.call_args.args[0]
+    captured = _patch_exec(monkeypatch, stdout=_stream_event('{"id": "U1"}'))
+    await c.call_tool("slack_read_user_profile", {})
+    cmd = captured["argv"]
     assert "--allowedTools" in cmd
     allowed_idx = cmd.index("--allowedTools")
     assert cmd[allowed_idx + 1] == "mcp__claude_ai_Slack__slack_read_user_profile"
@@ -128,23 +169,23 @@ def test_claude_mcp_command_passes_expected_args():
     assert cmd[model_idx + 1] == "haiku"
 
 
-def test_claude_mcp_prompt_goes_via_stdin_not_as_arg():
+@pytest.mark.asyncio
+async def test_claude_mcp_prompt_goes_via_stdin_not_as_arg(monkeypatch):
     """Regression: ``--allowedTools`` is variadic, so a trailing positional
     prompt gets eaten as a second tool name. The prompt must go through
     stdin instead."""
     c = _mk_client()
-    stdout = _stream_event('{"id": "U1"}')
-    with patch("code_trip2.producers.claude_mcp.subprocess.run") as run:
-        run.return_value = SimpleNamespace(stdout=stdout, stderr="", returncode=0)
-        c.call_tool("slack_read_user_profile", {"foo": "bar"})
-    kwargs = run.call_args.kwargs
-    cmd = run.call_args.args[0]
+    captured = _patch_exec(monkeypatch, stdout=_stream_event('{"id": "U1"}'))
+    await c.call_tool("slack_read_user_profile", {"foo": "bar"})
+    cmd = captured["argv"]
+    stdin_text = captured["input"]
     # Prompt must be passed via stdin.
-    assert "input" in kwargs and "slack_read_user_profile" in kwargs["input"]
-    assert "foo" in kwargs["input"]
+    assert stdin_text is not None
+    assert "slack_read_user_profile" in stdin_text
+    assert "foo" in stdin_text
     # Prompt must NOT appear in cmd args (which would let --allowedTools
     # absorb it).
-    assert kwargs["input"] not in cmd
+    assert stdin_text not in cmd
     # The last token of cmd should be the allowed tool id, with no
     # trailing positional argument.
     assert cmd[-1] == "mcp__claude_ai_Slack__slack_read_user_profile"
@@ -163,37 +204,35 @@ def _assistant_text_event(text: str) -> str:
     })
 
 
-def test_run_agent_passes_allowed_tools_after_other_flags():
+@pytest.mark.asyncio
+async def test_run_agent_passes_allowed_tools_after_other_flags(monkeypatch):
     c = _mk_client()
-    stdout = _assistant_text_event("Did the thing.")
-    with patch("code_trip2.producers.claude_mcp.subprocess.run") as run:
-        run.return_value = SimpleNamespace(stdout=stdout, stderr="", returncode=0)
-        result = c.run_agent(
-            prompt="please do X",
-            allowed_tools=["mcp__svc__a", "mcp__svc__b"],
-        )
+    captured = _patch_exec(monkeypatch, stdout=_assistant_text_event("Did the thing."))
+    result = await c.run_agent(
+        prompt="please do X",
+        allowed_tools=["mcp__svc__a", "mcp__svc__b"],
+    )
     assert result == "Did the thing."
-    cmd = run.call_args.args[0]
+    cmd = captured["argv"]
     # --allowedTools is variadic and must come LAST so it doesn't swallow
     # a subsequent flag as a tool name.
     assert "--allowedTools" in cmd
     idx = cmd.index("--allowedTools")
     assert cmd[idx + 1 :] == ["mcp__svc__a", "mcp__svc__b"]
     # Prompt is on stdin, not in argv.
-    assert run.call_args.kwargs["input"] == "please do X"
+    assert captured["input"] == "please do X"
 
 
-def test_run_agent_omits_allowed_tools_when_list_empty():
+@pytest.mark.asyncio
+async def test_run_agent_omits_allowed_tools_when_list_empty(monkeypatch):
     c = _mk_client()
-    stdout = _assistant_text_event("ok")
-    with patch("code_trip2.producers.claude_mcp.subprocess.run") as run:
-        run.return_value = SimpleNamespace(stdout=stdout, stderr="", returncode=0)
-        c.run_agent(prompt="hi")
-    cmd = run.call_args.args[0]
-    assert "--allowedTools" not in cmd
+    captured = _patch_exec(monkeypatch, stdout=_assistant_text_event("ok"))
+    await c.run_agent(prompt="hi")
+    assert "--allowedTools" not in captured["argv"]
 
 
-def test_run_agent_extracts_last_assistant_text():
+@pytest.mark.asyncio
+async def test_run_agent_extracts_last_assistant_text(monkeypatch):
     """Skill flows interleave tool_use / tool_result / text blocks; we
     want the final natural-language summary, not an intermediate one."""
     c = _mk_client()
@@ -204,18 +243,17 @@ def test_run_agent_extracts_last_assistant_text():
         ]}}),
         _assistant_text_event("Accepted 'Lunch' and archived the email."),
     ])
-    with patch("code_trip2.producers.claude_mcp.subprocess.run") as run:
-        run.return_value = SimpleNamespace(stdout=stdout, stderr="", returncode=0)
-        out = c.run_agent(prompt="accept invite", allowed_tools=["t1"])
+    _patch_exec(monkeypatch, stdout=stdout)
+    out = await c.run_agent(prompt="accept invite", allowed_tools=["t1"])
     assert out == "Accepted 'Lunch' and archived the email."
 
 
-def test_run_agent_raises_on_nonzero_exit():
+@pytest.mark.asyncio
+async def test_run_agent_raises_on_nonzero_exit(monkeypatch):
     c = _mk_client()
-    with patch("code_trip2.producers.claude_mcp.subprocess.run") as run:
-        run.return_value = SimpleNamespace(stdout="", stderr="oh no", returncode=2)
-        with pytest.raises(ClaudeMCPError) as exc:
-            c.run_agent(prompt="x")
+    _patch_exec(monkeypatch, stdout="", stderr="oh no", returncode=2)
+    with pytest.raises(ClaudeMCPError) as exc:
+        await c.run_agent(prompt="x")
     assert "exited 2" in str(exc.value)
 
 
@@ -865,6 +903,7 @@ def _ctx_with_slack_mcp(mcp):
 @pytest.mark.asyncio
 async def test_respond_slack_calls_send_message_via_mcp():
     mcp = MagicMock()
+    mcp.call_tool = AsyncMock()
     ctx = _ctx_with_slack_mcp(mcp)
     task = Task(
         kind="slack_msg",
@@ -897,7 +936,7 @@ async def test_respond_slack_without_mcp_speaks_error():
 @pytest.mark.asyncio
 async def test_respond_slack_api_error_keeps_task_active():
     mcp = MagicMock()
-    mcp.call_tool.side_effect = ClaudeMCPError("network down")
+    mcp.call_tool = AsyncMock(side_effect=ClaudeMCPError("network down"))
     ctx = _ctx_with_slack_mcp(mcp)
     task = Task(kind="slack_msg",
                 source={"channel_id": "C1", "ts": "1.0", "thread_ts": "1.0"})
@@ -911,6 +950,7 @@ async def test_respond_slack_api_error_keeps_task_active():
 @pytest.mark.asyncio
 async def test_dispatch_task_response_routes_slack_kind():
     mcp = MagicMock()
+    mcp.call_tool = AsyncMock()
     ctx = _ctx_with_slack_mcp(mcp)
     task = Task(kind="slack_msg",
                 source={"channel_id": "C1", "ts": "1.0", "thread_ts": "1.0"})

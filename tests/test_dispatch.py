@@ -208,7 +208,7 @@ async def test_handle_skill_invokes_agent_and_marks_task_done():
     ctx = _make_ctx(app_mode="queue")
     mcp = MagicMock()
     mcp.enabled = True
-    mcp.run_agent.return_value = "Accepted 'Lunch' and archived the email."
+    mcp.run_agent = AsyncMock(return_value="Accepted 'Lunch' and archived the email.")
     ctx.agent_mcp = mcp
     ctx.agent_allowed_tools = ("mcp__svc__tool_a", "mcp__svc__tool_b")
     t = ctx.queue.add(Task(
@@ -258,7 +258,7 @@ async def test_handle_skill_agent_error_keeps_task_active():
     ctx = _make_ctx(app_mode="queue")
     mcp = MagicMock()
     mcp.enabled = True
-    mcp.run_agent.side_effect = RuntimeError("budget exceeded")
+    mcp.run_agent = AsyncMock(side_effect=RuntimeError("budget exceeded"))
     ctx.agent_mcp = mcp
     t = ctx.queue.add(Task(kind="email_msg", source={"thread_id": "T1"}))
     ctx.current_task = t

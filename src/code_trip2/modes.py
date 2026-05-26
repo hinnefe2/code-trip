@@ -130,7 +130,7 @@ async def handle_focused_voice(ctx: Context, transcript: str) -> None:
 
 async def _dispatch_by_focus(ctx: Context, t: str) -> None:
     try:
-        app = window.active_app()
+        app = await window.active_app()
     except window.WindowError as exc:
         logger.warning("active_app failed (%s); defaulting to WORK branch.", exc)
         await _work_voice(ctx, t)
@@ -172,7 +172,7 @@ async def _try_global_commands(ctx: Context, t: str) -> bool:
         return True
     if low.startswith("status"):
         try:
-            app = window.active_app()
+            app = await window.active_app()
         except window.WindowError:
             app = "unknown"
         await _speak(ctx, f"App {app}. Window {ctx.active_window}.")
@@ -227,7 +227,7 @@ async def _try_voice_phrase(ctx: Context, t: str) -> bool:
 
 async def _dictate_voice(ctx: Context, t: str) -> None:
     try:
-        window.paste_text(t)
+        await window.paste_text(t)
     except window.WindowError as exc:
         await _report_error(ctx, f"Could not paste: {exc}")
         return
@@ -246,9 +246,7 @@ async def _work_voice(ctx: Context, t: str) -> None:
     stop_playback(ctx)
 
     try:
-        # remote.* stays sync this phase; bridged via to_thread until
-        # Phase 5 makes remote.py async.
-        await asyncio.to_thread(remote.send, host, opts, cfg.tmux_session, win, t)
+        await remote.send(host, opts, cfg.tmux_session, win, t)
     except remote.RemoteError as exc:
         await _report_error(ctx, f"Could not reach Claude: {exc}")
         return
@@ -258,9 +256,7 @@ async def _work_voice(ctx: Context, t: str) -> None:
     raw: str | None = None
     try:
         try:
-            await asyncio.to_thread(
-                remote.wait_done, host, opts, win, timeout=cfg.wait_timeout,
-            )
+            await remote.wait_done(host, opts, win, timeout=cfg.wait_timeout)
         except remote.WaitTimeout:
             await _report_error(ctx, "Claude did not respond in time.")
             return
@@ -268,9 +264,7 @@ async def _work_voice(ctx: Context, t: str) -> None:
             await _report_error(ctx, f"Lost connection to Claude: {exc}")
             return
         try:
-            raw = await asyncio.to_thread(
-                remote.capture, host, opts, cfg.tmux_session, win, lines=2000,
-            )
+            raw = await remote.capture(host, opts, cfg.tmux_session, win, lines=2000)
         except remote.RemoteError as exc:
             await _report_error(ctx, f"Could not read Claude's response: {exc}")
             return
@@ -473,9 +467,7 @@ def is_playback_active(ctx: Context) -> bool:
 async def _select_window(ctx: Context, name: str) -> None:
     host, opts = ctx.ssh
     try:
-        await asyncio.to_thread(
-            remote.select_window, host, opts, ctx.config.tmux_session, name,
-        )
+        await remote.select_window(host, opts, ctx.config.tmux_session, name)
     except remote.RemoteError as exc:
         await _report_error(ctx, f"Could not switch: {exc}")
         return
@@ -486,9 +478,7 @@ async def _select_window(ctx: Context, name: str) -> None:
 async def _new_window(ctx: Context, name: str) -> None:
     host, opts = ctx.ssh
     try:
-        await asyncio.to_thread(
-            remote.new_window, host, opts, ctx.config.tmux_session, name,
-        )
+        await remote.new_window(host, opts, ctx.config.tmux_session, name)
     except remote.RemoteError as exc:
         await _report_error(ctx, f"Could not create window: {exc}")
         return
@@ -499,9 +489,7 @@ async def _new_window(ctx: Context, name: str) -> None:
 async def _announce_windows(ctx: Context) -> None:
     host, opts = ctx.ssh
     try:
-        rows = await asyncio.to_thread(
-            remote.list_windows, host, opts, ctx.config.tmux_session,
-        )
+        rows = await remote.list_windows(host, opts, ctx.config.tmux_session)
     except remote.RemoteError as exc:
         await _report_error(ctx, f"Could not list windows: {exc}")
         return
@@ -530,11 +518,9 @@ async def _linear_refresh(ctx: Context) -> None:
     win = cfg.linear_window
     prompt = f"claude -p {json.dumps(_LINEAR_REFRESH_PROMPT)}"
     try:
-        await asyncio.to_thread(remote.send, host, opts, cfg.tmux_session, win, prompt)
-        await asyncio.to_thread(remote.wait_done, host, opts, win, timeout=cfg.wait_timeout)
-        raw = await asyncio.to_thread(
-            remote.capture, host, opts, cfg.tmux_session, win, lines=400,
-        )
+        await remote.send(host, opts, cfg.tmux_session, win, prompt)
+        await remote.wait_done(host, opts, win, timeout=cfg.wait_timeout)
+        raw = await remote.capture(host, opts, cfg.tmux_session, win, lines=400)
     except (remote.RemoteError, remote.WaitTimeout) as exc:
         await _report_error(ctx, f"Could not refresh tickets: {exc}")
         return
@@ -588,12 +574,8 @@ async def _linear_select(ctx: Context, idx: int) -> None:
     ctx.ticket_index = idx
     host, opts = ctx.ssh
     try:
-        await asyncio.to_thread(
-            remote.new_window, host, opts, ctx.config.tmux_session, branch,
-        )
-        await asyncio.to_thread(
-            remote.send, host, opts, ctx.config.tmux_session, branch, "claude",
-        )
+        await remote.new_window(host, opts, ctx.config.tmux_session, branch)
+        await remote.send(host, opts, ctx.config.tmux_session, branch, "claude")
     except remote.RemoteError as exc:
         await _report_error(ctx, f"Could not open window for {tid}: {exc}")
         return

@@ -379,6 +379,24 @@ def test_suppress_vks_covers_all_macropad_keys():
 # --- Chord handler ---------------------------------------------------------
 
 
+def _patch_open_subprocess(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    """Stub out ``chords.asyncio.create_subprocess_exec`` and return a list
+    that captures the argv of every invocation. Lets the URL-opener tests
+    assert what would have been run without actually spawning ``open``.
+    """
+    opened: list[list[str]] = []
+
+    async def fake_exec(*cmd, **kw):
+        opened.append(list(cmd))
+        proc = MagicMock()
+        proc.communicate = AsyncMock(return_value=(b"", b""))
+        proc.returncode = 0
+        return proc
+
+    monkeypatch.setattr(chords.asyncio, "create_subprocess_exec", fake_exec)
+    return opened
+
+
 def _ctx(
     app_cycle=("kitty", "Google Chrome", "Slack"),
     *,
@@ -411,9 +429,9 @@ def _ctx(
 @pytest.mark.asyncio
 async def test_chord_yes_sends_chrome_next_tab(monkeypatch):
     ctx = _ctx()
-    monkeypatch.setattr(window, "active_app", lambda: "Google Chrome")
+    monkeypatch.setattr(window, "active_app", AsyncMock(return_value="Google Chrome"))
     sent: list[KeyStroke] = []
-    monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
+    monkeypatch.setattr(window, "send_keystroke", AsyncMock(side_effect=lambda s: sent.append(s)))
 
     await chords.handle_chord(ctx, "nav+yes")
     assert sent == [chords._CHROME_NEXT_TAB]
@@ -422,9 +440,9 @@ async def test_chord_yes_sends_chrome_next_tab(monkeypatch):
 @pytest.mark.asyncio
 async def test_chord_no_sends_kitty_prev_window(monkeypatch):
     ctx = _ctx()
-    monkeypatch.setattr(window, "active_app", lambda: "kitty")
+    monkeypatch.setattr(window, "active_app", AsyncMock(return_value="kitty"))
     sent: list[KeyStroke] = []
-    monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
+    monkeypatch.setattr(window, "send_keystroke", AsyncMock(side_effect=lambda s: sent.append(s)))
 
     await chords.handle_chord(ctx, "nav+no")
     assert sent == [chords._KITTY_PREV]
@@ -433,9 +451,9 @@ async def test_chord_no_sends_kitty_prev_window(monkeypatch):
 @pytest.mark.asyncio
 async def test_chord_yes_on_slack_sends_next_unread(monkeypatch):
     ctx = _ctx()
-    monkeypatch.setattr(window, "active_app", lambda: "Slack")
+    monkeypatch.setattr(window, "active_app", AsyncMock(return_value="Slack"))
     sent: list[KeyStroke] = []
-    monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
+    monkeypatch.setattr(window, "send_keystroke", AsyncMock(side_effect=lambda s: sent.append(s)))
 
     await chords.handle_chord(ctx, "nav+yes")
     assert sent == [chords._SLACK_NEXT_UNREAD]
@@ -444,9 +462,9 @@ async def test_chord_yes_on_slack_sends_next_unread(monkeypatch):
 @pytest.mark.asyncio
 async def test_chord_no_on_slack_sends_history_back(monkeypatch):
     ctx = _ctx()
-    monkeypatch.setattr(window, "active_app", lambda: "Slack")
+    monkeypatch.setattr(window, "active_app", AsyncMock(return_value="Slack"))
     sent: list[KeyStroke] = []
-    monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
+    monkeypatch.setattr(window, "send_keystroke", AsyncMock(side_effect=lambda s: sent.append(s)))
 
     await chords.handle_chord(ctx, "nav+no")
     assert sent == [chords._SLACK_BACK_HISTORY]
@@ -455,9 +473,9 @@ async def test_chord_no_on_slack_sends_history_back(monkeypatch):
 @pytest.mark.asyncio
 async def test_chord_unknown_app_speaks_error(monkeypatch):
     ctx = _ctx()
-    monkeypatch.setattr(window, "active_app", lambda: "TextEdit")
+    monkeypatch.setattr(window, "active_app", AsyncMock(return_value="TextEdit"))
     sent: list[KeyStroke] = []
-    monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
+    monkeypatch.setattr(window, "send_keystroke", AsyncMock(side_effect=lambda s: sent.append(s)))
     monkeypatch.setattr(chords.earcon, "error", lambda: None)
 
     await chords.handle_chord(ctx, "nav+yes")
@@ -470,8 +488,8 @@ async def test_chord_unknown_app_speaks_error(monkeypatch):
 async def test_chord_act_cycles_apps(monkeypatch):
     ctx = _ctx()
     activated: list[str] = []
-    monkeypatch.setattr(window, "active_app", lambda: "kitty")
-    monkeypatch.setattr(window, "activate_app", lambda n: activated.append(n))
+    monkeypatch.setattr(window, "active_app", AsyncMock(return_value="kitty"))
+    monkeypatch.setattr(window, "activate_app", AsyncMock(side_effect=lambda n: activated.append(n)))
 
     await chords.handle_chord(ctx, "nav+act")
     assert activated == ["Google Chrome"]
@@ -481,8 +499,8 @@ async def test_chord_act_cycles_apps(monkeypatch):
 async def test_chord_act_wraps_around(monkeypatch):
     ctx = _ctx()
     activated: list[str] = []
-    monkeypatch.setattr(window, "active_app", lambda: "Slack")
-    monkeypatch.setattr(window, "activate_app", lambda n: activated.append(n))
+    monkeypatch.setattr(window, "active_app", AsyncMock(return_value="Slack"))
+    monkeypatch.setattr(window, "activate_app", AsyncMock(side_effect=lambda n: activated.append(n)))
 
     await chords.handle_chord(ctx, "nav+act")
     assert activated == ["kitty"]
@@ -492,8 +510,8 @@ async def test_chord_act_wraps_around(monkeypatch):
 async def test_chord_act_unknown_app_goes_to_first(monkeypatch):
     ctx = _ctx()
     activated: list[str] = []
-    monkeypatch.setattr(window, "active_app", lambda: "TextEdit")
-    monkeypatch.setattr(window, "activate_app", lambda n: activated.append(n))
+    monkeypatch.setattr(window, "active_app", AsyncMock(return_value="TextEdit"))
+    monkeypatch.setattr(window, "activate_app", AsyncMock(side_effect=lambda n: activated.append(n)))
 
     await chords.handle_chord(ctx, "nav+act")
     assert activated == ["kitty"]
@@ -502,7 +520,7 @@ async def test_chord_act_unknown_app_goes_to_first(monkeypatch):
 @pytest.mark.asyncio
 async def test_chord_ptt_speaks_active_app(monkeypatch):
     ctx = _ctx()
-    monkeypatch.setattr(window, "active_app", lambda: "Google Chrome")
+    monkeypatch.setattr(window, "active_app", AsyncMock(return_value="Google Chrome"))
 
     await chords.handle_chord(ctx, "nav+ptt")
     ctx.tts.speak.assert_called_once_with("Google Chrome")
@@ -512,7 +530,7 @@ async def test_chord_ptt_speaks_active_app(monkeypatch):
 async def test_tap_yes_sends_enter(monkeypatch):
     ctx = _ctx()
     sent: list[KeyStroke] = []
-    monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
+    monkeypatch.setattr(window, "send_keystroke", AsyncMock(side_effect=lambda s: sent.append(s)))
 
     await chords.handle_tap(ctx, "yes")
     assert sent == [chords._TAP_YES]
@@ -523,7 +541,7 @@ async def test_tap_yes_sends_enter(monkeypatch):
 async def test_tap_no_sends_escape(monkeypatch):
     ctx = _ctx()
     sent: list[KeyStroke] = []
-    monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
+    monkeypatch.setattr(window, "send_keystroke", AsyncMock(side_effect=lambda s: sent.append(s)))
 
     await chords.handle_tap(ctx, "no")
     assert sent == [chords._TAP_NO]
@@ -541,7 +559,7 @@ async def test_tap_nav_flips_mode(monkeypatch):
     ctx = _ctx()
     ctx.app_mode = "focused"
     sent: list[KeyStroke] = []
-    monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
+    monkeypatch.setattr(window, "send_keystroke", AsyncMock(side_effect=lambda s: sent.append(s)))
     flipped: list = []
     monkeypatch.setattr(dispatch, "flip_mode", lambda c: flipped.append(c))
 
@@ -573,7 +591,7 @@ async def test_tap_nav_during_playback_still_flips_mode(monkeypatch):
 async def test_tap_act_during_playback_stops_audio(monkeypatch):
     """In any mode, ACT-tap while TTS is speaking interrupts playback."""
     ctx = _ctx(queue=["chunk a"])  # playback_queue non-empty → is_playing
-    monkeypatch.setattr(window, "active_app", lambda: "kitty")
+    monkeypatch.setattr(window, "active_app", AsyncMock(return_value="kitty"))
 
     await chords.handle_tap(ctx, "act")
 
@@ -587,9 +605,8 @@ async def test_tap_act_in_queue_mode_no_playback_is_noop(monkeypatch):
     ctx = _ctx()
     ctx.app_mode = "queue"
     sent: list[KeyStroke] = []
-    monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
-    opened: list[list[str]] = []
-    monkeypatch.setattr(chords.subprocess, "run", lambda cmd, **kw: opened.append(cmd))
+    monkeypatch.setattr(window, "send_keystroke", AsyncMock(side_effect=lambda s: sent.append(s)))
+    opened = _patch_open_subprocess(monkeypatch)
 
     await chords.handle_tap(ctx, "act")
 
@@ -603,8 +620,8 @@ async def test_tap_act_in_focused_mode_chrome_opens_new_tab(monkeypatch):
     ctx = _ctx()
     ctx.app_mode = "focused"
     sent: list[KeyStroke] = []
-    monkeypatch.setattr(window, "active_app", lambda: "Google Chrome")
-    monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
+    monkeypatch.setattr(window, "active_app", AsyncMock(return_value="Google Chrome"))
+    monkeypatch.setattr(window, "send_keystroke", AsyncMock(side_effect=lambda s: sent.append(s)))
 
     await chords.handle_tap(ctx, "act")
 
@@ -617,18 +634,14 @@ async def test_tap_act_in_focused_mode_chrome_opens_new_tab(monkeypatch):
 async def test_tap_act_in_focused_mode_terminal_opens_last_pane_url(monkeypatch):
     ctx = _ctx()
     ctx.app_mode = "focused"
-    monkeypatch.setattr(window, "active_app", lambda: "kitty")
+    monkeypatch.setattr(window, "active_app", AsyncMock(return_value="kitty"))
     pane = (
         "Earlier output https://old.example.com/x referenced.\n"
         "Final URL is https://github.com/owner/repo/pull/42 here.\n"
         ">\n"
     )
-    monkeypatch.setattr(chords.remote, "capture", lambda *a, **kw: pane)
-    opened: list[list[str]] = []
-    monkeypatch.setattr(
-        chords.subprocess, "run",
-        lambda cmd, **kw: opened.append(cmd) or MagicMock(),
-    )
+    monkeypatch.setattr(chords.remote, "capture", AsyncMock(return_value=pane))
+    opened = _patch_open_subprocess(monkeypatch)
     monkeypatch.setattr(chords.earcon, "completion", lambda: None)
 
     await chords.handle_tap(ctx, "act")
@@ -640,15 +653,11 @@ async def test_tap_act_in_focused_mode_terminal_opens_last_pane_url(monkeypatch)
 async def test_tap_act_in_focused_mode_terminal_strips_trailing_punctuation(monkeypatch):
     ctx = _ctx()
     ctx.app_mode = "focused"
-    monkeypatch.setattr(window, "active_app", lambda: "kitty")
+    monkeypatch.setattr(window, "active_app", AsyncMock(return_value="kitty"))
     monkeypatch.setattr(
-        chords.remote, "capture", lambda *a, **kw: "see https://example.com/path."
+        chords.remote, "capture", AsyncMock(return_value="see https://example.com/path."),
     )
-    opened: list[list[str]] = []
-    monkeypatch.setattr(
-        chords.subprocess, "run",
-        lambda cmd, **kw: opened.append(cmd) or MagicMock(),
-    )
+    opened = _patch_open_subprocess(monkeypatch)
     monkeypatch.setattr(chords.earcon, "completion", lambda: None)
 
     await chords.handle_tap(ctx, "act")
@@ -660,8 +669,8 @@ async def test_tap_act_in_focused_mode_terminal_strips_trailing_punctuation(monk
 async def test_tap_act_in_focused_mode_terminal_no_url_speaks_error(monkeypatch):
     ctx = _ctx()
     ctx.app_mode = "focused"
-    monkeypatch.setattr(window, "active_app", lambda: "kitty")
-    monkeypatch.setattr(chords.remote, "capture", lambda *a, **kw: "no urls here")
+    monkeypatch.setattr(window, "active_app", AsyncMock(return_value="kitty"))
+    monkeypatch.setattr(chords.remote, "capture", AsyncMock(return_value="no urls here"))
     monkeypatch.setattr(chords.earcon, "error", lambda: None)
 
     await chords.handle_tap(ctx, "act")
@@ -677,8 +686,8 @@ async def test_tap_act_in_focused_mode_in_other_app_is_silent(monkeypatch):
     ctx = _ctx()
     ctx.app_mode = "focused"
     sent: list[KeyStroke] = []
-    monkeypatch.setattr(window, "active_app", lambda: "TextEdit")
-    monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
+    monkeypatch.setattr(window, "active_app", AsyncMock(return_value="TextEdit"))
+    monkeypatch.setattr(window, "send_keystroke", AsyncMock(side_effect=lambda s: sent.append(s)))
 
     await chords.handle_tap(ctx, "act")
 
@@ -690,7 +699,7 @@ async def test_chord_act_no_in_focused_mode_sends_ctrl_u(monkeypatch):
     ctx = _ctx()
     ctx.app_mode = "focused"
     sent: list[KeyStroke] = []
-    monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
+    monkeypatch.setattr(window, "send_keystroke", AsyncMock(side_effect=lambda s: sent.append(s)))
 
     await chords.handle_chord(ctx, "act+no")
     assert sent == [chords._ACT_NO_CLEAR_LINE]
@@ -713,7 +722,7 @@ async def test_chord_act_no_in_queue_mode_dismisses_task(monkeypatch):
 
     monkeypatch.setattr(dispatch, "dismiss_current_task", fake_dismiss)
     sent: list[KeyStroke] = []
-    monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
+    monkeypatch.setattr(window, "send_keystroke", AsyncMock(side_effect=lambda s: sent.append(s)))
 
     await chords.handle_chord(ctx, "act+no")
 
@@ -725,7 +734,7 @@ async def test_chord_act_no_in_queue_mode_dismisses_task(monkeypatch):
 async def test_tap_unknown_is_noop(monkeypatch):
     ctx = _ctx()
     sent: list[KeyStroke] = []
-    monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
+    monkeypatch.setattr(window, "send_keystroke", AsyncMock(side_effect=lambda s: sent.append(s)))
 
     await chords.handle_tap(ctx, "bogus")
     assert sent == []
@@ -735,7 +744,7 @@ async def test_tap_unknown_is_noop(monkeypatch):
 async def test_chord_active_app_error_reported(monkeypatch):
     ctx = _ctx()
 
-    def raise_(*_a):
+    async def raise_(*_a):
         raise window.WindowError("boom")
 
     monkeypatch.setattr(window, "active_app", raise_)

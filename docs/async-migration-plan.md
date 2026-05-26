@@ -1,6 +1,6 @@
 # Asyncio migration plan
 
-> **Status:** Phases 1–4 landed 2026-05-26 on the `async-migration` branch.
+> **Status:** Phases 1–5 landed 2026-05-26 on the `async-migration` branch.
 
 ## Motivation
 
@@ -118,11 +118,16 @@ After this phase, nothing about the rest of the orchestrator has changed. The as
 
 ### Phase 5 — Convert MCP clients + remote helpers
 
-- `ClaudeMCPClient.call_tool` and `.run_agent` switch from `subprocess.run` to `asyncio.create_subprocess_exec` + `await proc.communicate(input=…)`.
-- `remote.py` SSH helpers (`send`, `capture`, `wait_done`, `select_window`, `new_window`, `list_windows`, `_ssh`) become async via `asyncio.create_subprocess_exec`.
-- `window.py` macOS osascript helpers become async via `asyncio.create_subprocess_exec` — they're small, single subprocess.run calls.
+- `ClaudeMCPClient.call_tool` and `.run_agent` are async; the shared subprocess plumbing lives in a module-level `_run_subprocess` helper.
+- `remote.py` SSH helpers (`send`, `capture`, `wait_done`, `clear_signal`, `select_window`, `new_window`, `list_windows`, `_ssh`) are all async. `wait_done`'s polling loop uses `asyncio.sleep` against the running loop's `loop.time()` for the deadline.
+- `window.py` is async: `active_app`, `activate_app`, `paste_text`, `send_keystroke` (its inter-chord delay uses `asyncio.sleep`). `_send_chord` stays sync — it's just pynput press/tap/release, no I/O.
+- `ClaudeProducer`'s inline `_ssh` is removed; callers use `remote._ssh` directly. Its `_summarize_pane` drops the `asyncio.to_thread` wrappers around `remote.capture`.
+- All Phase 4 `asyncio.to_thread(...)` stopgaps in `dispatch.py`, `modes.py`, `chords.py`, `producers/slack.py`, `producers/email.py` are replaced with direct awaits.
+- `LinearProducer` still wraps `MCPClient.start` / `.stop` in `asyncio.to_thread` — that's a different MCP client (stdio-based, used only by Linear). It's a stub producer with no live caller; conversion can wait.
 
-After Phase 5 all subprocess calls are async; the `asyncio.to_thread` stopgap from Phase 4 can come out.
+Remaining `asyncio.to_thread` uses after Phase 5:
+- `TTSClient._write_in_blocks` → wraps sounddevice's blocking `stream.write` (irreducible PortAudio C boundary, intentional).
+- `LinearProducer.run` → wraps the sync `MCPClient` (stub).
 
 ### Phase 6 — Replace macropad → async bridge
 

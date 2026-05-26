@@ -178,9 +178,7 @@ class SlackProducer:
         also try a few structured shapes in case a future MCP version
         returns JSON.
         """
-        result = await asyncio.to_thread(
-            self._mcp.call_tool, "slack_read_user_profile", {}
-        )
+        result = await self._mcp.call_tool("slack_read_user_profile", {})
 
         # Structured shapes first, just in case.
         for candidate in (result.get("user"), result):
@@ -259,8 +257,7 @@ class SlackProducer:
         resolved: dict[str, str] = {}
         for name in names:
             try:
-                result = await asyncio.to_thread(
-                    self._mcp.call_tool,
+                result = await self._mcp.call_tool(
                     "slack_search_channels",
                     {"query": name, "limit": 10, "response_format": "detailed"},
                 )
@@ -308,8 +305,7 @@ class SlackProducer:
         last_ts = self._state.last_search_ts()
         after = self._after_param(last_ts)
         try:
-            result = await asyncio.to_thread(
-                self._mcp.call_tool,
+            result = await self._mcp.call_tool(
                 "slack_search_public_and_private",
                 {
                     "query": f"<@{self._user_id}>",
@@ -368,9 +364,7 @@ class SlackProducer:
         if last_ts:
             args["oldest"] = last_ts
         try:
-            result = await asyncio.to_thread(
-                self._mcp.call_tool, "slack_read_channel", args
-            )
+            result = await self._mcp.call_tool("slack_read_channel", args)
         except ClaudeMCPError as exc:
             logger.warning(
                 "SlackProducer: read channel '#%s' failed: %s", channel_name, exc

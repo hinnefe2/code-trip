@@ -106,10 +106,7 @@ async def handle_skill(ctx: "Context", transcript: str) -> None:
     ctx.thinking.start()
     try:
         try:
-            # MCP client stays sync this phase; bridged via to_thread
-            # until Phase 5 converts ClaudeMCPClient to async.
-            summary = await asyncio.to_thread(
-                mcp.run_agent,
+            summary = await mcp.run_agent(
                 prompt=prompt,
                 allowed_tools=ctx.agent_allowed_tools,
             )
@@ -371,10 +368,7 @@ async def _respond_claude(ctx: "Context", task: Task, transcript: str) -> None:
     win = task.source.get("window") or task.topic
     host, opts = ctx.ssh
     try:
-        # remote.* stays sync this phase; bridged via to_thread until Phase 5.
-        await asyncio.to_thread(
-            remote.send, host, opts, ctx.config.tmux_session, win, transcript,
-        )
+        await remote.send(host, opts, ctx.config.tmux_session, win, transcript)
     except remote.RemoteError as exc:
         await _speak(ctx, f"Could not reach Claude: {exc}")
         return
@@ -409,8 +403,7 @@ async def _respond_email(ctx: "Context", task: Task, transcript: str) -> None:
     if msg_id:
         args["replyToMessageId"] = msg_id
     try:
-        # MCP client stays sync this phase; bridged via to_thread until Phase 5.
-        await asyncio.to_thread(mcp.call_tool, "create_draft", args)
+        await mcp.call_tool("create_draft", args)
     except Exception as exc:
         logger.exception("Email draft failed")
         await _speak(ctx, f"Could not draft email: {exc}")
@@ -439,8 +432,7 @@ async def _respond_slack(ctx: "Context", task: Task, transcript: str) -> None:
         await _speak(ctx, "Missing Slack channel for this task.")
         return
     try:
-        await asyncio.to_thread(
-            mcp.call_tool,
+        await mcp.call_tool(
             "slack_send_message",
             {
                 "channel_id": channel_id,
