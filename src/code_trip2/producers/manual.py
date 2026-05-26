@@ -1,6 +1,6 @@
 """ManualProducer: voice-triggered manual task adds.
 
-There's no background thread here — the producer is just a thin helper
+There's no background work here — the producer is just a thin helper
 that gets called from the voice handler when the user says
 ``"add a task X"`` / ``"remind me to read this"``. Dispatch already lives
 in :mod:`code_trip2.dispatch`; this module exists so the producer
@@ -10,18 +10,22 @@ hotkey-driven adds) have a home.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 logger = logging.getLogger(__name__)
 
 
 class ManualProducer:
-    """No-op start/stop; manual adds are pull-driven from dispatch."""
+    """No-op run/stop; manual adds are pull-driven from dispatch."""
 
     name = "manual"
 
-    def start(self) -> None:
-        pass
+    def __init__(self) -> None:
+        self._stop = asyncio.Event()
 
-    def stop(self) -> None:
-        pass
+    def request_stop(self) -> None:
+        self._stop.set()
+
+    async def run(self) -> None:
+        return

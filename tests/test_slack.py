@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
 from pathlib import Path
@@ -264,35 +265,40 @@ def _producer(tmp_path: Path, *, poll_interval=30.0, watch_channels=()):
     return p, q, mcp, state
 
 
-def test_producer_skips_when_mcp_unavailable(tmp_path: Path):
-    cfg = SimpleNamespace(slack_poll_interval=30.0)
+@pytest.mark.asyncio
+async def test_producer_skips_when_mcp_unavailable(tmp_path: Path):
+    cfg = SimpleNamespace(slack_poll_interval=30.0, slack_watch_channels=())
     p = SlackProducer(config=cfg, queue=TaskQueue(), mcp=None)
-    p.start()
-    assert p._thread is None
+    # run() should return immediately when no MCP client is available.
+    await asyncio.wait_for(p.run(), timeout=1.0)
 
 
-def test_producer_setup_returns_false_when_user_id_fails(tmp_path: Path):
-    """user_id resolution now happens on the worker thread; if it raises,
-    setup returns False and the poll loop is skipped."""
+@pytest.mark.asyncio
+async def test_producer_setup_returns_false_when_user_id_fails(tmp_path: Path):
+    """If user_id resolution raises, setup returns False and the poll
+    loop is skipped."""
     p, _q, mcp, _state = _producer(tmp_path)
     mcp.call_tool.side_effect = ClaudeMCPError("auth broken")
-    assert p._setup_in_thread() is False
+    assert await p._setup_in_thread() is False
 
 
-def test_producer_setup_returns_false_when_user_id_empty(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_producer_setup_returns_false_when_user_id_empty(tmp_path: Path):
     p, _q, mcp, _state = _producer(tmp_path)
     mcp.call_tool.return_value = {"id": ""}
-    assert p._setup_in_thread() is False
+    assert await p._setup_in_thread() is False
 
 
-def test_producer_setup_returns_true_and_caches_user_id(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_producer_setup_returns_true_and_caches_user_id(tmp_path: Path):
     p, _q, mcp, _state = _producer(tmp_path)
     mcp.call_tool.return_value = {"id": "UABC"}
-    assert p._setup_in_thread() is True
+    assert await p._setup_in_thread() is True
     assert p._user_id == "UABC"
 
 
-def test_producer_setup_resolves_watch_channels(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_producer_setup_resolves_watch_channels(tmp_path: Path):
     p, _q, mcp, _state = _producer(tmp_path, watch_channels=("team-ai",))
     # First call: user profile. Second: channel search.
     mcp.call_tool.side_effect = [
@@ -310,11 +316,12 @@ def test_producer_setup_resolves_watch_channels(tmp_path: Path):
             "---\n"
         )},
     ]
-    assert p._setup_in_thread() is True
+    assert await p._setup_in_thread() is True
     assert p._watched == {"team-ai": "C0TEAMAI"}
 
 
-def test_producer_setup_tolerates_failed_channel_lookup(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_producer_setup_tolerates_failed_channel_lookup(tmp_path: Path):
     """A bad channel name shouldn't keep the producer from running the
     mention search."""
     p, _q, mcp, _state = _producer(tmp_path, watch_channels=("nope",))
@@ -322,14 +329,16 @@ def test_producer_setup_tolerates_failed_channel_lookup(tmp_path: Path):
         {"id": "UABC"},
         ClaudeMCPError("network glitch"),
     ]
-    assert p._setup_in_thread() is True
+    assert await p._setup_in_thread() is True
     assert p._watched == {}
 
 
-def test_producer_run_retries_setup_after_transient_failure(tmp_path: Path):
-    """A one-time setup failure shouldn't permanently kill the thread.
-    The producer should retry on the next poll-interval tick."""
+@pytest.mark.asyncio
+async def test_producer_run_retries_setup_after_transient_failure(tmp_path: Path):
+    """A one-time setup failure shouldn't permanently kill the producer.
+    The task should retry on the next poll-interval tick."""
     p, _q, mcp, _state = _producer(tmp_path, poll_interval=0.01)
+    p._STARTUP_DELAY_S = 0.01  # skip the 2s stagger for the test
     calls = []
 
     def call_tool(name, args):
@@ -342,61 +351,45 @@ def test_producer_run_retries_setup_after_transient_failure(tmp_path: Path):
 
     mcp.call_tool.side_effect = call_tool
 
-    import threading as _t, time as _time
-    # Stagger uses _stop.wait(2.0). Override the stop event with a
-    # short-lived one for the test.
-    t = _t.Thread(target=p._run, daemon=True)
-    p._stop.clear()
-    t.start()
-    # Wait for two setup attempts + one poll attempt to land.
-    deadline = _time.monotonic() + 5.0
-    while _time.monotonic() < deadline:
+    task = asyncio.create_task(p.run())
+    # Wait for two setup attempts to land.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 5.0
+    while loop.time() < deadline:
         if calls.count("slack_read_user_profile") >= 2:
             break
-        _time.sleep(0.05)
-    p._stop.set()
-    t.join(timeout=2.0)
+        await asyncio.sleep(0.02)
+    p.request_stop()
+    try:
+        await asyncio.wait_for(task, timeout=2.0)
+    except asyncio.TimeoutError:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
     assert calls.count("slack_read_user_profile") >= 2, (
         f"expected at least two setup attempts, got calls={calls}"
     )
     assert p._user_id == "UABC"
 
 
-def test_producer_start_spawns_thread_without_blocking(tmp_path: Path):
-    """Critical: start() must not block on the user_id fetch, even when
-    that fetch takes a long time. The fetch happens inside the worker
-    thread instead."""
-    p, _q, mcp, _state = _producer(tmp_path)
-
-    def slow_call(*_args, **_kwargs):
-        import time as _t
-        _t.sleep(10)
-        return {"id": "UABC"}
-
-    mcp.call_tool.side_effect = slow_call
-
-    import time as _t
-    started_at = _t.monotonic()
-    p.start()
-    elapsed = _t.monotonic() - started_at
-    assert elapsed < 0.5, f"start() blocked for {elapsed:.2f}s — should be near-instant"
-    assert p._thread is not None and p._thread.is_alive()
-    p.stop()  # don't leave the slow-sleeping thread running across tests
-
-
-def test_producer_fetch_user_id_reads_id_from_user_block(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_producer_fetch_user_id_reads_id_from_user_block(tmp_path: Path):
     p, _q, mcp, _state = _producer(tmp_path)
     mcp.call_tool.return_value = {"user": {"id": "UABC", "name": "henry"}}
-    assert p._fetch_user_id() == "UABC"
+    assert await p._fetch_user_id() == "UABC"
 
 
-def test_producer_fetch_user_id_reads_id_from_top_level(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_producer_fetch_user_id_reads_id_from_top_level(tmp_path: Path):
     p, _q, mcp, _state = _producer(tmp_path)
     mcp.call_tool.return_value = {"id": "UDEF"}
-    assert p._fetch_user_id() == "UDEF"
+    assert await p._fetch_user_id() == "UDEF"
 
 
-def test_producer_fetch_user_id_parses_plain_text_result(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_producer_fetch_user_id_parses_plain_text_result(tmp_path: Path):
     """The Slack MCP actually returns human-readable text in a ``result``
     key — regex out the User ID line."""
     p, _q, mcp, _state = _producer(tmp_path)
@@ -408,13 +401,14 @@ def test_producer_fetch_user_id_parses_plain_text_result(tmp_path: Path):
             "Real Name: Henry Hinnefeld\n"
         )
     }
-    assert p._fetch_user_id() == "U02L5V8H9RS"
+    assert await p._fetch_user_id() == "U02L5V8H9RS"
 
 
-def test_producer_fetch_user_id_returns_empty_when_unparseable(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_producer_fetch_user_id_returns_empty_when_unparseable(tmp_path: Path):
     p, _q, mcp, _state = _producer(tmp_path)
     mcp.call_tool.return_value = {"result": "no recognizable user ID here"}
-    assert p._fetch_user_id() == ""
+    assert await p._fetch_user_id() == ""
 
 
 _DETAILED_FIXTURE = (
@@ -444,11 +438,12 @@ _DETAILED_FIXTURE = (
 )
 
 
-def test_producer_poll_emits_tasks_from_detailed_markdown(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_producer_poll_emits_tasks_from_detailed_markdown(tmp_path: Path):
     p, q, mcp, state = _producer(tmp_path)
     p._user_id = "UME"
     mcp.call_tool.return_value = {"results": _DETAILED_FIXTURE}
-    p._poll_once()
+    await p._poll_once()
 
     tasks = q.all()
     assert len(tasks) == 2
@@ -465,7 +460,8 @@ def test_producer_poll_emits_tasks_from_detailed_markdown(tmp_path: Path):
     assert state.last_search_ts() == "1716000002.000000"
 
 
-def test_producer_poll_skips_bot_messages_by_default(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_producer_poll_skips_bot_messages_by_default(tmp_path: Path):
     bot_fixture = (
         "# Search Results for: <@UME>\n\n"
         "### Result 1 of 1\n"
@@ -481,14 +477,15 @@ def test_producer_poll_skips_bot_messages_by_default(tmp_path: Path):
     p, q, mcp, state = _producer(tmp_path)
     p._user_id = "UME"
     mcp.call_tool.return_value = {"results": bot_fixture}
-    p._poll_once()
+    await p._poll_once()
     assert q.all() == []
     # State should still advance so we don't keep re-parsing the same bot
     # message on every poll.
     assert state.last_search_ts() == "1716000099.000000"
 
 
-def test_producer_poll_skips_messages_at_or_before_last_ts(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_producer_poll_skips_messages_at_or_before_last_ts(tmp_path: Path):
     fixture = (
         "### Result 1 of 2\n"
         "Channel: #c (ID: C1)\n"
@@ -511,12 +508,13 @@ def test_producer_poll_skips_messages_at_or_before_last_ts(tmp_path: Path):
     p._user_id = "UME"
     state.set_last_search_ts("1716000005.000000")
     mcp.call_tool.return_value = {"results": fixture}
-    p._poll_once()
+    await p._poll_once()
     assert len(q.all()) == 1
     assert "new" in q.all()[0].body
 
 
-def test_producer_poll_dedupes_within_session(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_producer_poll_dedupes_within_session(tmp_path: Path):
     fixture = (
         "### Result 1 of 1\n"
         "Channel: #c (ID: C1)\n"
@@ -530,20 +528,22 @@ def test_producer_poll_dedupes_within_session(tmp_path: Path):
     p, q, mcp, _state = _producer(tmp_path)
     p._user_id = "UME"
     mcp.call_tool.return_value = {"results": fixture}
-    p._poll_once()
-    p._poll_once()  # same poll result; second pass should be a no-op
+    await p._poll_once()
+    await p._poll_once()  # same poll result; second pass should be a no-op
     assert len(q.all()) == 1
 
 
-def test_producer_poll_handles_empty_results(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_producer_poll_handles_empty_results(tmp_path: Path):
     p, q, mcp, _state = _producer(tmp_path)
     p._user_id = "UME"
     mcp.call_tool.return_value = {"results": "# Search Results for: <@UME>\n\n## Messages (0 results)\n"}
-    p._poll_once()
+    await p._poll_once()
     assert q.all() == []
 
 
-def test_producer_poll_handles_structured_messages_too(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_producer_poll_handles_structured_messages_too(tmp_path: Path):
     """Future-proof: if the MCP ever returns a structured ``messages``
     list instead of markdown, we still cope."""
     p, q, mcp, _state = _producer(tmp_path)
@@ -561,15 +561,16 @@ def test_producer_poll_handles_structured_messages_too(tmp_path: Path):
             }
         ]
     }
-    p._poll_once()
+    await p._poll_once()
     assert len(q.all()) == 1
 
 
-def test_producer_poll_resilient_to_mcp_errors(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_producer_poll_resilient_to_mcp_errors(tmp_path: Path):
     p, q, mcp, _state = _producer(tmp_path)
     p._user_id = "UME"
     mcp.call_tool.side_effect = ClaudeMCPError("network")
-    p._poll_once()  # should not raise
+    await p._poll_once()  # should not raise
     assert q.all() == []
 
 
@@ -597,14 +598,15 @@ _CHANNEL_READ_FIXTURE = (
 )
 
 
-def test_poll_watched_channel_emits_every_message_including_bots(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_poll_watched_channel_emits_every_message_including_bots(tmp_path: Path):
     """Unlike the mention search, watched channels include bot messages —
     the user opted into 'every new message in this channel'."""
     p, q, mcp, state = _producer(tmp_path, watch_channels=("team-ai",))
     p._user_id = "UME"
     p._watched = {"team-ai": "C0TEAMAI"}
     mcp.call_tool.return_value = {"results": _CHANNEL_READ_FIXTURE}
-    p._poll_watched_channel("team-ai", "C0TEAMAI")
+    await p._poll_watched_channel("team-ai", "C0TEAMAI")
 
     tasks = q.all()
     assert len(tasks) == 2  # bot AND human
@@ -619,13 +621,14 @@ def test_poll_watched_channel_emits_every_message_including_bots(tmp_path: Path)
     assert state.last_channel_ts("C0TEAMAI") == "1716000002.000000"
 
 
-def test_poll_watched_channel_respects_per_channel_cursor(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_poll_watched_channel_respects_per_channel_cursor(tmp_path: Path):
     p, q, mcp, state = _producer(tmp_path, watch_channels=("team-ai",))
     p._user_id = "UME"
     p._watched = {"team-ai": "C0TEAMAI"}
     state.set_last_channel_ts("C0TEAMAI", "1716000002.000000")
     mcp.call_tool.return_value = {"results": _CHANNEL_READ_FIXTURE}
-    p._poll_watched_channel("team-ai", "C0TEAMAI")
+    await p._poll_watched_channel("team-ai", "C0TEAMAI")
     # Both messages are at or before the cursor — should emit nothing.
     assert q.all() == []
 
@@ -642,22 +645,24 @@ def test_poll_watched_channel_cursor_is_independent_of_mention_cursor(tmp_path: 
     assert state.last_channel_ts("C0TEAMAI") == "1716000060.000000"
 
 
-def test_poll_watched_channel_resilient_to_mcp_errors(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_poll_watched_channel_resilient_to_mcp_errors(tmp_path: Path):
     p, q, mcp, _state = _producer(tmp_path, watch_channels=("team-ai",))
     p._watched = {"team-ai": "C0TEAMAI"}
     mcp.call_tool.side_effect = ClaudeMCPError("network down")
-    p._poll_watched_channel("team-ai", "C0TEAMAI")  # should not raise
+    await p._poll_watched_channel("team-ai", "C0TEAMAI")  # should not raise
     assert q.all() == []
 
 
-def test_poll_once_calls_both_paths(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_poll_once_calls_both_paths(tmp_path: Path):
     """_poll_once should run the mention search AND a read per watched
     channel."""
     p, _q, mcp, _state = _producer(tmp_path, watch_channels=("team-ai", "general"))
     p._user_id = "UME"
     p._watched = {"team-ai": "C0TEAMAI", "general": "C0GEN"}
     mcp.call_tool.return_value = {"results": ""}
-    p._poll_once()
+    await p._poll_once()
     # One mention search + two channel reads.
     tool_names = [c.args[0] for c in mcp.call_tool.call_args_list]
     assert tool_names.count("slack_search_public_and_private") == 1
@@ -746,7 +751,8 @@ def test_slack_to_plain_text_realistic_message():
     assert "#xteam-delivery" in out
 
 
-def test_producer_emit_task_cleans_slack_markup(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_producer_emit_task_cleans_slack_markup(tmp_path: Path):
     """End-to-end: a task's body should already have the markup stripped."""
     fixture = (
         "### Result 1 of 1\n"
@@ -762,7 +768,7 @@ def test_producer_emit_task_cleans_slack_markup(tmp_path: Path):
     p, q, mcp, _state = _producer(tmp_path)
     p._user_id = "U02L5V8H9RS"
     mcp.call_tool.return_value = {"results": fixture}
-    p._poll_once()
+    await p._poll_once()
     [t] = q.all()
     assert "U02L5V8H9RS" not in t.body
     assert "example.com" not in t.body
@@ -925,7 +931,8 @@ def _thread_fixture(thread_ts: str, msg_ts: str, body: str, sender: str = "Alice
     )
 
 
-def test_producer_collapses_thread_replies_into_single_task(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_producer_collapses_thread_replies_into_single_task(tmp_path: Path):
     """Two messages in the same thread should produce ONE pending task
     (the second message updates the first), not two — long Slack threads
     shouldn't pile up dozens of inbox items."""
@@ -936,7 +943,7 @@ def test_producer_collapses_thread_replies_into_single_task(tmp_path: Path):
     mcp.call_tool.return_value = {
         "results": _thread_fixture("1716000100.000000", "1716000100.000000", "first message")
     }
-    p._poll_once()
+    await p._poll_once()
     assert len(q.all()) == 1
     first = q.all()[0]
     assert "first message" in first.body
@@ -945,7 +952,7 @@ def test_producer_collapses_thread_replies_into_single_task(tmp_path: Path):
     mcp.call_tool.return_value = {
         "results": _thread_fixture("1716000100.000000", "1716000200.000000", "follow-up message", sender="Bob")
     }
-    p._poll_once()
+    await p._poll_once()
 
     pending = q.pending()
     assert len(pending) == 1, "thread reply should update the existing task, not stack"
@@ -954,7 +961,8 @@ def test_producer_collapses_thread_replies_into_single_task(tmp_path: Path):
     assert "Bob" in pending[0].headline
 
 
-def test_producer_separate_threads_get_separate_tasks(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_producer_separate_threads_get_separate_tasks(tmp_path: Path):
     """Two messages with different thread_ts produce two tasks."""
     p, q, mcp, _state = _producer(tmp_path)
     p._user_id = "UME"
@@ -964,11 +972,12 @@ def test_producer_separate_threads_get_separate_tasks(tmp_path: Path):
             + _thread_fixture("1716000400.000000", "1716000400.000000", "thread two", sender="Charlie")
         )
     }
-    p._poll_once()
+    await p._poll_once()
     assert len(q.pending()) == 2
 
 
-def test_producer_does_not_collapse_into_done_threads(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_producer_does_not_collapse_into_done_threads(tmp_path: Path):
     """If the user has already dismissed (marked done) a thread task,
     a new message in the same thread should create a fresh task — not
     silently update the dismissed one."""
@@ -977,14 +986,14 @@ def test_producer_does_not_collapse_into_done_threads(tmp_path: Path):
     mcp.call_tool.return_value = {
         "results": _thread_fixture("1716000500.000000", "1716000500.000000", "first")
     }
-    p._poll_once()
+    await p._poll_once()
     [first] = q.all()
     q.mark_done(first.id)
 
     mcp.call_tool.return_value = {
         "results": _thread_fixture("1716000500.000000", "1716000600.000000", "follow-up after dismiss")
     }
-    p._poll_once()
+    await p._poll_once()
     pending = q.pending()
     assert len(pending) == 1
     assert pending[0].id != first.id

@@ -25,9 +25,9 @@ discover the current user's ID, then loops at the configured interval.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
-import threading
 import time
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
@@ -135,6 +135,11 @@ def _previous_workday_5pm_unix(now: datetime | None = None) -> int:
 class SlackProducer:
     name = "slack"
 
+    # Initial stagger before the first poll so producers don't all hit
+    # claude --print the instant the orchestrator starts. Class constant
+    # so tests can lower it via per-instance override.
+    _STARTUP_DELAY_S = 2.0
+
     def __init__(
         self,
         *,
@@ -147,8 +152,7 @@ class SlackProducer:
         self._queue = queue
         self._mcp = mcp
         self._state = state or SlackState()
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
+        self._stop = asyncio.Event()
         self._user_id: str = ""
         # Tiny cache to suppress duplicates within a session (state file
         # already handles cross-restart dedup).
@@ -159,29 +163,20 @@ class SlackProducer:
 
     # ---- lifecycle ------------------------------------------------------
 
-    def start(self) -> None:
-        if self._thread is not None and self._thread.is_alive():
-            return
-        if self._mcp is None or not self._mcp.enabled:
-            logger.info("SlackProducer: ClaudeMCPClient unavailable; not starting.")
-            return
-        # Resolve user_id inside the worker thread, not here — the
-        # claude --print call takes ~10 s and would block the
-        # orchestrator's whole startup (no logs, no dashboard) until
-        # it returns.
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
+    def request_stop(self) -> None:
         self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-            self._thread = None
+
+    async def _sleep_or_stop(self, timeout: float) -> bool:
+        """Sleep ``timeout`` seconds or until stop. Returns True if stop fired."""
+        try:
+            await asyncio.wait_for(self._stop.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
 
     # ---- setup ----------------------------------------------------------
 
-    def _fetch_user_id(self) -> str:
+    async def _fetch_user_id(self) -> str:
         """Resolve the current user's Slack ID via the MCP.
 
         The Slack MCP returns human-readable text wrapped in a ``result``
@@ -190,7 +185,9 @@ class SlackProducer:
         also try a few structured shapes in case a future MCP version
         returns JSON.
         """
-        result = self._mcp.call_tool("slack_read_user_profile", {})
+        result = await asyncio.to_thread(
+            self._mcp.call_tool, "slack_read_user_profile", {}
+        )
 
         # Structured shapes first, just in case.
         for candidate in (result.get("user"), result):
@@ -209,46 +206,48 @@ class SlackProducer:
 
     # ---- poll loop ------------------------------------------------------
 
-    def _run(self) -> None:
+    async def run(self) -> None:
+        if self._mcp is None or not self._mcp.enabled:
+            logger.info("SlackProducer: ClaudeMCPClient unavailable; not starting.")
+            return
         # Slight stagger so we don't hammer claude at the same instant the
         # orchestrator starts.
-        if self._stop.wait(2.0):
+        if await self._sleep_or_stop(self._STARTUP_DELAY_S):
             return
         # Retry setup until it succeeds. A transient claude --print
         # failure (auth blip, rate-limit, etc) should not permanently
-        # disable the producer for the rest of the session — the thread
+        # disable the producer for the rest of the session — the task
         # stays alive and retries every poll interval.
-        while not self._setup_in_thread():
-            if self._stop.wait(self._config.slack_poll_interval):
+        while not await self._setup_in_thread():
+            if await self._sleep_or_stop(self._config.slack_poll_interval):
                 return
         while not self._stop.is_set():
             try:
-                self._poll_once()
+                await self._poll_once()
             except Exception:
                 logger.exception("SlackProducer poll failed")
-            if self._stop.wait(self._config.slack_poll_interval):
+            if await self._sleep_or_stop(self._config.slack_poll_interval):
                 return
 
-    def _setup_in_thread(self) -> bool:
-        """Resolve user_id (and watched channel IDs) from inside the
-        worker thread.
+    async def _setup_in_thread(self) -> bool:
+        """Resolve user_id (and watched channel IDs).
 
         Returns ``True`` if setup succeeded and the poll loop should
         proceed, ``False`` otherwise (failed MCP call or empty user_id).
-        Split out from :meth:`_run` so tests can drive the setup path
+        Split out from :meth:`run` so tests can drive the setup path
         without sitting through the 2 s startup stagger. Channel
         resolution failures don't block setup — the producer still
         runs the mention search, just with no watched-channel coverage.
         """
         try:
-            self._user_id = self._fetch_user_id()
+            self._user_id = await self._fetch_user_id()
         except ClaudeMCPError as exc:
             logger.warning("SlackProducer: could not resolve user_id (%s); idling.", exc)
             return False
         if not self._user_id:
             logger.warning("SlackProducer: empty user_id from slack_read_user_profile; idling.")
             return False
-        self._watched = self._resolve_watch_channels(self._config.slack_watch_channels)
+        self._watched = await self._resolve_watch_channels(self._config.slack_watch_channels)
         logger.info(
             "SlackProducer: ready (user_id=%s, watched=%s)",
             self._user_id,
@@ -256,7 +255,7 @@ class SlackProducer:
         )
         return True
 
-    def _resolve_watch_channels(self, names: tuple[str, ...]) -> dict[str, str]:
+    async def _resolve_watch_channels(self, names: tuple[str, ...]) -> dict[str, str]:
         """Map channel name → channel_id via ``slack_search_channels``.
 
         Each lookup is one MCP call. We only need exact-name matches;
@@ -267,7 +266,8 @@ class SlackProducer:
         resolved: dict[str, str] = {}
         for name in names:
             try:
-                result = self._mcp.call_tool(
+                result = await asyncio.to_thread(
+                    self._mcp.call_tool,
                     "slack_search_channels",
                     {"query": name, "limit": 10, "response_format": "detailed"},
                 )
@@ -303,19 +303,20 @@ class SlackProducer:
             return m.group(1)
         return None
 
-    def _poll_once(self) -> None:
-        self._poll_mentions()
+    async def _poll_once(self) -> None:
+        await self._poll_mentions()
         for name, channel_id in self._watched.items():
-            self._poll_watched_channel(name, channel_id)
+            await self._poll_watched_channel(name, channel_id)
         # Cap the in-memory dedup set so it doesn't grow unbounded.
         if len(self._recent_ids) > 500:
             self._recent_ids = set(sorted(self._recent_ids)[-250:])
 
-    def _poll_mentions(self) -> None:
+    async def _poll_mentions(self) -> None:
         last_ts = self._state.last_search_ts()
         after = self._after_param(last_ts)
         try:
-            result = self._mcp.call_tool(
+            result = await asyncio.to_thread(
+                self._mcp.call_tool,
                 "slack_search_public_and_private",
                 {
                     "query": f"<@{self._user_id}>",
@@ -366,7 +367,7 @@ class SlackProducer:
             skipped_old,
         )
 
-    def _poll_watched_channel(self, channel_name: str, channel_id: str) -> None:
+    async def _poll_watched_channel(self, channel_name: str, channel_id: str) -> None:
         """Pull every new message from a watched channel (no @-mention
         filter, no bot filter — the user opted in to seeing everything)."""
         last_ts = self._state.last_channel_ts(channel_id)
@@ -374,7 +375,9 @@ class SlackProducer:
         if last_ts:
             args["oldest"] = last_ts
         try:
-            result = self._mcp.call_tool("slack_read_channel", args)
+            result = await asyncio.to_thread(
+                self._mcp.call_tool, "slack_read_channel", args
+            )
         except ClaudeMCPError as exc:
             logger.warning(
                 "SlackProducer: read channel '#%s' failed: %s", channel_name, exc

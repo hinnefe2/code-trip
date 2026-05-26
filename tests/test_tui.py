@@ -300,11 +300,13 @@ def test_render_input_panel_shows_buffer_contents():
 def test_render_producers_status_uses_supervisor():
     ctx = _make_ctx()
     sup = ProducerSupervisor()
-    # Fake two producers: one idle, one running.
-    sup.add(SimpleNamespace(name="claude", _thread=SimpleNamespace(is_alive=lambda: True),
-                            start=lambda: None, stop=lambda: None))
-    sup.add(SimpleNamespace(name="slack", _thread=None,
-                            start=lambda: None, stop=lambda: None))
+    # Fake two producers: one running, one never-started (idle).
+    sup.add(SimpleNamespace(name="claude", request_stop=lambda: None,
+                            run=lambda: None))
+    sup.add(SimpleNamespace(name="slack", request_stop=lambda: None,
+                            run=lambda: None))
+    # Simulate "claude task was created and is alive"; slack never started.
+    sup._tasks["claude"] = SimpleNamespace(done=lambda: False)
     layout = tui.render(ctx, supervisor=sup)
     out = _render_to_string(layout)
     assert "claude" in out

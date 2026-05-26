@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -101,30 +102,32 @@ def _producer(tmp_path: Path, *, poll_interval=120.0, search_query="in:inbox -fr
     return p, q, mcp, state
 
 
-def test_producer_skips_when_mcp_unavailable(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_producer_skips_when_mcp_unavailable(tmp_path: Path):
     cfg = SimpleNamespace(
         email_poll_interval=120.0,
         email_search_query="in:inbox",
         email_max_results=20,
     )
     p = EmailProducer(config=cfg, queue=TaskQueue(), mcp=None)
-    p.start()
-    assert p._thread is None
+    await asyncio.wait_for(p.run(), timeout=1.0)
 
 
-def test_producer_passes_after_param_in_query(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_producer_passes_after_param_in_query(tmp_path: Path):
     """Each poll should append ``after:<unix_ts>`` to the configured query."""
     p, _q, mcp, state = _producer(tmp_path)
     state.set_last_message_ts(1716000000)
     mcp.call_tool.return_value = {"threads": []}
-    p._poll_once()
+    await p._poll_once()
     call = mcp.call_tool.call_args
     assert call.args[0] == "search_threads"
     assert "after:1716000000" in call.args[1]["query"]
     assert "in:inbox" in call.args[1]["query"]
 
 
-def test_producer_emits_task_from_structured_threads(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_producer_emits_task_from_structured_threads(tmp_path: Path):
     p, q, mcp, state = _producer(tmp_path)
     mcp.call_tool.return_value = {
         "threads": [
@@ -142,7 +145,7 @@ def test_producer_emits_task_from_structured_threads(tmp_path: Path):
             }
         ]
     }
-    p._poll_once()
+    await p._poll_once()
     [task] = q.all()
     assert task.kind == "email_msg"
     assert task.source["thread_id"] == "T1"
@@ -154,7 +157,8 @@ def test_producer_emits_task_from_structured_threads(tmp_path: Path):
     assert state.last_message_ts() == 1716000100
 
 
-def test_producer_skips_threads_at_or_before_last_ts(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_producer_skips_threads_at_or_before_last_ts(tmp_path: Path):
     p, q, mcp, state = _producer(tmp_path)
     state.set_last_message_ts(1716000100)
     mcp.call_tool.return_value = {
@@ -183,13 +187,14 @@ def test_producer_skips_threads_at_or_before_last_ts(tmp_path: Path):
             },
         ]
     }
-    p._poll_once()
+    await p._poll_once()
     [task] = q.all()
     assert task.source["thread_id"] == "T2"
     assert state.last_message_ts() == 1716000200
 
 
-def test_producer_collapses_thread_replies_into_single_task(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_producer_collapses_thread_replies_into_single_task(tmp_path: Path):
     """A new message in the same thread updates the existing task — no
     pile-up of N tasks for one conversation."""
     p, q, mcp, _state = _producer(tmp_path)
@@ -209,7 +214,7 @@ def test_producer_collapses_thread_replies_into_single_task(tmp_path: Path):
             }
         ]
     }
-    p._poll_once()
+    await p._poll_once()
     [first] = q.all()
     # Force the next poll to consider the new ts even though the producer's
     # dedup key is per (thread, message) — we want to test thread collapse.
@@ -229,7 +234,7 @@ def test_producer_collapses_thread_replies_into_single_task(tmp_path: Path):
             }
         ]
     }
-    p._poll_once()
+    await p._poll_once()
     pending = q.pending()
     assert len(pending) == 1
     assert pending[0].id == first.id
@@ -237,21 +242,24 @@ def test_producer_collapses_thread_replies_into_single_task(tmp_path: Path):
     assert pending[0].source["message_id"] == "M2"
 
 
-def test_producer_handles_empty_results(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_producer_handles_empty_results(tmp_path: Path):
     p, q, mcp, _state = _producer(tmp_path)
     mcp.call_tool.return_value = {"threads": []}
-    p._poll_once()
+    await p._poll_once()
     assert q.all() == []
 
 
-def test_producer_resilient_to_mcp_errors(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_producer_resilient_to_mcp_errors(tmp_path: Path):
     p, q, mcp, _state = _producer(tmp_path)
     mcp.call_tool.side_effect = ClaudeMCPError("network")
-    p._poll_once()  # must not raise
+    await p._poll_once()  # must not raise
     assert q.all() == []
 
 
-def test_producer_parses_markdown_fallback(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_producer_parses_markdown_fallback(tmp_path: Path):
     """If the MCP ever returns a Slack-style detailed markdown blob, we
     still extract the thread fields."""
     p, q, mcp, _state = _producer(tmp_path)
@@ -268,7 +276,7 @@ def test_producer_parses_markdown_fallback(tmp_path: Path):
             "---\n"
         )
     }
-    p._poll_once()
+    await p._poll_once()
     [task] = q.all()
     assert task.source["thread_id"] == "TMD"
     assert task.source["message_id"] == "MMD"

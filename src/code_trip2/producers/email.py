@@ -19,9 +19,9 @@ anyway — the user can review and send from Gmail.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
-import threading
 import time
 from typing import TYPE_CHECKING
 
@@ -56,6 +56,11 @@ _BARE_EMAIL_RE = re.compile(r"[\w.+\-]+@[\w.\-]+\.[A-Za-z]{2,}")
 class EmailProducer:
     name = "email"
 
+    # Initial stagger before the first poll so producers don't all hit
+    # claude --print the instant the orchestrator starts. Class constant
+    # so tests can lower it via per-instance override.
+    _STARTUP_DELAY_S = 3.0
+
     def __init__(
         self,
         *,
@@ -68,51 +73,47 @@ class EmailProducer:
         self._queue = queue
         self._mcp = mcp
         self._state = state or EmailState()
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
+        self._stop = asyncio.Event()
         # Per-session dedup keyed by (thread_id, latest_message_id).
         # State file already handles cross-restart dedup via last_message_ts.
         self._recent_keys: set[str] = set()
 
     # ---- lifecycle ------------------------------------------------------
 
-    def start(self) -> None:
-        if self._thread is not None and self._thread.is_alive():
-            return
-        if self._mcp is None or not self._mcp.enabled:
-            logger.info("EmailProducer: ClaudeMCPClient unavailable; not starting.")
-            return
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
+    def request_stop(self) -> None:
         self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-            self._thread = None
+
+    async def _sleep_or_stop(self, timeout: float) -> bool:
+        try:
+            await asyncio.wait_for(self._stop.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
 
     # ---- poll loop ------------------------------------------------------
 
-    def _run(self) -> None:
-        # Small stagger so producers don't all hit claude --print at once.
-        if self._stop.wait(3.0):
+    async def run(self) -> None:
+        if self._mcp is None or not self._mcp.enabled:
+            logger.info("EmailProducer: ClaudeMCPClient unavailable; not starting.")
+            return
+        if await self._sleep_or_stop(self._STARTUP_DELAY_S):
             return
         while not self._stop.is_set():
             try:
-                self._poll_once()
+                await self._poll_once()
             except Exception:
                 logger.exception("EmailProducer poll failed")
-            if self._stop.wait(self._config.email_poll_interval):
+            if await self._sleep_or_stop(self._config.email_poll_interval):
                 return
 
-    def _poll_once(self) -> None:
+    async def _poll_once(self) -> None:
         last_ts = self._state.last_message_ts()
         after = self._after_param(last_ts)
         base_query = (self._config.email_search_query or "").strip()
         query = f"{base_query} after:{after}".strip()
         try:
-            result = self._mcp.call_tool(
+            result = await asyncio.to_thread(
+                self._mcp.call_tool,
                 "search_threads",
                 {
                     "query": query,

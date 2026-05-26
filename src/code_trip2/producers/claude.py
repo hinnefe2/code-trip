@@ -13,10 +13,10 @@ the hook so :func:`remote.wait_done` keeps working in focused mode.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import shlex
-import threading
 import time
 
 from code_trip2 import remote
@@ -45,76 +45,77 @@ class ClaudeProducer:
         self._queue = queue
         self._summarizer = summarizer
         self._poll = poll_interval
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
+        self._stop = asyncio.Event()
         self._seen: set[str] = set()
 
-    def start(self) -> None:
-        if not self._config.ssh_host:
-            logger.info("ClaudeProducer: no ssh_host configured; not starting.")
-            return
-        if self._thread is not None and self._thread.is_alive():
-            return
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
+    def request_stop(self) -> None:
         self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-            self._thread = None
 
     # --- internals --------------------------------------------------------
 
-    def _run(self) -> None:
+    async def run(self) -> None:
+        if not self._config.ssh_host:
+            logger.info("ClaudeProducer: no ssh_host configured; not starting.")
+            return
         host, opts = self._config.ssh_host, self._config.ssh_options
-        # Make sure the dir exists on the remote so the first poll doesn't fail.
-        self._ensure_remote_dir(host, opts)
+        await self._ensure_remote_dir(host, opts)
         while not self._stop.is_set():
             try:
-                files = self._list_remote_events(host, opts)
+                await self._poll_once(host, opts)
             except remote.RemoteError as exc:
                 logger.warning("ClaudeProducer poll failed: %s", exc)
-                if self._stop.wait(self._poll * 4):
+                if await self._sleep_or_stop(self._poll * 4):
                     return
                 continue
-            for filename in files:
-                if filename in self._seen:
-                    continue
-                self._seen.add(filename)
-                try:
-                    payload = self._read_and_clear(host, opts, filename)
-                except remote.RemoteError as exc:
-                    logger.warning("ClaudeProducer read failed for %s: %s", filename, exc)
-                    continue
-                if payload is None:
-                    continue
-                self._emit(payload)
-            if self._stop.wait(self._poll):
+            except Exception:
+                logger.exception("ClaudeProducer unexpected error")
+            if await self._sleep_or_stop(self._poll):
                 return
 
-    def _ensure_remote_dir(self, host: str, opts: tuple[str, ...]) -> None:
+    async def _sleep_or_stop(self, timeout: float) -> bool:
+        """Sleep ``timeout`` seconds or until stop fires. Returns True if stop fired."""
+        try:
+            await asyncio.wait_for(self._stop.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    async def _poll_once(self, host: str, opts: tuple[str, ...]) -> None:
+        files = await self._list_remote_events(host, opts)
+        for filename in files:
+            if filename in self._seen:
+                continue
+            self._seen.add(filename)
+            try:
+                payload = await self._read_and_clear(host, opts, filename)
+            except remote.RemoteError as exc:
+                logger.warning("ClaudeProducer read failed for %s: %s", filename, exc)
+                continue
+            if payload is None:
+                continue
+            await self._emit(payload, host, opts)
+
+    async def _ensure_remote_dir(self, host: str, opts: tuple[str, ...]) -> None:
         cmd = f"mkdir -p {shlex.quote(EVENTS_DIR)}"
         try:
-            remote._ssh(host, opts, cmd, capture=False)  # type: ignore[attr-defined]
+            await self._ssh(host, opts, cmd, capture=False)
         except remote.RemoteError:
             logger.warning("Could not create %s on remote", EVENTS_DIR)
 
-    def _list_remote_events(self, host: str, opts: tuple[str, ...]) -> list[str]:
+    async def _list_remote_events(self, host: str, opts: tuple[str, ...]) -> list[str]:
         cmd = (
             f"ls -1 {shlex.quote(EVENTS_DIR)} 2>/dev/null | grep -E '\\.json$' || true"
         )
-        out = remote._ssh(host, opts, cmd)  # type: ignore[attr-defined]
+        out = await self._ssh(host, opts, cmd)
         return [line.strip() for line in out.splitlines() if line.strip()]
 
-    def _read_and_clear(
+    async def _read_and_clear(
         self, host: str, opts: tuple[str, ...], filename: str
     ) -> dict | None:
         path = f"{EVENTS_DIR}/{filename}"
         cmd = f"cat {shlex.quote(path)} && rm -f {shlex.quote(path)}"
         try:
-            raw = remote._ssh(host, opts, cmd)  # type: ignore[attr-defined]
+            raw = await self._ssh(host, opts, cmd)
         except remote.RemoteError:
             return None
         raw = raw.strip()
@@ -126,12 +127,12 @@ class ClaudeProducer:
             logger.warning("ClaudeProducer: bad JSON in %s", filename)
             return None
 
-    def _emit(self, payload: dict) -> None:
+    async def _emit(self, payload: dict, host: str, opts: tuple[str, ...]) -> None:
         window = str(payload.get("window") or "unknown")
         finished_at = float(payload.get("finished_at") or time.time())
         last_user_msg = payload.get("last_user_msg") or ""
         headline = self._make_headline(window, last_user_msg)
-        body = self._summarize_pane(window, last_user_msg)
+        body = await self._summarize_pane(window, last_user_msg, host, opts)
         task = Task(
             kind="claude_reply",
             topic=window,
@@ -142,7 +143,13 @@ class ClaudeProducer:
         )
         self._queue.add(task)
 
-    def _summarize_pane(self, window: str, last_user_msg: str) -> str | None:
+    async def _summarize_pane(
+        self,
+        window: str,
+        last_user_msg: str,
+        host: str,
+        opts: tuple[str, ...],
+    ) -> str | None:
         """Capture the pane and run it through the summarizer.
 
         Returns the summary (audio-ready) or None if no summarizer is
@@ -153,19 +160,24 @@ class ClaudeProducer:
         """
         if self._summarizer is None or not self._summarizer.enabled:
             return None
-        host, opts = self._config.ssh_host, self._config.ssh_options
         if not host:
             return None
         try:
-            raw = remote.capture(host, opts, self._config.tmux_session, window, lines=400)
+            # remote.capture / summarizer.summarize stay sync this phase;
+            # bridged via to_thread until Phases 4–5 convert them.
+            raw = await asyncio.to_thread(
+                remote.capture, host, opts, self._config.tmux_session, window, lines=400,
+            )
         except remote.RemoteError as exc:
             logger.warning("ClaudeProducer: capture-pane failed for %s: %s", window, exc)
             return None
         if not raw or not raw.strip():
             return None
         try:
-            return self._summarizer.summarize(
-                raw, context={"kind": "claude_reply", "user_prompt": last_user_msg}
+            return await asyncio.to_thread(
+                self._summarizer.summarize,
+                raw,
+                context={"kind": "claude_reply", "user_prompt": last_user_msg},
             )
         except SummarizerError as exc:
             logger.warning("ClaudeProducer: summarize failed for %s: %s", window, exc)
@@ -176,3 +188,49 @@ class ClaudeProducer:
             snippet = last_user_msg.strip().splitlines()[0][:80]
             return f"replied to: {snippet}"
         return "finished"
+
+    # --- async SSH ---------------------------------------------------------
+
+    async def _ssh(
+        self,
+        host: str,
+        opts: tuple[str, ...],
+        cmd: str,
+        *,
+        capture: bool = True,
+        timeout: float = 30.0,
+    ) -> str:
+        """Run one SSH command via asyncio.subprocess.
+
+        Phase 2 inlines this here rather than touching ``remote.py``;
+        Phase 5 makes ``remote._ssh`` itself async and this can be
+        replaced with a call to it. Same RemoteError contract.
+        """
+        argv = ["ssh", *opts, host, cmd]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdout=asyncio.subprocess.PIPE if capture else asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except OSError as exc:
+            raise remote.RemoteError(f"SSH spawn failed: {cmd}: {exc}") from exc
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout
+            )
+        except asyncio.TimeoutError as exc:
+            proc.kill()
+            try:
+                await proc.wait()
+            except Exception:
+                pass
+            raise remote.RemoteError(f"SSH timed out: {cmd}") from exc
+        if proc.returncode != 0:
+            stderr = (stderr_b or b"").decode(errors="replace")
+            raise remote.RemoteError(
+                f"SSH failed ({proc.returncode}): {cmd}\n{stderr}"
+            )
+        if capture:
+            return (stdout_b or b"").decode(errors="replace")
+        return ""

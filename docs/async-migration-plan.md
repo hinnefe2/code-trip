@@ -1,6 +1,6 @@
 # Asyncio migration plan
 
-> **Status:** Design doc, written 2026-05-26. Not yet started.
+> **Status:** Phases 1–2 landed 2026-05-26 on the `async-migration` branch.
 
 ## Motivation
 
@@ -69,8 +69,8 @@ After this phase, nothing about the rest of the orchestrator has changed. The as
 
 ### Phase 2 — Convert producers to async tasks
 
-- `Producer` protocol: `start()` / `stop()` → `async def run(self)`.
-- `ProducerSupervisor`: holds a list of `asyncio.Task`. `start_all()` creates them; `stop_all()` cancels and awaits them.
+- `Producer` protocol: `start()` / `stop()` → `async def run(self)` + `def request_stop(self)`. (`request_stop` is sync so the supervisor and signal handler can call it without an `await`.)
+- `ProducerSupervisor`: holds a `dict[name, asyncio.Task]`. `start_all()` is sync (creates tasks); `stop_all()` is async — signals stop, waits up to 2 s for voluntary exit, then cancels stragglers.
 - Each producer's poll loop becomes:
   ```python
   async def run(self):
@@ -82,8 +82,9 @@ After this phase, nothing about the rest of the orchestrator has changed. The as
           await asyncio.wait_for(self._stop.wait(), timeout=interval)
               # except asyncio.TimeoutError pass
   ```
-- `subprocess.run` in `ClaudeProducer` (SSH ls/cat/rm) → `asyncio.create_subprocess_exec` with `await proc.communicate()`.
-- `claude --print` calls in Slack/Email producers route through `ClaudeMCPClient` (converted in Phase 5).
+- `subprocess.run` in `ClaudeProducer` (SSH ls/cat/rm) → `asyncio.create_subprocess_exec` with `await proc.communicate()`. The async SSH helper lives inline as `ClaudeProducer._ssh` for now; Phase 5 hoists it into `remote.py`.
+- `remote.capture` and `Summarizer.summarize` calls inside ClaudeProducer are bridged via `asyncio.to_thread` until Phases 4–5 convert them natively.
+- `claude --print` calls in Slack/Email producers stay sync (`ClaudeMCPClient`); Phase 2 wraps each call site in `await asyncio.to_thread(mcp.call_tool, …)`. Phase 5 converts the MCP client and the wrappers go away.
 
 **Per-producer trickiness**
 - `ClaudeProducer` polls SSH every 1.5 s; conversion is mechanical.

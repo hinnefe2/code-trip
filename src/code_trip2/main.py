@@ -455,7 +455,7 @@ async def main_async(config: Config, *, tui: bool = False) -> None:
         if dashboard is not None:
             dashboard.stop()
         consumer.stop()
-        supervisor.stop_all()
+        await supervisor.stop_all()
         macropad.stop()
         thinking.stop()
         log.close()

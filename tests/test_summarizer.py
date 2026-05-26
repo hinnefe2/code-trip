@@ -152,7 +152,8 @@ def test_summarize_or_strip_falls_back_on_empty_summary():
 # --- ClaudeProducer summarization ------------------------------------------
 
 
-def test_claude_producer_summarizes_pane():
+@pytest.mark.asyncio
+async def test_claude_producer_summarizes_pane():
     from code_trip2.producers.claude import ClaudeProducer
     from code_trip2.tasks import TaskQueue
 
@@ -166,7 +167,10 @@ def test_claude_producer_summarizes_pane():
 
     with patch("code_trip2.producers.claude.remote.capture") as cap:
         cap.return_value = "raw pane text"
-        p._emit({"window": "ticket-42", "finished_at": 1000.0, "last_user_msg": "run tests"})
+        await p._emit(
+            {"window": "ticket-42", "finished_at": 1000.0, "last_user_msg": "run tests"},
+            "remote", (),
+        )
 
     tasks = q.all()
     assert len(tasks) == 1
@@ -177,7 +181,8 @@ def test_claude_producer_summarizes_pane():
     summarizer.summarize.assert_called_once()
 
 
-def test_claude_producer_no_summarizer_leaves_body_none():
+@pytest.mark.asyncio
+async def test_claude_producer_no_summarizer_leaves_body_none():
     from code_trip2.producers.claude import ClaudeProducer
     from code_trip2.tasks import TaskQueue
 
@@ -185,7 +190,7 @@ def test_claude_producer_no_summarizer_leaves_body_none():
     q = TaskQueue()
 
     p = ClaudeProducer(config=cfg, queue=q, summarizer=None)  # type: ignore[arg-type]
-    p._emit({"window": "w", "finished_at": 1000.0})
+    await p._emit({"window": "w", "finished_at": 1000.0}, "remote", ())
 
     tasks = q.all()
     assert len(tasks) == 1
