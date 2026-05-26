@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import atexit
 import faulthandler
 import logging
@@ -46,6 +47,10 @@ logger = logging.getLogger(__name__)
 
 
 def run(config: Config, *, tui: bool = False) -> None:
+    asyncio.run(main_async(config, tui=tui))
+
+
+async def main_async(config: Config, *, tui: bool = False) -> None:
     log = SessionLogger(default_session_path())
     log.event("session_start", config={
         "tmux_session": config.tmux_session,
@@ -158,7 +163,18 @@ def run(config: Config, *, tui: bool = False) -> None:
     consumer = QueueConsumer(ctx)
     consumer.attach()
 
+    # Two shutdown events bridged together. The asyncio.Event is what
+    # main_async awaits; the threading.Event is what the still-threaded
+    # producers, consumer, and stdin paste reader poll. Both fire
+    # together so neither side has to know about the other. The
+    # threading bridge goes away in Phase 8 once everything is async.
     shutdown = threading.Event()
+    shutdown_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def _trigger_shutdown() -> None:
+        shutdown.set()
+        shutdown_event.set()
 
     def _process_audio(path: Path, skill_mode: bool) -> None:
         if stt is None:
@@ -370,12 +386,15 @@ def run(config: Config, *, tui: bool = False) -> None:
         device=config.audio_device,
     )
 
-    def _handle_signal(signum: int, _frame: object) -> None:
+    def _on_signal(signum: int) -> None:
         logger.info("Received signal %d; shutting down.", signum)
-        shutdown.set()
+        _trigger_shutdown()
 
-    signal.signal(signal.SIGINT, _handle_signal)
-    signal.signal(signal.SIGTERM, _handle_signal)
+    # add_signal_handler runs the callback on the loop, not in signal
+    # context, so it can safely set asyncio.Event. Only works on the
+    # main thread (asyncio.run runs there). Unix-only; macOS supported.
+    loop.add_signal_handler(signal.SIGINT, _on_signal, signal.SIGINT)
+    loop.add_signal_handler(signal.SIGTERM, _on_signal, signal.SIGTERM)
 
     ptt_desc = (
         f"{config.ptt_key} (forwards to {config.stt_local_hotkey})"
@@ -431,12 +450,7 @@ def run(config: Config, *, tui: bool = False) -> None:
     if dashboard is not None:
         dashboard.start()
     try:
-        # Poll instead of an indefinite wait so signal handlers (SIGINT
-        # in particular) get to run promptly. Python's signal delivery
-        # doesn't always interrupt threading.Event().wait() with no
-        # timeout on the main thread.
-        while not shutdown.is_set():
-            shutdown.wait(timeout=1.0)
+        await shutdown_event.wait()
     finally:
         if dashboard is not None:
             dashboard.stop()

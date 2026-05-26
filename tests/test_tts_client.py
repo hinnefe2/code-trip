@@ -141,6 +141,7 @@ def _stub_client():
     c._stream_rate = 0
     c._stream_channels = 0
     c._stream_lock = threading.Lock()
+    c._speak_lock = threading.Lock()
     c._stop_event = threading.Event()
     return c
 
