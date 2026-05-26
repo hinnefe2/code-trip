@@ -73,6 +73,24 @@ def test_replay_drops_old_events(tmp_path: Path):
     assert log.replay() == []
 
 
+def test_replay_demotes_active_to_pending(tmp_path: Path):
+    """A task left ``state=active`` at shutdown (e.g. orchestrator was
+    announcing it when the user hit Ctrl-C) should come back as
+    ``pending`` on replay. ``current_task`` is in-memory only, so an
+    active task with no live owner is invisible — pending makes it
+    rejoin the queue."""
+    log = QueueLog(dir_=tmp_path)
+    q = TaskQueue()
+    log.attach(q)
+    t = q.add(Task(headline="was being announced"))
+    q.mark_active(t.id)
+
+    fresh = QueueLog(dir_=tmp_path).replay()
+    assert len(fresh) == 1
+    assert fresh[0].id == t.id
+    assert fresh[0].state == "pending"
+
+
 def test_record_scoring_writes_separate_file(tmp_path: Path):
     log = QueueLog(dir_=tmp_path)
     t = Task(headline="x")

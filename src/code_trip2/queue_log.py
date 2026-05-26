@@ -100,6 +100,13 @@ class QueueLog:
         applies events in order, and drops anything older than 24 hours by
         ``created_at``. Tasks marked done/dropped during the replay window
         are not returned — they're terminal.
+
+        Tasks left in ``active`` state at shutdown are demoted back to
+        ``pending``. The active state only means anything while the
+        orchestrator is running and ``ctx.current_task`` points at it;
+        across a restart there's no one "holding" the task, so leaving
+        it active makes it invisible to both ``TaskQueue.pending()``
+        and the TUI's current-task panel.
         """
         cutoff = time.time() - _REPLAY_WINDOW_S
         state: dict[str, Task] = {}
@@ -126,8 +133,15 @@ class QueueLog:
                         state[t.id] = t
             except OSError:
                 logger.warning("Could not read %s for replay", path, exc_info=True)
-        # Surface only non-terminal entries to the live queue.
-        return [t for t in state.values() if t.state in ("pending", "active", "snoozed")]
+        out: list[Task] = []
+        for t in state.values():
+            if t.state == "active":
+                t.state = "pending"
+                out.append(t)
+            elif t.state in ("pending", "snoozed"):
+                out.append(t)
+            # done / dropped are terminal — skip.
+        return out
 
     def _recent_queue_files(self) -> list[Path]:
         try:
