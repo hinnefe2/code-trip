@@ -1,6 +1,6 @@
 # Asyncio migration plan
 
-> **Status:** Phases 1–5 landed 2026-05-26 on the `async-migration` branch.
+> **Status:** Phases 1–6 landed 2026-05-26 on the `async-migration` branch.
 
 ## Motivation
 
@@ -131,9 +131,32 @@ Remaining `asyncio.to_thread` uses after Phase 5:
 
 ### Phase 6 — Replace macropad → async bridge
 
-- Macropad keeps its pynput listener thread and audio recording thread internally. Public API stays callback-based.
-- `main.py` wraps every callback in the `_from_thread` helper described above. One pattern, applied uniformly. Existing per-callback wrapper threads (`threading.Thread(target=handle_chord, …)`) go away.
-- `on_audio` callback awaits STT then dispatches.
+The bridge itself landed as part of Phase 4 (the `_from_thread` helper was needed once `handle_chord` / `handle_tap` / `handle_voice` / `handle_skill` became coroutines). Phase 6 is the audit confirming uniformity and cataloguing what threads remain.
+
+- Macropad keeps its pynput listener thread and audio capture stream internally. Public API stays callback-based.
+- `main.py` wraps every async-bound callback in `_from_thread`. One pattern, applied uniformly:
+  - `on_audio` → `_from_thread(_process_audio, path, skill_mode)` (STT + dispatch on the loop)
+  - `on_chord` → `_from_thread(handle_chord, ctx, name)`
+  - `on_tap` → `_from_thread(handle_tap, ctx, name)`
+  - Local-STT stdin reader → `_from_thread(handle_voice|handle_skill, ctx, transcript)` (the stdin reader still runs on its own thread until Phase 7)
+- Two callbacks are intentionally **sync** because they must be callable from the pynput thread without a loop hop:
+  - `on_ptt_press` → `stop_playback(ctx)` (sets `TTSClient._stop_event`, a `threading.Event`)
+  - `on_ptt_release` → push skill-mode flag onto a `queue.Queue` for the stdin paste reader
+- No per-callback `threading.Thread(target=…)` wrappers remain. Confirmed by grep across `src/`.
+
+**Threads still alive in our code after Phase 6** (catalogued for Phase 8 cleanup):
+
+| Thread | Where | Status |
+|---|---|---|
+| pynput keyboard listener | `macropad.py` | **Irreducible** — pynput C-callback API |
+| sounddevice `InputStream` (mic capture) | `macropad.py` | **Irreducible** — PortAudio C-callback |
+| sounddevice playback in `earcon.Thinking` | `earcon.py` | **Irreducible** — PortAudio playback boundary |
+| sounddevice `OutputStream` (TTS playback, via `asyncio.to_thread`) | `tts_client.py` | **Irreducible** — executor thread per block write |
+| Rich Live render thread | `tui.py` Dashboard | Phase 7 removes (Textual owns its loop) |
+| Stdin paste reader (local-STT mode) | `main.py:_stdin_paste_loop` | Phase 7 removes (Textual's Input widget replaces it) |
+| `threading.Event` shutdown bridge | `main.py` | Phase 8 removes once the stdin reader is gone |
+
+The locks at `email_state.py`, `slack_state.py`, `input_buffer.py` are no-ops under single-loop discipline; Phase 8 drops them.
 
 ### Phase 7 — Migrate TUI to Textual
 
