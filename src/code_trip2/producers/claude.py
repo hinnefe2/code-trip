@@ -163,8 +163,7 @@ class ClaudeProducer:
         if not host:
             return None
         try:
-            # remote.capture / summarizer.summarize stay sync this phase;
-            # bridged via to_thread until Phases 4–5 convert them.
+            # remote.capture stays sync until Phase 5; bridged via to_thread.
             raw = await asyncio.to_thread(
                 remote.capture, host, opts, self._config.tmux_session, window, lines=400,
             )
@@ -174,10 +173,8 @@ class ClaudeProducer:
         if not raw or not raw.strip():
             return None
         try:
-            return await asyncio.to_thread(
-                self._summarizer.summarize,
-                raw,
-                context={"kind": "claude_reply", "user_prompt": last_user_msg},
+            return await self._summarizer.summarize(
+                raw, context={"kind": "claude_reply", "user_prompt": last_user_msg},
             )
         except SummarizerError as exc:
             logger.warning("ClaudeProducer: summarize failed for %s: %s", window, exc)

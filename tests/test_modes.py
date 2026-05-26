@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import threading
+import asyncio
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -125,6 +125,8 @@ def _real_ctx(*, terminal_apps=("kitty",)) -> modes.Context:
     )
     tts = MagicMock()
     tts.is_playing.return_value = False
+    # speak is awaited by the async handlers; sync MagicMock would error.
+    tts.speak = AsyncMock(return_value=None)
     log = MagicMock()
     thinking = MagicMock()
     return modes.Context(config=config, tts=tts, log=log, thinking=thinking)
@@ -174,38 +176,42 @@ def test_advance_playback_stops_tts_keeps_queue():
 # --- _try_global_commands --------------------------------------------------
 
 
-def test_global_repeat_with_no_history_speaks_message():
+@pytest.mark.asyncio
+async def test_global_repeat_with_no_history_speaks_message():
     ctx = _real_ctx()
-    handled = modes._try_global_commands(ctx, "repeat")
+    handled = await modes._try_global_commands(ctx, "repeat")
     assert handled is True
     ctx.tts.speak.assert_called_once()
     assert "nothing" in ctx.tts.speak.call_args.args[0].lower()
 
 
-def test_global_repeat_with_history_replays(monkeypatch):
+@pytest.mark.asyncio
+async def test_global_repeat_with_history_replays(monkeypatch):
     ctx = _real_ctx()
     ctx.last_response_chunks = ["chunk one.", "chunk two."]
     started: list[str] = []
-    monkeypatch.setattr(modes, "_start_playback_worker", lambda c: started.append("ok"))
-    handled = modes._try_global_commands(ctx, "Repeat that.")
+    monkeypatch.setattr(modes, "_start_playback_task", lambda c: started.append("ok"))
+    handled = await modes._try_global_commands(ctx, "Repeat that.")
     assert handled is True
     assert ctx.playback_queue == ["chunk one.", "chunk two."]
     assert started == ["ok"]
 
 
-def test_global_stop_clears_playback():
+@pytest.mark.asyncio
+async def test_global_stop_clears_playback():
     ctx = _real_ctx()
     ctx.playback_queue = ["a", "b"]
-    handled = modes._try_global_commands(ctx, "stop")
+    handled = await modes._try_global_commands(ctx, "stop")
     assert handled is True
     assert ctx.playback_queue == []
     ctx.tts.stop.assert_called_once()
 
 
-def test_global_status_speaks_app_and_window(monkeypatch):
+@pytest.mark.asyncio
+async def test_global_status_speaks_app_and_window(monkeypatch):
     ctx = _real_ctx()
     monkeypatch.setattr(window, "active_app", lambda: "kitty")
-    handled = modes._try_global_commands(ctx, "status")
+    handled = await modes._try_global_commands(ctx, "status")
     assert handled is True
     msg = ctx.tts.speak.call_args.args[0]
     assert "kitty" in msg.lower()
@@ -215,21 +221,24 @@ def test_global_status_speaks_app_and_window(monkeypatch):
 # --- _try_voice_phrase -----------------------------------------------------
 
 
-def test_voice_phrase_next_without_tickets_falls_through():
+@pytest.mark.asyncio
+async def test_voice_phrase_next_without_tickets_falls_through():
     ctx = _real_ctx()
-    handled = modes._try_voice_phrase(ctx, "next")
+    handled = await modes._try_voice_phrase(ctx, "next")
     assert handled is False
 
 
-def test_voice_phrase_next_with_tickets_steps(monkeypatch):
+@pytest.mark.asyncio
+async def test_voice_phrase_next_with_tickets_steps(monkeypatch):
     ctx = _real_ctx()
     ctx.tickets = [{"id": "T-1", "title": "one"}, {"id": "T-2", "title": "two"}]
-    handled = modes._try_voice_phrase(ctx, "next")
+    handled = await modes._try_voice_phrase(ctx, "next")
     assert handled is True
     assert ctx.ticket_index == 1
 
 
-def test_voice_phrase_select_n_with_tickets(monkeypatch):
+@pytest.mark.asyncio
+async def test_voice_phrase_select_n_with_tickets(monkeypatch):
     ctx = _real_ctx()
     ctx.tickets = [
         {"id": "T-1", "title": "one", "branch": "t-1"},
@@ -237,30 +246,32 @@ def test_voice_phrase_select_n_with_tickets(monkeypatch):
     ]
     monkeypatch.setattr(modes.remote, "new_window", MagicMock())
     monkeypatch.setattr(modes.remote, "send", MagicMock())
-    handled = modes._try_voice_phrase(ctx, "select 2")
+    handled = await modes._try_voice_phrase(ctx, "select 2")
     assert handled is True
     assert ctx.active_window == "t-2"
     assert ctx.ticket_index == 1
 
 
-def test_voice_phrase_list_windows(monkeypatch):
+@pytest.mark.asyncio
+async def test_voice_phrase_list_windows(monkeypatch):
     ctx = _real_ctx()
     monkeypatch.setattr(
         modes.remote,
         "list_windows",
         lambda *a, **kw: [(0, "main", "/"), (1, "linear", "/x")],
     )
-    handled = modes._try_voice_phrase(ctx, "list windows")
+    handled = await modes._try_voice_phrase(ctx, "list windows")
     assert handled is True
     msg = ctx.tts.speak.call_args.args[0]
     assert "main" in msg and "linear" in msg
 
 
-def test_voice_phrase_switch_to(monkeypatch):
+@pytest.mark.asyncio
+async def test_voice_phrase_switch_to(monkeypatch):
     ctx = _real_ctx()
     sel = MagicMock()
     monkeypatch.setattr(modes.remote, "select_window", sel)
-    handled = modes._try_voice_phrase(ctx, "switch to ticket-1")
+    handled = await modes._try_voice_phrase(ctx, "switch to ticket-1")
     assert handled is True
     sel.assert_called_once()
     assert ctx.active_window == "ticket-1"
@@ -269,25 +280,36 @@ def test_voice_phrase_switch_to(monkeypatch):
 # --- handle_voice dispatcher ----------------------------------------------
 
 
-def test_dispatch_terminal_app_routes_to_work(monkeypatch):
+@pytest.mark.asyncio
+async def test_dispatch_terminal_app_routes_to_work(monkeypatch):
     ctx = _real_ctx(terminal_apps=("kitty", "iTerm2"))
     work_calls: list[str] = []
     monkeypatch.setattr(window, "active_app", lambda: "kitty")
-    monkeypatch.setattr(modes, "_work_voice", lambda c, t: work_calls.append(t))
-    modes.handle_voice(ctx, "do the thing")
+
+    async def fake_work(c, t):
+        work_calls.append(t)
+
+    monkeypatch.setattr(modes, "_work_voice", fake_work)
+    await modes.handle_voice(ctx, "do the thing")
     assert work_calls == ["do the thing"]
 
 
-def test_dispatch_non_terminal_app_routes_to_dictate(monkeypatch):
+@pytest.mark.asyncio
+async def test_dispatch_non_terminal_app_routes_to_dictate(monkeypatch):
     ctx = _real_ctx()
     dictate_calls: list[str] = []
     monkeypatch.setattr(window, "active_app", lambda: "Google Chrome")
-    monkeypatch.setattr(modes, "_dictate_voice", lambda c, t: dictate_calls.append(t))
-    modes.handle_voice(ctx, "type this in the browser")
+
+    async def fake_dictate(c, t):
+        dictate_calls.append(t)
+
+    monkeypatch.setattr(modes, "_dictate_voice", fake_dictate)
+    await modes.handle_voice(ctx, "type this in the browser")
     assert dictate_calls == ["type this in the browser"]
 
 
-def test_dispatch_falls_back_to_work_on_active_app_error(monkeypatch):
+@pytest.mark.asyncio
+async def test_dispatch_falls_back_to_work_on_active_app_error(monkeypatch):
     ctx = _real_ctx()
     work_calls: list[str] = []
 
@@ -295,34 +317,45 @@ def test_dispatch_falls_back_to_work_on_active_app_error(monkeypatch):
         raise window.WindowError("osascript broken")
 
     monkeypatch.setattr(window, "active_app", boom)
-    monkeypatch.setattr(modes, "_work_voice", lambda c, t: work_calls.append(t))
-    modes.handle_voice(ctx, "hi")
+
+    async def fake_work(c, t):
+        work_calls.append(t)
+
+    monkeypatch.setattr(modes, "_work_voice", fake_work)
+    await modes.handle_voice(ctx, "hi")
     assert work_calls == ["hi"]
 
 
-def test_dispatch_voice_phrase_wins_over_focus(monkeypatch):
+@pytest.mark.asyncio
+async def test_dispatch_voice_phrase_wins_over_focus(monkeypatch):
     ctx = _real_ctx()
     ctx.tickets = [{"id": "T-1", "title": "one"}]
     monkeypatch.setattr(window, "active_app", lambda: "Google Chrome")
     work_calls: list[str] = []
-    monkeypatch.setattr(modes, "_work_voice", lambda c, t: work_calls.append(t))
-    modes.handle_voice(ctx, "next")
+
+    async def fake_work(c, t):
+        work_calls.append(t)
+
+    monkeypatch.setattr(modes, "_work_voice", fake_work)
+    await modes.handle_voice(ctx, "next")
     # ticket step ran, NOT _work_voice
     assert work_calls == []
     assert ctx.ticket_index == 0  # only one ticket; modulo wraps to 0
 
 
-def test_empty_transcript_is_noop(monkeypatch):
+@pytest.mark.asyncio
+async def test_empty_transcript_is_noop(monkeypatch):
     ctx = _real_ctx()
     monkeypatch.setattr(window, "active_app", lambda: "kitty")
-    modes.handle_voice(ctx, "   ")
+    await modes.handle_voice(ctx, "   ")
     ctx.tts.speak.assert_not_called()
 
 
 # --- chord tap routing during playback ------------------------------------
 
 
-def test_nav_tap_flips_mode_even_during_playback(monkeypatch):
+@pytest.mark.asyncio
+async def test_nav_tap_flips_mode_even_during_playback(monkeypatch):
     """NAV solo tap flips app-mode regardless of playback state. The
     earlier 'advance chunk' behavior on NAV is gone — chunks auto-
     advance via the playback worker."""
@@ -335,7 +368,7 @@ def test_nav_tap_flips_mode_even_during_playback(monkeypatch):
     flipped: list = []
     monkeypatch.setattr(dispatch, "flip_mode", lambda c: flipped.append(c))
 
-    chords.handle_tap(ctx, "nav")
+    await chords.handle_tap(ctx, "nav")
 
     assert flipped == [ctx]
     assert sent == []
@@ -343,21 +376,23 @@ def test_nav_tap_flips_mode_even_during_playback(monkeypatch):
     assert ctx.playback_queue == ["a", "b"]
 
 
-def test_act_tap_stops_playback_when_active(monkeypatch):
+@pytest.mark.asyncio
+async def test_act_tap_stops_playback_when_active(monkeypatch):
     """ACT solo tap interrupts TTS playback (was: NO tap)."""
     ctx = _real_ctx()
     ctx.playback_queue = ["a", "b"]
     sent: list = []
     monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
 
-    chords.handle_tap(ctx, "act")
+    await chords.handle_tap(ctx, "act")
 
     assert sent == []
     ctx.tts.stop.assert_called_once()
     assert ctx.playback_queue == []  # stop_playback clears the queue
 
 
-def test_no_tap_skips_task_during_playback_in_queue_mode(monkeypatch):
+@pytest.mark.asyncio
+async def test_no_tap_skips_task_during_playback_in_queue_mode(monkeypatch):
     """NO no longer stops playback as a side effect — in queue mode it
     just skips the current task (which on its own ends the announce-
     ment via the worker draining)."""
@@ -366,33 +401,39 @@ def test_no_tap_skips_task_during_playback_in_queue_mode(monkeypatch):
     ctx.app_mode = "queue"
     ctx.playback_queue = ["a"]
     skipped: list = []
-    monkeypatch.setattr(dispatch, "queue_no_tap", lambda c: skipped.append(c))
 
-    chords.handle_tap(ctx, "no")
+    async def fake_no_tap(c):
+        skipped.append(c)
+
+    monkeypatch.setattr(dispatch, "queue_no_tap", fake_no_tap)
+
+    await chords.handle_tap(ctx, "no")
 
     assert skipped == [ctx]
 
 
-def test_yes_tap_unchanged_during_playback(monkeypatch):
+@pytest.mark.asyncio
+async def test_yes_tap_unchanged_during_playback(monkeypatch):
     ctx = _real_ctx()
     ctx.app_mode = "focused"  # YES in focused mode = Enter keystroke
     ctx.playback_queue = ["a"]
     sent: list = []
     monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
 
-    chords.handle_tap(ctx, "yes")
+    await chords.handle_tap(ctx, "yes")
 
     assert sent == [chords._TAP_YES]
 
 
-def test_no_tap_when_idle_in_focused_mode_sends_escape(monkeypatch):
+@pytest.mark.asyncio
+async def test_no_tap_when_idle_in_focused_mode_sends_escape(monkeypatch):
     ctx = _real_ctx()
     ctx.app_mode = "focused"  # queue empty, tts not playing
     sent: list = []
     monkeypatch.setattr(window, "send_keystroke", lambda s: sent.append(s))
     monkeypatch.setattr(window, "active_app", lambda: "TextEdit")
 
-    chords.handle_tap(ctx, "no")
+    await chords.handle_tap(ctx, "no")
 
     assert sent == [chords._TAP_NO]
 
@@ -400,47 +441,52 @@ def test_no_tap_when_idle_in_focused_mode_sends_escape(monkeypatch):
 # --- chunked playback worker (integration with mocked tts) ----------------
 
 
-def test_speak_chunked_drains_queue_via_worker(monkeypatch):
+@pytest.mark.asyncio
+async def test_speak_chunked_drains_queue_via_worker(monkeypatch):
     ctx = _real_ctx()
     spoken: list[str] = []
 
-    def fake_speak(text: str) -> None:
+    async def fake_speak(text: str) -> None:
         spoken.append(text)
 
-    ctx.tts.speak.side_effect = fake_speak
+    ctx.tts.speak = AsyncMock(side_effect=fake_speak)
     # Avoid actually calling sounddevice via earcon.completion in the worker.
     monkeypatch.setattr(modes.earcon, "completion", lambda: None)
 
     modes._speak_chunked(ctx, "Sentence one. Sentence two.\n\nNew para here.")
-    # Wait for worker to finish.
-    if ctx._playback_thread is not None:
-        ctx._playback_thread.join(timeout=2.0)
+    # Wait for the playback task to finish.
+    if ctx._playback_task is not None:
+        await asyncio.wait_for(ctx._playback_task, timeout=2.0)
 
     assert spoken == ["Sentence one. Sentence two.", "New para here."]
     assert ctx.last_response_chunks == ["Sentence one. Sentence two.", "New para here."]
     assert ctx.playback_queue == []
 
 
-def test_stop_during_playback_drops_remaining(monkeypatch):
+@pytest.mark.asyncio
+async def test_stop_during_playback_drops_remaining(monkeypatch):
     ctx = _real_ctx()
-    started = threading.Event()
-    proceed = threading.Event()
+    started = asyncio.Event()
+    proceed = asyncio.Event()
     spoken: list[str] = []
 
-    def slow_speak(text: str) -> None:
+    async def slow_speak(text: str) -> None:
         spoken.append(text)
         started.set()
-        proceed.wait(timeout=2.0)
+        try:
+            await asyncio.wait_for(proceed.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pass
 
-    ctx.tts.speak.side_effect = slow_speak
+    ctx.tts.speak = AsyncMock(side_effect=slow_speak)
     monkeypatch.setattr(modes.earcon, "completion", lambda: None)
 
     modes._speak_chunked(ctx, "Chunk one. " + ("x. " * 80))
-    started.wait(timeout=2.0)
+    await asyncio.wait_for(started.wait(), timeout=2.0)
     modes.stop_playback(ctx)
     proceed.set()
-    if ctx._playback_thread is not None:
-        ctx._playback_thread.join(timeout=2.0)
+    if ctx._playback_task is not None:
+        await asyncio.wait_for(ctx._playback_task, timeout=2.0)
 
     # Only the first chunk got spoken because we stopped before the rest.
     assert len(spoken) == 1

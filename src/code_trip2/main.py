@@ -176,32 +176,50 @@ async def main_async(config: Config, *, tui: bool = False) -> None:
         shutdown.set()
         shutdown_event.set()
 
-    def _process_audio(path: Path, skill_mode: bool) -> None:
+    # Bridge from threaded callbacks (macropad's pynput listener, stdin
+    # paste reader) onto the asyncio loop. Phase 6 documents this as the
+    # one well-defined seam between the irreducible threaded boundaries
+    # and the orchestrator. The done callback surfaces task exceptions
+    # to the log instead of asyncio silently warning on GC.
+    def _from_thread(coro_fn, *args, **kwargs) -> None:
+        def _schedule() -> None:
+            task = loop.create_task(coro_fn(*args, **kwargs))
+            task.add_done_callback(_log_task_exception)
+        loop.call_soon_threadsafe(_schedule)
+
+    def _log_task_exception(task: "asyncio.Task") -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.exception(
+                "Background task %r failed", task.get_name(), exc_info=exc
+            )
+
+    async def _process_audio(path: Path, skill_mode: bool) -> None:
         if stt is None:
             logger.warning("on_audio fired in non-openai STT mode; ignoring %s", path)
             return
         try:
-            transcript = stt.transcribe(path)
+            transcript = await stt.transcribe(path)
         except STTClientError as exc:
             logger.exception("STT failed")
             try:
                 earcon.error()
-                tts.speak(f"Transcription failed: {exc}")
+                await tts.speak(f"Transcription failed: {exc}")
             except Exception:
                 pass
             return
         logger.info("Transcribed (skill_mode=%s): %s", skill_mode, transcript)
         if skill_mode:
-            handle_skill(ctx, transcript)
+            await handle_skill(ctx, transcript)
         else:
-            handle_voice(ctx, transcript)
+            await handle_voice(ctx, transcript)
 
     def on_audio(path: Path, *, skill_mode: bool = False) -> None:
-        # Run STT + dispatch off the macropad listener thread so taps stay
-        # responsive while a turn is in flight (wait_done can take 5–15s).
-        threading.Thread(
-            target=_process_audio, args=(path, skill_mode), daemon=True
-        ).start()
+        # Macropad listener thread → loop. STT + dispatch run on the loop
+        # so taps stay responsive while a turn is in flight.
+        _from_thread(_process_audio, path, skill_mode)
 
     # --- local-STT (Superwhisper / clipboard-paste) integration ----------
     #
@@ -348,22 +366,22 @@ async def main_async(config: Config, *, tui: bool = False) -> None:
             skill_mode = False
         logger.info("submit transcript (skill_mode=%s): %s", skill_mode, transcript)
         if skill_mode:
-            handle_skill(ctx, transcript)
+            _from_thread(handle_skill, ctx, transcript)
         else:
-            handle_voice(ctx, transcript)
+            _from_thread(handle_voice, ctx, transcript)
 
     def on_ptt_press() -> None:
         # PTT-press while Claude is speaking should stop playback so the
-        # mic input isn't talking over TTS.
+        # mic input isn't talking over TTS. stop_playback is sync and
+        # thread-safe (tts.stop just sets a threading.Event).
         stop_playback(ctx)
 
-    # Dispatch off the pynput listener thread — anything slow (TTS,
-    # ssh capture) here would freeze the keyboard.
+    # Macropad listener thread → loop, via the same bridge as on_audio.
     def on_chord(name: str) -> None:
-        threading.Thread(target=handle_chord, args=(ctx, name), daemon=True).start()
+        _from_thread(handle_chord, ctx, name)
 
     def on_tap(name: str) -> None:
-        threading.Thread(target=handle_tap, args=(ctx, name), daemon=True).start()
+        _from_thread(handle_tap, ctx, name)
 
     ptt_forward_key = (
         resolve_key(config.stt_local_hotkey) if config.stt_provider == "local" else None

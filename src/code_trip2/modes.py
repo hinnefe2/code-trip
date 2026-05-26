@@ -20,10 +20,10 @@ or fall through to the focused-app keystroke.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
-import threading
 from dataclasses import dataclass, field
 
 from code_trip2 import earcon, remote, window
@@ -54,13 +54,11 @@ class Context:
     # Last prompt sent to the active pane — anchor for finding Claude's
     # response in the captured pane text.
     last_sent_prompt: str = ""
-    # Chunked playback state.
+    # Chunked playback state. Single-loop discipline: every mutation
+    # happens on the event loop thread, no lock needed.
     playback_queue: list[str] = field(default_factory=list)
     last_response_chunks: list[str] = field(default_factory=list)
-    _playback_lock: threading.Lock = field(
-        default_factory=threading.Lock, init=False, repr=False
-    )
-    _playback_thread: "threading.Thread | None" = field(
+    _playback_task: "asyncio.Task | None" = field(
         default=None, init=False, repr=False
     )
     # Task-queue interaction surface (queue mode).
@@ -111,31 +109,31 @@ class Context:
 # --- top-level dispatch ----------------------------------------------------
 
 
-def handle_voice(ctx: Context, transcript: str) -> None:
+async def handle_voice(ctx: Context, transcript: str) -> None:
     """Route a PTT transcript: globals → voice phrases → app focus."""
     t = transcript.strip()
     if not t:
         return
 
-    if _try_global_commands(ctx, t):
+    if await _try_global_commands(ctx, t):
         return
-    if _try_voice_phrase(ctx, t):
+    if await _try_voice_phrase(ctx, t):
         return
-    _dispatch_by_focus(ctx, t)
+    await _dispatch_by_focus(ctx, t)
 
 
-def _dispatch_by_focus(ctx: Context, t: str) -> None:
+async def _dispatch_by_focus(ctx: Context, t: str) -> None:
     try:
         app = window.active_app()
     except window.WindowError as exc:
         logger.warning("active_app failed (%s); defaulting to WORK branch.", exc)
-        _work_voice(ctx, t)
+        await _work_voice(ctx, t)
         return
 
     if app in ctx.config.terminal_apps:
-        _work_voice(ctx, t)
+        await _work_voice(ctx, t)
     else:
-        _dictate_voice(ctx, t)
+        await _dictate_voice(ctx, t)
 
 
 # --- global commands -------------------------------------------------------
@@ -147,13 +145,12 @@ def replay_last(ctx: Context) -> bool:
     handlers."""
     if not ctx.last_response_chunks:
         return False
-    with ctx._playback_lock:
-        ctx.playback_queue = list(ctx.last_response_chunks)
-    _start_playback_worker(ctx)
+    ctx.playback_queue = list(ctx.last_response_chunks)
+    _start_playback_task(ctx)
     return True
 
 
-def _try_global_commands(ctx: Context, t: str) -> bool:
+async def _try_global_commands(ctx: Context, t: str) -> bool:
     low = t.lower().strip(" .!?")
     if (
         low == "what"
@@ -162,7 +159,7 @@ def _try_global_commands(ctx: Context, t: str) -> bool:
         or "say it again" in low
     ):
         if not replay_last(ctx):
-            _speak(ctx, "Nothing to repeat.")
+            await _speak(ctx, "Nothing to repeat.")
         return True
     if low in ("stop", "cancel", "stop talking", "shut up", "be quiet"):
         stop_playback(ctx)
@@ -172,7 +169,7 @@ def _try_global_commands(ctx: Context, t: str) -> bool:
             app = window.active_app()
         except window.WindowError:
             app = "unknown"
-        _speak(ctx, f"App {app}. Window {ctx.active_window}.")
+        await _speak(ctx, f"App {app}. Window {ctx.active_window}.")
         return True
     return False
 
@@ -180,40 +177,40 @@ def _try_global_commands(ctx: Context, t: str) -> bool:
 # --- voice phrases ---------------------------------------------------------
 
 
-def _try_voice_phrase(ctx: Context, t: str) -> bool:
+async def _try_voice_phrase(ctx: Context, t: str) -> bool:
     low = t.lower()
 
     if any(p in low for p in (
         "list tickets", "show tickets", "my tickets",
         "refresh tickets", "reload tickets",
     )):
-        _linear_refresh(ctx)
+        await _linear_refresh(ctx)
         return True
     if ctx.tickets:
         bare = low.strip(" .!?")
         if bare in ("next", "next ticket"):
-            _linear_step(ctx, +1)
+            await _linear_step(ctx, +1)
             return True
         if bare in ("previous", "prev", "back", "previous ticket"):
-            _linear_step(ctx, -1)
+            await _linear_step(ctx, -1)
             return True
         m = re.match(r"(?:select|work on|start)\s+(?:ticket\s+)?(\d+|this)", low)
         if m:
             token = m.group(1)
             idx = ctx.ticket_index if token == "this" else int(token) - 1
-            _linear_select(ctx, idx)
+            await _linear_select(ctx, idx)
             return True
 
     if "list windows" in low or "what windows" in low:
-        _announce_windows(ctx)
+        await _announce_windows(ctx)
         return True
     m = re.match(r"(?:switch(?:\s+to)?|go\s+to)\s+(.+?)[\.\s]*$", low)
     if m:
-        _select_window(ctx, m.group(1).strip())
+        await _select_window(ctx, m.group(1).strip())
         return True
     m = re.match(r"new\s+window\s+(.+?)[\.\s]*$", low)
     if m:
-        _new_window(ctx, m.group(1).strip())
+        await _new_window(ctx, m.group(1).strip())
         return True
 
     return False
@@ -222,11 +219,11 @@ def _try_voice_phrase(ctx: Context, t: str) -> bool:
 # --- DICTATE branch --------------------------------------------------------
 
 
-def _dictate_voice(ctx: Context, t: str) -> None:
+async def _dictate_voice(ctx: Context, t: str) -> None:
     try:
         window.paste_text(t)
     except window.WindowError as exc:
-        _report_error(ctx, f"Could not paste: {exc}")
+        await _report_error(ctx, f"Could not paste: {exc}")
         return
     ctx.log.event("turn", branch="dictate", transcript=t)
 
@@ -234,7 +231,7 @@ def _dictate_voice(ctx: Context, t: str) -> None:
 # --- WORK branch -----------------------------------------------------------
 
 
-def _work_voice(ctx: Context, t: str) -> None:
+async def _work_voice(ctx: Context, t: str) -> None:
     host, opts = ctx.ssh
     win = ctx.active_window
     cfg = ctx.config
@@ -243,9 +240,11 @@ def _work_voice(ctx: Context, t: str) -> None:
     stop_playback(ctx)
 
     try:
-        remote.send(host, opts, cfg.tmux_session, win, t)
+        # remote.* stays sync this phase; bridged via to_thread until
+        # Phase 5 makes remote.py async.
+        await asyncio.to_thread(remote.send, host, opts, cfg.tmux_session, win, t)
     except remote.RemoteError as exc:
-        _report_error(ctx, f"Could not reach Claude: {exc}")
+        await _report_error(ctx, f"Could not reach Claude: {exc}")
         return
     ctx.last_sent_prompt = t
 
@@ -253,22 +252,26 @@ def _work_voice(ctx: Context, t: str) -> None:
     raw: str | None = None
     try:
         try:
-            remote.wait_done(host, opts, win, timeout=cfg.wait_timeout)
+            await asyncio.to_thread(
+                remote.wait_done, host, opts, win, timeout=cfg.wait_timeout,
+            )
         except remote.WaitTimeout:
-            _report_error(ctx, "Claude did not respond in time.")
+            await _report_error(ctx, "Claude did not respond in time.")
             return
         except remote.RemoteError as exc:
-            _report_error(ctx, f"Lost connection to Claude: {exc}")
+            await _report_error(ctx, f"Lost connection to Claude: {exc}")
             return
         try:
-            raw = remote.capture(host, opts, cfg.tmux_session, win, lines=2000)
+            raw = await asyncio.to_thread(
+                remote.capture, host, opts, cfg.tmux_session, win, lines=2000,
+            )
         except remote.RemoteError as exc:
-            _report_error(ctx, f"Could not read Claude's response: {exc}")
+            await _report_error(ctx, f"Could not read Claude's response: {exc}")
             return
     finally:
         ctx.thinking.stop()
 
-    spoken, summarized = _summarize_or_strip(ctx, raw or "", t)
+    spoken, summarized = await _summarize_or_strip(ctx, raw or "", t)
     ctx.log.event(
         "turn",
         branch="work",
@@ -278,12 +281,12 @@ def _work_voice(ctx: Context, t: str) -> None:
         summarized=summarized,
     )
     if not spoken:
-        _speak(ctx, "No output.")
+        await _speak(ctx, "No output.")
         return
-    _speak_chunked(ctx, spoken)
+    speak_chunked(ctx, spoken)
 
 
-def _summarize_or_strip(ctx: Context, raw: str, prompt: str) -> tuple[str, bool]:
+async def _summarize_or_strip(ctx: Context, raw: str, prompt: str) -> tuple[str, bool]:
     """Run the summarizer if available; otherwise fall back to clean_output.
 
     Returns ``(spoken_text, summarized)`` where ``summarized`` is True iff
@@ -292,7 +295,7 @@ def _summarize_or_strip(ctx: Context, raw: str, prompt: str) -> tuple[str, bool]
     """
     if ctx.summarizer is not None and ctx.summarizer.enabled and raw.strip():
         try:
-            text = ctx.summarizer.summarize(
+            text = await ctx.summarizer.summarize(
                 raw, context={"kind": "claude_reply", "user_prompt": prompt}
             )
         except SummarizerError as exc:
@@ -400,38 +403,35 @@ def _speak_chunked(ctx: Context, text: str) -> None:
 
 def speak_chunked(ctx: Context, text: str) -> None:
     """Public entry point: chunk ``text`` and start playback. Replaces any
-    pending playback. Sets ``last_response_chunks`` for repeat support."""
+    pending playback. Sets ``last_response_chunks`` for repeat support.
+
+    Sync because callers (dispatch handlers, the queue consumer) shouldn't
+    wait for playback to finish — they want fire-and-forget. The actual
+    speaking happens on an asyncio task spawned by ``_start_playback_task``.
+    """
     chunks = chunk_text(text)
     if not chunks:
         return
-    with ctx._playback_lock:
-        ctx.last_response_chunks = list(chunks)
-        ctx.playback_queue = list(chunks)
-    _start_playback_worker(ctx)
+    ctx.last_response_chunks = list(chunks)
+    ctx.playback_queue = list(chunks)
+    _start_playback_task(ctx)
 
 
-def _start_playback_worker(ctx: Context) -> None:
-    with ctx._playback_lock:
-        existing = ctx._playback_thread
-        if existing is not None and existing.is_alive():
-            # An existing worker will pick up the new queue items.
-            return
-        if not ctx.playback_queue:
-            return
-        thread = threading.Thread(target=_playback_loop, args=(ctx,), daemon=True)
-        ctx._playback_thread = thread
-    thread.start()
+def _start_playback_task(ctx: Context) -> None:
+    if ctx._playback_task is not None and not ctx._playback_task.done():
+        # An existing task will pick up the new queue items.
+        return
+    if not ctx.playback_queue:
+        return
+    ctx._playback_task = asyncio.create_task(_playback_loop(ctx), name="playback")
 
 
-def _playback_loop(ctx: Context) -> None:
+async def _playback_loop(ctx: Context) -> None:
     try:
-        while True:
-            with ctx._playback_lock:
-                if not ctx.playback_queue:
-                    break
-                chunk = ctx.playback_queue.pop(0)
+        while ctx.playback_queue:
+            chunk = ctx.playback_queue.pop(0)
             try:
-                ctx.tts.speak(chunk)
+                await ctx.tts.speak(chunk)
             except TTSClientError:
                 logger.exception("TTS failed for chunk")
                 break
@@ -440,19 +440,21 @@ def _playback_loop(ctx: Context) -> None:
         except earcon.EarconError:
             pass
     finally:
-        with ctx._playback_lock:
-            ctx._playback_thread = None
+        ctx._playback_task = None
 
 
 def advance_playback(ctx: Context) -> None:
-    """Skip the current chunk; the worker will pick up the next one."""
+    """Skip the current chunk; the playback task will pick up the next."""
     ctx.tts.stop()
 
 
 def stop_playback(ctx: Context) -> None:
-    """Drop pending chunks and interrupt current playback."""
-    with ctx._playback_lock:
-        ctx.playback_queue.clear()
+    """Drop pending chunks and interrupt current playback.
+
+    Sync so it can be called from the macropad's pynput listener thread
+    (on_ptt_press); ``ctx.tts.stop()`` is also sync and thread-safe.
+    """
+    ctx.playback_queue.clear()
     ctx.tts.stop()
 
 
@@ -460,47 +462,52 @@ def is_playback_active(ctx: Context) -> bool:
     """True while audio is playing or chunks remain queued."""
     if ctx.tts.is_playing():
         return True
-    with ctx._playback_lock:
-        return bool(ctx.playback_queue)
+    return bool(ctx.playback_queue)
 
 
 # --- window navigation -----------------------------------------------------
 
 
-def _select_window(ctx: Context, name: str) -> None:
+async def _select_window(ctx: Context, name: str) -> None:
     host, opts = ctx.ssh
     try:
-        remote.select_window(host, opts, ctx.config.tmux_session, name)
+        await asyncio.to_thread(
+            remote.select_window, host, opts, ctx.config.tmux_session, name,
+        )
     except remote.RemoteError as exc:
-        _report_error(ctx, f"Could not switch: {exc}")
+        await _report_error(ctx, f"Could not switch: {exc}")
         return
     ctx.active_window = name
-    _speak(ctx, f"Switched to {name}.")
+    await _speak(ctx, f"Switched to {name}.")
 
 
-def _new_window(ctx: Context, name: str) -> None:
+async def _new_window(ctx: Context, name: str) -> None:
     host, opts = ctx.ssh
     try:
-        remote.new_window(host, opts, ctx.config.tmux_session, name)
+        await asyncio.to_thread(
+            remote.new_window, host, opts, ctx.config.tmux_session, name,
+        )
     except remote.RemoteError as exc:
-        _report_error(ctx, f"Could not create window: {exc}")
+        await _report_error(ctx, f"Could not create window: {exc}")
         return
     ctx.active_window = name
-    _speak(ctx, f"Created window {name}.")
+    await _speak(ctx, f"Created window {name}.")
 
 
-def _announce_windows(ctx: Context) -> None:
+async def _announce_windows(ctx: Context) -> None:
     host, opts = ctx.ssh
     try:
-        rows = remote.list_windows(host, opts, ctx.config.tmux_session)
+        rows = await asyncio.to_thread(
+            remote.list_windows, host, opts, ctx.config.tmux_session,
+        )
     except remote.RemoteError as exc:
-        _report_error(ctx, f"Could not list windows: {exc}")
+        await _report_error(ctx, f"Could not list windows: {exc}")
         return
     if not rows:
-        _speak(ctx, "No windows.")
+        await _speak(ctx, "No windows.")
         return
     names = ", ".join(name for _idx, name, _cwd in rows)
-    _speak(ctx, f"{len(rows)} windows: {names}.")
+    await _speak(ctx, f"{len(rows)} windows: {names}.")
 
 
 # --- LINEAR ----------------------------------------------------------------
@@ -515,61 +522,63 @@ _LINEAR_REFRESH_PROMPT = (
 _JSON_ARRAY_RE = re.compile(r"\[\s*\{.*\}\s*\]", re.DOTALL)
 
 
-def _linear_refresh(ctx: Context) -> None:
+async def _linear_refresh(ctx: Context) -> None:
     host, opts = ctx.ssh
     cfg = ctx.config
     win = cfg.linear_window
     prompt = f"claude -p {json.dumps(_LINEAR_REFRESH_PROMPT)}"
     try:
-        remote.send(host, opts, cfg.tmux_session, win, prompt)
-        remote.wait_done(host, opts, win, timeout=cfg.wait_timeout)
-        raw = remote.capture(host, opts, cfg.tmux_session, win, lines=400)
+        await asyncio.to_thread(remote.send, host, opts, cfg.tmux_session, win, prompt)
+        await asyncio.to_thread(remote.wait_done, host, opts, win, timeout=cfg.wait_timeout)
+        raw = await asyncio.to_thread(
+            remote.capture, host, opts, cfg.tmux_session, win, lines=400,
+        )
     except (remote.RemoteError, remote.WaitTimeout) as exc:
-        _report_error(ctx, f"Could not refresh tickets: {exc}")
+        await _report_error(ctx, f"Could not refresh tickets: {exc}")
         return
     match = _JSON_ARRAY_RE.search(raw)
     if not match:
-        _report_error(ctx, "No ticket JSON found.")
+        await _report_error(ctx, "No ticket JSON found.")
         return
     try:
         payload = json.loads(match.group(0))
     except json.JSONDecodeError as exc:
-        _report_error(ctx, f"Invalid ticket JSON: {exc}")
+        await _report_error(ctx, f"Invalid ticket JSON: {exc}")
         return
     tickets: list[dict] = [t for t in payload if isinstance(t, dict) and t.get("id")]
     ctx.tickets = tickets
     ctx.ticket_index = 0
-    _speak(ctx, f"{len(tickets)} tickets.")
-    _linear_announce(ctx)
+    await _speak(ctx, f"{len(tickets)} tickets.")
+    await _linear_announce(ctx)
 
 
-def _linear_step(ctx: Context, delta: int) -> None:
+async def _linear_step(ctx: Context, delta: int) -> None:
     if not ctx.tickets:
-        _speak(ctx, "No tickets. Say 'list tickets' to refresh.")
+        await _speak(ctx, "No tickets. Say 'list tickets' to refresh.")
         return
     ctx.ticket_index = (ctx.ticket_index + delta) % len(ctx.tickets)
-    _linear_announce(ctx)
+    await _linear_announce(ctx)
 
 
-def _linear_announce(ctx: Context) -> None:
+async def _linear_announce(ctx: Context) -> None:
     if not ctx.tickets:
-        _speak(ctx, "No tickets.")
+        await _speak(ctx, "No tickets.")
         return
     t = ctx.tickets[ctx.ticket_index]
     tid = str(t.get("id", "?"))
     title = str(t.get("title", ""))
     prio = str(t.get("priority", "")) or "no priority"
     assignee = str(t.get("assignee", "")) or "unassigned"
-    _speak(
+    await _speak(
         ctx,
         f"{ctx.ticket_index + 1} of {len(ctx.tickets)}. {tid}. {title}. "
         f"Priority {prio}. Assigned to {assignee}.",
     )
 
 
-def _linear_select(ctx: Context, idx: int) -> None:
+async def _linear_select(ctx: Context, idx: int) -> None:
     if not ctx.tickets or idx < 0 or idx >= len(ctx.tickets):
-        _speak(ctx, "No such ticket.")
+        await _speak(ctx, "No such ticket.")
         return
     t = ctx.tickets[idx]
     tid = str(t.get("id", ""))
@@ -577,32 +586,36 @@ def _linear_select(ctx: Context, idx: int) -> None:
     ctx.ticket_index = idx
     host, opts = ctx.ssh
     try:
-        remote.new_window(host, opts, ctx.config.tmux_session, branch)
-        remote.send(host, opts, ctx.config.tmux_session, branch, "claude")
+        await asyncio.to_thread(
+            remote.new_window, host, opts, ctx.config.tmux_session, branch,
+        )
+        await asyncio.to_thread(
+            remote.send, host, opts, ctx.config.tmux_session, branch, "claude",
+        )
     except remote.RemoteError as exc:
-        _report_error(ctx, f"Could not open window for {tid}: {exc}")
+        await _report_error(ctx, f"Could not open window for {tid}: {exc}")
         return
     ctx.active_window = branch
-    _speak(ctx, f"Opened {tid} in window {branch}.")
+    await _speak(ctx, f"Opened {tid} in window {branch}.")
 
 
 # --- helpers ---------------------------------------------------------------
 
 
-def _speak(ctx: Context, text: str) -> None:
+async def _speak(ctx: Context, text: str) -> None:
     if not text:
         return
     try:
-        ctx.tts.speak(text)
+        await ctx.tts.speak(text)
     except TTSClientError:
         logger.exception("TTS failed for: %s", text)
 
 
-def _report_error(ctx: Context, message: str) -> None:
+async def _report_error(ctx: Context, message: str) -> None:
     ctx.thinking.stop()
     try:
         earcon.error()
     except earcon.EarconError:
         pass
-    _speak(ctx, message)
+    await _speak(ctx, message)
     ctx.log.event("error", message=message)

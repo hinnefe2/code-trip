@@ -14,6 +14,7 @@ deliberately pairs "next unread" with "history back".
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import subprocess
@@ -21,7 +22,7 @@ from typing import TYPE_CHECKING
 
 from pynput import keyboard
 
-from code_trip2 import earcon, remote, window
+from code_trip2 import dispatch, earcon, modes, remote, window
 from code_trip2.tts_client import TTSClientError
 from code_trip2.window import Chord, KeyStroke
 
@@ -89,17 +90,15 @@ TAP_STROKES: dict[str, KeyStroke] = {
 }
 
 
-def handle_chord(ctx: "Context", name: str) -> None:
-    from code_trip2 import dispatch  # local import to avoid cycle
-
+async def handle_chord(ctx: "Context", name: str) -> None:
     if name == "nav+yes":
-        _nav(ctx, forward=True)
+        await _nav(ctx, forward=True)
     elif name == "nav+no":
-        _nav(ctx, forward=False)
+        await _nav(ctx, forward=False)
     elif name == "nav+act":
-        _cycle_app(ctx)
+        await _cycle_app(ctx)
     elif name == "nav+ptt":
-        _speak_active_app(ctx)
+        await _speak_active_app(ctx)
     elif name == "act+no":
         # ACT+NO is mode-dependent: in queue mode it dismisses the
         # current task (the "permanent skip" the user reaches for when
@@ -107,7 +106,7 @@ def handle_chord(ctx: "Context", name: str) -> None:
         # focused mode it stays as Ctrl+U for shell input.
         logger.info("Chord act+no fired in app_mode=%r", ctx.app_mode)
         if ctx.app_mode == dispatch.MODE_QUEUE:
-            dispatch.dismiss_current_task(ctx)
+            await dispatch.dismiss_current_task(ctx)
         else:
             _send_stroke(ctx, _ACT_NO_CLEAR_LINE)
     else:
@@ -137,7 +136,7 @@ def _keystroke_targets_tui_host(ctx: "Context") -> bool:
         return False
 
 
-def handle_tap(ctx: "Context", name: str) -> None:
+async def handle_tap(ctx: "Context", name: str) -> None:
     """Dispatch a macropad solo tap.
 
     Key bindings (post-revamp):
@@ -154,8 +153,6 @@ def handle_tap(ctx: "Context", name: str) -> None:
     no "next chunk" tap binding any more — ACT just stops playback
     outright.
     """
-    from code_trip2 import dispatch, modes  # local import to avoid cycle
-
     # NAV solo: app-mode flip.
     if name == "nav":
         dispatch.flip_mode(ctx)
@@ -170,16 +167,16 @@ def handle_tap(ctx: "Context", name: str) -> None:
             modes.stop_playback(ctx)
             return
         if ctx.app_mode == dispatch.MODE_FOCUSED:
-            _act_tap_app_aware(ctx)
+            await _act_tap_app_aware(ctx)
         return
 
     # Queue mode: YES/NO drive the queue rather than the focused app.
     if ctx.app_mode == dispatch.MODE_QUEUE:
         if name == "yes":
-            dispatch.queue_yes_tap(ctx)
+            await dispatch.queue_yes_tap(ctx)
             return
         if name == "no":
-            dispatch.queue_no_tap(ctx)
+            await dispatch.queue_no_tap(ctx)
             return
 
     stroke = TAP_STROKES.get(name)
@@ -189,14 +186,14 @@ def handle_tap(ctx: "Context", name: str) -> None:
     _send_stroke(ctx, stroke)
 
 
-def _act_tap_app_aware(ctx: "Context") -> bool:
+async def _act_tap_app_aware(ctx: "Context") -> bool:
     """Per-app ACT-tap behavior. Returns True if handled (else no-op)."""
     try:
         app = window.active_app()
     except window.WindowError:
         return False
     if app in ctx.config.terminal_apps:
-        _open_last_pane_url(ctx)
+        await _open_last_pane_url(ctx)
         return True
     if app == _CHROME_APP:
         _send_stroke(ctx, _CHROME_NEW_TAB)
@@ -204,23 +201,25 @@ def _act_tap_app_aware(ctx: "Context") -> bool:
     return False
 
 
-def _open_last_pane_url(ctx: "Context") -> None:
+async def _open_last_pane_url(ctx: "Context") -> None:
     """Capture the active tmux pane, find the most recent URL, open in Chrome."""
     host, opts = ctx.ssh
     try:
-        raw = remote.capture(
-            host, opts, ctx.config.tmux_session, ctx.active_window, lines=200
+        # remote.capture stays sync this phase; bridged via to_thread.
+        raw = await asyncio.to_thread(
+            remote.capture, host, opts, ctx.config.tmux_session, ctx.active_window, lines=200,
         )
     except remote.RemoteError as exc:
-        _speak_error(ctx, f"Could not read pane: {exc}")
+        await _speak_error(ctx, f"Could not read pane: {exc}")
         return
     text = _ANSI_RE.sub("", raw)
     matches = _URL_RE.findall(text)
     if not matches:
-        _speak_error(ctx, "No URL in pane.")
+        await _speak_error(ctx, "No URL in pane.")
         return
     url = matches[-1].rstrip(_URL_TRIM)
     try:
+        # `open` returns quickly; sync subprocess is fine here.
         subprocess.run(
             ["open", "-a", _CHROME_APP, url],
             check=True,
@@ -228,7 +227,7 @@ def _open_last_pane_url(ctx: "Context") -> None:
             timeout=5.0,
         )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as exc:
-        _speak_error(ctx, f"Could not open URL: {exc}")
+        await _speak_error(ctx, f"Could not open URL: {exc}")
         return
     try:
         earcon.completion()
@@ -236,28 +235,28 @@ def _open_last_pane_url(ctx: "Context") -> None:
         pass
 
 
-def _nav(ctx: "Context", forward: bool) -> None:
+async def _nav(ctx: "Context", forward: bool) -> None:
     try:
         app = window.active_app()
     except window.WindowError as exc:
-        _speak_error(ctx, f"Could not read active app: {exc}")
+        await _speak_error(ctx, f"Could not read active app: {exc}")
         return
     pair = APP_NAV.get(app)
     if pair is None:
-        _speak_error(ctx, f"No navigation for {app}.")
+        await _speak_error(ctx, f"No navigation for {app}.")
         return
     stroke = pair[0] if forward else pair[1]
     _send_stroke(ctx, stroke)
 
 
-def _cycle_app(ctx: "Context") -> None:
+async def _cycle_app(ctx: "Context") -> None:
     apps = tuple(ctx.config.app_cycle)
     if not apps:
         return
     try:
         current = window.active_app()
     except window.WindowError as exc:
-        _speak_error(ctx, f"Could not read active app: {exc}")
+        await _speak_error(ctx, f"Could not read active app: {exc}")
         return
     try:
         idx = apps.index(current)
@@ -267,30 +266,30 @@ def _cycle_app(ctx: "Context") -> None:
     try:
         window.activate_app(next_app)
     except window.WindowError as exc:
-        _speak_error(ctx, f"Could not activate {next_app}: {exc}")
+        await _speak_error(ctx, f"Could not activate {next_app}: {exc}")
 
 
-def _speak_active_app(ctx: "Context") -> None:
+async def _speak_active_app(ctx: "Context") -> None:
     try:
         app = window.active_app()
     except window.WindowError as exc:
-        _speak_error(ctx, f"Could not read active app: {exc}")
+        await _speak_error(ctx, f"Could not read active app: {exc}")
         return
-    _speak(ctx, app)
+    await _speak(ctx, app)
 
 
-def _speak(ctx: "Context", text: str) -> None:
+async def _speak(ctx: "Context", text: str) -> None:
     if not text:
         return
     try:
-        ctx.tts.speak(text)
+        await ctx.tts.speak(text)
     except TTSClientError:
         logger.exception("TTS failed for: %s", text)
 
 
-def _speak_error(ctx: "Context", message: str) -> None:
+async def _speak_error(ctx: "Context", message: str) -> None:
     try:
         earcon.error()
     except earcon.EarconError:
         pass
-    _speak(ctx, message)
+    await _speak(ctx, message)

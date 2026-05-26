@@ -1,6 +1,6 @@
 # Asyncio migration plan
 
-> **Status:** Phases 1–3 landed 2026-05-26 on the `async-migration` branch.
+> **Status:** Phases 1–4 landed 2026-05-26 on the `async-migration` branch.
 
 ## Motivation
 
@@ -105,14 +105,16 @@ After this phase, nothing about the rest of the orchestrator has changed. The as
 
 ### Phase 4 — Convert dispatch + handle_voice + handle_skill
 
-- All `handle_*`, `_respond_*`, `_announce_*`, `_skip_current`, `_drop_current`, `_snooze_current`, `_add_manual` become `async def`.
-- `handle_voice` and `handle_skill` await `_dispatch_task_response`.
-- `_respond_claude` / `_respond_slack` / `_respond_email` await the MCP client (converted in Phase 5; for now wrap the sync call in `asyncio.to_thread` as a temporary measure).
-- `TTSClient.speak`, `STTClient.transcribe`, `Summarizer.summarize` → async. OpenAI calls use `AsyncOpenAI`; TTS audio playback wraps `stream.write` in `asyncio.to_thread`.
-- `modes.speak_chunked` becomes async; the chunked playback worker becomes an async task.
-- `modes._work_voice` becomes async (uses `remote.send`/`wait_done`/`capture` from Phase 5).
+- All `handle_*`, `_respond_*`, `_announce_*` (except the fire-and-forget `_announce_headline`), `_skip_current`, `_drop_current`, `_snooze_current`, `_add_manual`, `queue_yes_tap`, `queue_no_tap`, `dismiss_current_task` become `async def`.
+- `modes.handle_voice`, `_try_global_commands`, `_try_voice_phrase`, `_dispatch_by_focus`, `_dictate_voice`, `_work_voice`, `_select_window`, `_new_window`, `_announce_windows`, `_linear_refresh`, `_linear_step`, `_linear_announce`, `_linear_select`, `_speak`, `_report_error`, `_summarize_or_strip` become `async`.
+- `_respond_claude` / `_respond_slack` / `_respond_email` await `remote.*` / `mcp.call_tool` via `asyncio.to_thread` until Phase 5 makes those async.
+- `TTSClient.speak`, `STTClient.transcribe`, `Summarizer.summarize` → async. OpenAI calls use `AsyncOpenAI`; TTS audio playback wraps `stream.write` in `asyncio.to_thread`. `TTSClient.stop` stays sync (callable from the pynput listener thread) and the `_stop_event` stays `threading.Event` for the same reason. `_speak_lock` becomes `asyncio.Lock` to serialize between async speak callers.
+- `modes.speak_chunked` stays **sync** — it's fire-and-forget (chunks go into `ctx.playback_queue`, the playback task picks them up). Callers don't want to wait for playback to finish.
+- The chunked playback worker (`_playback_loop`) becomes an `async def` coroutine; `_start_playback_task` spawns it with `asyncio.create_task`. The `Context._playback_lock` / `_playback_thread` fields go away.
+- `chords.handle_chord` / `handle_tap` / `_act_tap_app_aware` / `_open_last_pane_url` / `_nav` / `_cycle_app` / `_speak_active_app` / `_speak` / `_speak_error` become async. The stale `from code_trip2 import dispatch` local imports inside `handle_chord` / `handle_tap` are hoisted to module top — the cycle they claimed to avoid no longer exists.
+- `main.py` introduces a `_from_thread(coro_fn, *args, **kwargs)` bridge that schedules a coroutine on the loop from the macropad's pynput thread and the stdin paste reader thread. Each spawned task gets a `done_callback` that logs uncaught exceptions so they're not silently swallowed. (Phase 6 documents this as the single seam to the threaded boundaries.)
 
-**Risk:** many call sites. Move incrementally; keep tests passing after each handler conversion.
+**Risk:** many call sites. The test churn was substantial — every `MagicMock` for `ctx.tts`, `ctx.summarizer`, etc. needed `tts.speak = AsyncMock()` (etc.) because the methods are now awaited; every test that exercises a handler needed `@pytest.mark.asyncio` + `await`.
 
 ### Phase 5 — Convert MCP clients + remote helpers
 

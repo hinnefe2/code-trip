@@ -7,7 +7,7 @@ import json
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -851,16 +851,19 @@ def _ctx_with_slack_mcp(mcp):
         ssh_host="", ssh_options=(), tmux_session="main",
         work_window="work", linear_window="linear", terminal_apps=("kitty",),
     )
+    tts = MagicMock()
+    tts.speak = AsyncMock(return_value=None)
     return modes.Context(
         config=cfg,  # type: ignore[arg-type]
-        tts=MagicMock(),
+        tts=tts,
         log=MagicMock(),
         thinking=MagicMock(),
         slack_mcp=mcp,
     )
 
 
-def test_respond_slack_calls_send_message_via_mcp():
+@pytest.mark.asyncio
+async def test_respond_slack_calls_send_message_via_mcp():
     mcp = MagicMock()
     ctx = _ctx_with_slack_mcp(mcp)
     task = Task(
@@ -870,7 +873,7 @@ def test_respond_slack_calls_send_message_via_mcp():
     )
     ctx.queue.add(task)
     ctx.current_task = task
-    dispatch._respond_slack(ctx, task, "Yes, ship it.")
+    await dispatch._respond_slack(ctx, task, "Yes, ship it.")
     mcp.call_tool.assert_called_once_with(
         "slack_send_message",
         {"channel_id": "C123", "message": "Yes, ship it.", "thread_ts": "1.0"},
@@ -879,18 +882,20 @@ def test_respond_slack_calls_send_message_via_mcp():
     assert ctx.current_task is None
 
 
-def test_respond_slack_without_mcp_speaks_error():
+@pytest.mark.asyncio
+async def test_respond_slack_without_mcp_speaks_error():
     ctx = _ctx_with_slack_mcp(mcp=None)
     task = Task(kind="slack_msg",
                 source={"channel_id": "C1", "ts": "1.0", "thread_ts": "1.0"})
     ctx.queue.add(task)
     ctx.current_task = task
-    dispatch._respond_slack(ctx, task, "reply")
+    await dispatch._respond_slack(ctx, task, "reply")
     ctx.tts.speak.assert_called_with("Slack MCP is not configured.")
     assert ctx.queue.get(task.id).state != "done"
 
 
-def test_respond_slack_api_error_keeps_task_active():
+@pytest.mark.asyncio
+async def test_respond_slack_api_error_keeps_task_active():
     mcp = MagicMock()
     mcp.call_tool.side_effect = ClaudeMCPError("network down")
     ctx = _ctx_with_slack_mcp(mcp)
@@ -898,19 +903,20 @@ def test_respond_slack_api_error_keeps_task_active():
                 source={"channel_id": "C1", "ts": "1.0", "thread_ts": "1.0"})
     ctx.queue.add(task)
     ctx.current_task = task
-    dispatch._respond_slack(ctx, task, "reply")
+    await dispatch._respond_slack(ctx, task, "reply")
     assert ctx.queue.get(task.id).state != "done"
     assert ctx.current_task is task
 
 
-def test_dispatch_task_response_routes_slack_kind():
+@pytest.mark.asyncio
+async def test_dispatch_task_response_routes_slack_kind():
     mcp = MagicMock()
     ctx = _ctx_with_slack_mcp(mcp)
     task = Task(kind="slack_msg",
                 source={"channel_id": "C1", "ts": "1.0", "thread_ts": "1.0"})
     ctx.queue.add(task)
     ctx.current_task = task
-    dispatch._dispatch_task_response(ctx, task, "responding now")
+    await dispatch._dispatch_task_response(ctx, task, "responding now")
     mcp.call_tool.assert_called_once()
 
 

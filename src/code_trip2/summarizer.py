@@ -64,9 +64,9 @@ class Summarizer:
         self._client = None
         if api_key:
             try:
-                from openai import OpenAI
+                from openai import AsyncOpenAI
 
-                self._client = OpenAI(api_key=api_key)
+                self._client = AsyncOpenAI(api_key=api_key)
             except ImportError:
                 logger.warning("openai package not installed; summarizer disabled.")
 
@@ -74,7 +74,7 @@ class Summarizer:
     def enabled(self) -> bool:
         return self._client is not None
 
-    def summarize(self, raw: str, *, context: dict | None = None) -> str:
+    async def summarize(self, raw: str, *, context: dict | None = None) -> str:
         """Return an audio-shaped summary of ``raw``. Raises on API error."""
         if self._client is None:
             raise SummarizerError("Summarizer not configured (no OPENAI API key).")
@@ -82,7 +82,7 @@ class Summarizer:
             return ""
         user_msg = self._format_user_msg(raw, context)
         try:
-            resp = self._client.chat.completions.create(
+            resp = await self._client.chat.completions.create(
                 model=self._model,
                 messages=[
                     {"role": "system", "content": _SYSTEM_PROMPT},

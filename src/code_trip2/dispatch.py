@@ -63,18 +63,18 @@ def flip_mode(ctx: "Context") -> None:
 # --- top-level voice -------------------------------------------------------
 
 
-def handle_voice(ctx: "Context", transcript: str) -> None:
+async def handle_voice(ctx: "Context", transcript: str) -> None:
     """Route a PTT transcript: queue mode first, else fall through to focused."""
     t = transcript.strip()
     if not t:
         return
     if ctx.app_mode == MODE_QUEUE:
-        _handle_queue_voice(ctx, t)
+        await _handle_queue_voice(ctx, t)
     else:
-        modes.handle_voice(ctx, t)
+        await modes.handle_voice(ctx, t)
 
 
-def handle_skill(ctx: "Context", transcript: str) -> None:
+async def handle_skill(ctx: "Context", transcript: str) -> None:
     """ACT+PTT path: hand the transcript + task context to Claude.
 
     The keypress (ACT held during PTT) flags the recording as a skill
@@ -91,11 +91,11 @@ def handle_skill(ctx: "Context", transcript: str) -> None:
         return
     task = ctx.current_task
     if task is None:
-        _speak(ctx, "Nothing active to act on.")
+        await _speak(ctx, "Nothing active to act on.")
         return
     mcp = ctx.agent_mcp
     if mcp is None or not getattr(mcp, "enabled", False):
-        _speak(ctx, "Agent MCP is not configured.")
+        await _speak(ctx, "Agent MCP is not configured.")
         return
     prompt = _build_skill_prompt(task, t)
     logger.info(
@@ -105,13 +105,16 @@ def handle_skill(ctx: "Context", transcript: str) -> None:
     ctx.thinking.start()
     try:
         try:
-            summary = mcp.run_agent(
+            # MCP client stays sync this phase; bridged via to_thread
+            # until Phase 5 converts ClaudeMCPClient to async.
+            summary = await asyncio.to_thread(
+                mcp.run_agent,
                 prompt=prompt,
                 allowed_tools=ctx.agent_allowed_tools,
             )
         except Exception as exc:
             logger.exception("Skill invocation failed")
-            _speak(ctx, f"Skill failed: {exc}")
+            await _speak(ctx, f"Skill failed: {exc}")
             return
     finally:
         ctx.thinking.stop()
@@ -125,7 +128,7 @@ def handle_skill(ctx: "Context", transcript: str) -> None:
         skill_transcript=t,
         skill_summary=summary,
     )
-    _speak(ctx, summary or "Done.")
+    await _speak(ctx, summary or "Done.")
 
 
 def _build_skill_prompt(task: Task, transcript: str) -> str:
@@ -164,7 +167,7 @@ _SNOOZE_RE = re.compile(
 )
 
 
-def _handle_queue_voice(ctx: "Context", t: str) -> None:
+async def _handle_queue_voice(ctx: "Context", t: str) -> None:
     low = t.lower().strip(" .!?")
 
     # Globals first.
@@ -176,60 +179,60 @@ def _handle_queue_voice(ctx: "Context", t: str) -> None:
         or "say that again" in low or "say it again" in low
     ):
         if not modes.replay_last(ctx):
-            _speak(ctx, "Nothing to repeat.")
+            await _speak(ctx, "Nothing to repeat.")
         return
     if low.startswith("status"):
-        _speak(ctx, f"Queue mode. Window {ctx.active_window}.")
+        await _speak(ctx, f"Queue mode. Window {ctx.active_window}.")
         return
 
     # Queue ops.
     if low in ("next", "what's next", "whats next"):
-        _announce_next(ctx)
+        await _announce_next(ctx)
         return
     if low in ("skip", "later", "skip it"):
-        _skip_current(ctx)
+        await _skip_current(ctx)
         return
     if low in ("dismiss", "drop it", "drop", "done", "done with this"):
-        _drop_current(ctx)
+        await _drop_current(ctx)
         return
     m = _SNOOZE_RE.match(low)
     if m:
-        _snooze_current(ctx, m.group(1), m.group(2))
+        await _snooze_current(ctx, m.group(1), m.group(2))
         return
     if low in ("what's in the queue", "whats in the queue", "how many", "queue", "inbox"):
-        _announce_count(ctx)
+        await _announce_count(ctx)
         return
     if low in ("go on", "continue", "tell me more", "expand"):
-        _announce_body(ctx)
+        await _announce_body(ctx)
         return
 
     # Manual task add.
     m = re.match(r"^(?:add|remind me to|note)\s+(?:a\s+)?(?:task\s+)?(.+)$", low)
     if m:
-        _add_manual(ctx, m.group(1))
+        await _add_manual(ctx, m.group(1))
         return
 
     # Anything else: dispatch against the active task by kind.
     if ctx.current_task is not None:
-        _dispatch_task_response(ctx, ctx.current_task, t)
+        await _dispatch_task_response(ctx, ctx.current_task, t)
         return
 
     # No active task: fall through to focused-mode voice phrases (window
     # switching etc. is still useful from queue mode for setup).
-    modes.handle_voice(ctx, t)
+    await modes.handle_voice(ctx, t)
 
 
 # --- queue ops -------------------------------------------------------------
 
 
-def _announce_next(ctx: "Context") -> Task | None:
+async def _announce_next(ctx: "Context") -> Task | None:
     """Pull the highest-scoring task and announce its headline."""
     if ctx.current_task is not None:
         # Treat 'next' with an active task as "skip this one".
-        _skip_current(ctx)
+        await _skip_current(ctx)
     t = ctx.queue.pull(now=time.time(), recent=ctx.recent_topics)
     if t is None:
-        _speak(ctx, "Queue is empty.")
+        await _speak(ctx, "Queue is empty.")
         return None
     if ctx.queue_log is not None:
         ctx.queue_log.record("pull", t)
@@ -239,34 +242,34 @@ def _announce_next(ctx: "Context") -> Task | None:
     return t
 
 
-def _skip_current(ctx: "Context") -> None:
+async def _skip_current(ctx: "Context") -> None:
     t = ctx.current_task
     ctx.current_task = None
     if t is None:
         return
     ctx.queue.defer(t.id, 300.0)  # 5-minute soft-defer
-    _speak(ctx, "Skipped.")
+    await _speak(ctx, "Skipped.")
 
 
-def _drop_current(ctx: "Context") -> None:
+async def _drop_current(ctx: "Context") -> None:
     t = ctx.current_task
     ctx.current_task = None
     if t is None:
-        _speak(ctx, "Nothing active.")
+        await _speak(ctx, "Nothing active.")
         return
     ctx.queue.mark_done(t.id)
-    _speak(ctx, "Done.")
+    await _speak(ctx, "Done.")
 
 
-def _snooze_current(ctx: "Context", amount: str | None, unit: str | None) -> None:
+async def _snooze_current(ctx: "Context", amount: str | None, unit: str | None) -> None:
     t = ctx.current_task
     if t is None:
-        _speak(ctx, "Nothing active.")
+        await _speak(ctx, "Nothing active.")
         return
     seconds = _parse_snooze_seconds(amount, unit)
     ctx.current_task = None
     ctx.queue.defer(t.id, seconds)
-    _speak(ctx, f"Snoozed {int(seconds)} seconds.")
+    await _speak(ctx, f"Snoozed {int(seconds)} seconds.")
 
 
 def _parse_snooze_seconds(amount: str | None, unit: str | None) -> float:
@@ -286,17 +289,17 @@ def _parse_snooze_seconds(amount: str | None, unit: str | None) -> float:
     return float(n * 60)
 
 
-def _announce_count(ctx: "Context") -> None:
+async def _announce_count(ctx: "Context") -> None:
     counts = ctx.queue.count_by_kind()
     if not counts:
-        _speak(ctx, "Queue is empty.")
+        await _speak(ctx, "Queue is empty.")
         return
     total = sum(counts.values())
     parts = ", ".join(f"{v} {k.replace('_', ' ')}" for k, v in sorted(counts.items()))
-    _speak(ctx, f"{total} pending. {parts}.")
+    await _speak(ctx, f"{total} pending. {parts}.")
 
 
-def _add_manual(ctx: "Context", body: str) -> None:
+async def _add_manual(ctx: "Context", body: str) -> None:
     t = Task(
         kind="note",
         topic="inbox",
@@ -304,23 +307,27 @@ def _add_manual(ctx: "Context", body: str) -> None:
         body=body,
     )
     ctx.queue.add(t)
-    _speak(ctx, "Added.")
+    await _speak(ctx, "Added.")
 
 
 # --- announcement ---------------------------------------------------------
 
 
 def _announce_headline(ctx: "Context", task: Task) -> None:
-    """Speak the task headline. Body is held until user asks for it."""
+    """Speak the task headline. Body is held until user asks for it.
+
+    Sync because ``modes.speak_chunked`` is fire-and-forget — it
+    schedules a playback task and returns.
+    """
     label = _kind_label(task)
     text = f"{label}: {task.headline}" if task.headline else label
     modes.speak_chunked(ctx, text)
 
 
-def _announce_body(ctx: "Context") -> None:
+async def _announce_body(ctx: "Context") -> None:
     t = ctx.current_task
     if t is None or not t.body:
-        _speak(ctx, "Nothing to expand.")
+        await _speak(ctx, "Nothing to expand.")
         return
     modes._speak_chunked(ctx, t.body)  # type: ignore[attr-defined]
 
@@ -343,39 +350,42 @@ def _kind_label(task: Task) -> str:
 # --- per-kind response dispatch -------------------------------------------
 
 
-def _dispatch_task_response(ctx: "Context", task: Task, transcript: str) -> None:
+async def _dispatch_task_response(ctx: "Context", task: Task, transcript: str) -> None:
     """Route a free-form PTT transcript to whatever makes sense for this task."""
     if task.kind == "claude_reply":
-        _respond_claude(ctx, task, transcript)
+        await _respond_claude(ctx, task, transcript)
         return
     if task.kind == "slack_msg":
-        _respond_slack(ctx, task, transcript)
+        await _respond_slack(ctx, task, transcript)
         return
     if task.kind == "email_msg":
-        _respond_email(ctx, task, transcript)
+        await _respond_email(ctx, task, transcript)
         return
-    _speak(ctx, "No response action for this task.")
+    await _speak(ctx, "No response action for this task.")
 
 
-def _respond_claude(ctx: "Context", task: Task, transcript: str) -> None:
+async def _respond_claude(ctx: "Context", task: Task, transcript: str) -> None:
     """Send the transcript to the source tmux window. Don't block — the
     ClaudeProducer will surface the next reply as a new task when ready."""
     win = task.source.get("window") or task.topic
     host, opts = ctx.ssh
     try:
-        remote.send(host, opts, ctx.config.tmux_session, win, transcript)
+        # remote.* stays sync this phase; bridged via to_thread until Phase 5.
+        await asyncio.to_thread(
+            remote.send, host, opts, ctx.config.tmux_session, win, transcript,
+        )
     except remote.RemoteError as exc:
-        _speak(ctx, f"Could not reach Claude: {exc}")
+        await _speak(ctx, f"Could not reach Claude: {exc}")
         return
     ctx.queue.mark_done(task.id)
     ctx.current_task = None
     ctx.log.event(
         "queue_turn", task_id=task.id, kind=task.kind, topic=task.topic, sent=transcript
     )
-    _speak(ctx, "Sent.")
+    await _speak(ctx, "Sent.")
 
 
-def _respond_email(ctx: "Context", task: Task, transcript: str) -> None:
+async def _respond_email(ctx: "Context", task: Task, transcript: str) -> None:
     """Draft a reply to the source email via the Gmail MCP.
 
     The claude.ai Gmail MCP has no send tool — only ``create_draft``. We
@@ -384,13 +394,13 @@ def _respond_email(ctx: "Context", task: Task, transcript: str) -> None:
     """
     mcp = ctx.email_mcp
     if mcp is None:
-        _speak(ctx, "Gmail MCP is not configured.")
+        await _speak(ctx, "Gmail MCP is not configured.")
         return
     to_addr = task.source.get("sender_email") or ""
     msg_id = task.source.get("message_id") or ""
     subject = task.source.get("subject") or ""
     if not to_addr:
-        _speak(ctx, "Missing sender email for this task.")
+        await _speak(ctx, "Missing sender email for this task.")
         return
     if not subject.lower().startswith("re:"):
         subject = f"Re: {subject}" if subject else "Re:"
@@ -398,10 +408,11 @@ def _respond_email(ctx: "Context", task: Task, transcript: str) -> None:
     if msg_id:
         args["replyToMessageId"] = msg_id
     try:
-        mcp.call_tool("create_draft", args)
+        # MCP client stays sync this phase; bridged via to_thread until Phase 5.
+        await asyncio.to_thread(mcp.call_tool, "create_draft", args)
     except Exception as exc:
         logger.exception("Email draft failed")
-        _speak(ctx, f"Could not draft email: {exc}")
+        await _speak(ctx, f"Could not draft email: {exc}")
         return
     ctx.queue.mark_done(task.id)
     ctx.current_task = None
@@ -412,22 +423,23 @@ def _respond_email(ctx: "Context", task: Task, transcript: str) -> None:
         topic=task.topic,
         sent=transcript,
     )
-    _speak(ctx, "Drafted.")
+    await _speak(ctx, "Drafted.")
 
 
-def _respond_slack(ctx: "Context", task: Task, transcript: str) -> None:
+async def _respond_slack(ctx: "Context", task: Task, transcript: str) -> None:
     """Reply in the Slack thread the task came from via the Slack MCP."""
     mcp = ctx.slack_mcp
     if mcp is None:
-        _speak(ctx, "Slack MCP is not configured.")
+        await _speak(ctx, "Slack MCP is not configured.")
         return
     channel_id = task.source.get("channel_id")
     thread_ts = task.source.get("thread_ts") or task.source.get("ts")
     if not channel_id:
-        _speak(ctx, "Missing Slack channel for this task.")
+        await _speak(ctx, "Missing Slack channel for this task.")
         return
     try:
-        mcp.call_tool(
+        await asyncio.to_thread(
+            mcp.call_tool,
             "slack_send_message",
             {
                 "channel_id": channel_id,
@@ -437,7 +449,7 @@ def _respond_slack(ctx: "Context", task: Task, transcript: str) -> None:
         )
     except Exception as exc:
         logger.exception("Slack reply failed")
-        _speak(ctx, f"Could not send Slack reply: {exc}")
+        await _speak(ctx, f"Could not send Slack reply: {exc}")
         return
     ctx.queue.mark_done(task.id)
     ctx.current_task = None
@@ -448,29 +460,29 @@ def _respond_slack(ctx: "Context", task: Task, transcript: str) -> None:
         topic=task.topic,
         sent=transcript,
     )
-    _speak(ctx, "Sent.")
+    await _speak(ctx, "Sent.")
 
 
 # --- macropad tap delegates (queue-mode YES/NO/ACT) -----------------------
 
 
-def queue_yes_tap(ctx: "Context") -> None:
+async def queue_yes_tap(ctx: "Context") -> None:
     """YES in queue mode: engage with current task or pull next."""
     if ctx.current_task is None:
-        _announce_next(ctx)
+        await _announce_next(ctx)
         return
-    _announce_body(ctx)
+    await _announce_body(ctx)
 
 
-def queue_no_tap(ctx: "Context") -> None:
+async def queue_no_tap(ctx: "Context") -> None:
     """NO in queue mode: skip current task."""
     if ctx.current_task is None:
-        _speak(ctx, "Nothing active.")
+        await _speak(ctx, "Nothing active.")
         return
-    _skip_current(ctx)
+    await _skip_current(ctx)
 
 
-def dismiss_current_task(ctx: "Context") -> None:
+async def dismiss_current_task(ctx: "Context") -> None:
     """ACT+NO chord in queue mode: mark current task done.
 
     Distinct from :func:`queue_no_tap` (which just defers): this is
@@ -483,10 +495,10 @@ def dismiss_current_task(ctx: "Context") -> None:
         ctx.current_task.id if ctx.current_task else None,
     )
     if ctx.current_task is None:
-        _speak(ctx, "Nothing active.")
+        await _speak(ctx, "Nothing active.")
         return
     modes.stop_playback(ctx)
-    _drop_current(ctx)
+    await _drop_current(ctx)
 
 
 # --- consumer / auto-announce thread --------------------------------------
@@ -530,9 +542,9 @@ class QueueConsumer:
             self._wake.clear()
             if self._stop.is_set():
                 break
-            self._maybe_announce()
+            await self._maybe_announce()
 
-    def _maybe_announce(self) -> None:
+    async def _maybe_announce(self) -> None:
         ctx = self._ctx
         if ctx.app_mode != MODE_QUEUE:
             return
@@ -548,16 +560,16 @@ class QueueConsumer:
             earcon.new_task()
         except earcon.EarconError:
             pass
-        _announce_next(ctx)
+        await _announce_next(ctx)
 
 
 # --- helpers ---------------------------------------------------------------
 
 
-def _speak(ctx: "Context", text: str) -> None:
+async def _speak(ctx: "Context", text: str) -> None:
     if not text:
         return
     try:
-        ctx.tts.speak(text)
+        await ctx.tts.speak(text)
     except Exception:
         logger.exception("TTS failed for: %s", text)

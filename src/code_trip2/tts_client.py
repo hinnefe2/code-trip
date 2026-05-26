@@ -9,6 +9,7 @@ playback mid-sentence.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import os
@@ -18,7 +19,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import openai
-from openai import APIConnectionError, APIError, AuthenticationError
+from openai import APIConnectionError, APIError, AsyncOpenAI, AuthenticationError
 
 try:
     import sounddevice as sd
@@ -83,7 +84,7 @@ class TTSClient:
     voice: str = DEFAULT_VOICE
     speed: float = DEFAULT_SPEED
 
-    _client: openai.OpenAI = field(default=None, init=False, repr=False)  # type: ignore[assignment]
+    _client: AsyncOpenAI = field(default=None, init=False, repr=False)  # type: ignore[assignment]
     _playing: bool = field(default=False, init=False, repr=False)
     # Persistent OutputStream so we don't reopen the audio device on every
     # speak() call. Lazily created and recreated only when the sample
@@ -94,14 +95,19 @@ class TTSClient:
     _stream_lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False
     )
-    # Serializes the body of speak() so two threads can't both write into
-    # the persistent OutputStream's ring buffer at once. PortAudio's
-    # PaUtil_WriteRingBuffer is single-writer; concurrent writes corrupt
-    # the head/tail pointers and segfault the process (DiagnosticReports
-    # 2026-05-22 onward: PaUtil_WriteRingBuffer + 180, KERN_INVALID_ADDRESS).
-    _speak_lock: threading.Lock = field(
-        default_factory=threading.Lock, init=False, repr=False
+    # Serializes the body of speak() so two concurrent callers can't both
+    # write into the persistent OutputStream's ring buffer at once.
+    # PortAudio's PaUtil_WriteRingBuffer is single-writer; concurrent
+    # writes corrupt the head/tail pointers and segfault the process
+    # (DiagnosticReports 2026-05-22 onward: PaUtil_WriteRingBuffer + 180,
+    # KERN_INVALID_ADDRESS).
+    _speak_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock, init=False, repr=False
     )
+    # threading.Event (not asyncio.Event) because stop() must be callable
+    # from any thread (e.g. the macropad's pynput listener) and threading
+    # primitives are cross-thread safe by default. The block writer inside
+    # _write_in_blocks reads it from an executor thread.
     _stop_event: threading.Event = field(
         default_factory=threading.Event, init=False, repr=False
     )
@@ -112,20 +118,21 @@ class TTSClient:
             raise TTSClientError(
                 f"No API key: set {ENV_API_KEY} or pass api_key"
             )
-        self._client = openai.OpenAI(api_key=resolved_key)
+        self._client = AsyncOpenAI(api_key=resolved_key)
 
     # --- public API -------------------------------------------------------
 
-    def speak(self, text: str) -> None:
+    async def speak(self, text: str) -> None:
         """Synthesize ``text`` and play it through the system audio.
 
-        Blocks until playback finishes.  Call :meth:`stop` from another
-        thread to interrupt mid-sentence (latency: ~170 ms = one write
-        block).
+        Awaits until playback finishes. Call :meth:`stop` (sync, from any
+        thread) to interrupt mid-sentence — latency is one write block
+        (~170 ms).
 
-        Concurrent callers serialize on ``_speak_lock`` — PortAudio's
-        ring buffer is single-writer, so two threads writing at once
-        would corrupt it and segfault the process.
+        Concurrent callers serialize on ``_speak_lock`` because
+        PortAudio's ring buffer is single-writer; without serialization
+        two coroutines' executor-thread writes would corrupt it and
+        segfault the process.
 
         Raises:
             TTSClientError: if the text is empty or the API call fails.
@@ -134,9 +141,9 @@ class TTSClient:
         if not text:
             raise TTSClientError("Empty text cannot be synthesized")
 
-        with self._speak_lock:
+        async with self._speak_lock:
             try:
-                response = self._client.audio.speech.create(
+                response = await self._client.audio.speech.create(
                     model=self.model,
                     voice=self.voice,
                     input=text,
@@ -161,24 +168,21 @@ class TTSClient:
             stream = self._ensure_stream(sample_rate, channels)
             self._playing = True
             try:
-                self._write_in_blocks(stream, samples)
+                await self._write_in_blocks(stream, samples)
             finally:
                 self._playing = False
 
     def stop(self) -> None:
-        """Interrupt any in-progress playback and wait for it to exit.
+        """Interrupt any in-progress playback.
 
-        Sets a stop flag, then briefly acquires ``_speak_lock`` to wait
-        until the in-flight ``speak()`` call has returned. Bounded by
-        one write block (~170 ms). Returning before the writer exits
-        would let the next ``speak()`` race the dying one — the whole
-        point of this method is "by the time I return, nothing is
-        touching the OutputStream." The stream itself is left open so
-        the next ``speak()`` doesn't pay the reopen cost.
+        Sync and thread-safe — sets a stop flag that the block writer
+        loop checks between writes. The stream itself is left open so
+        the next ``speak()`` doesn't pay the reopen cost. The next
+        ``speak()`` acquires ``_speak_lock`` and won't overlap with a
+        still-finishing writer because the writer holds the lock until
+        it exits.
         """
         self._stop_event.set()
-        with self._speak_lock:
-            pass
 
     def is_playing(self) -> bool:
         """True while ``speak()`` is blocked on playback."""
@@ -226,15 +230,20 @@ class TTSClient:
             self._stream_channels = channels
             return self._stream
 
-    def _write_in_blocks(self, stream, samples: np.ndarray) -> None:
+    async def _write_in_blocks(self, stream, samples: np.ndarray) -> None:
         """Push samples into the stream in small blocks so we can
-        honor ``stop()`` without aborting the stream."""
+        honor ``stop()`` without aborting the stream.
+
+        Each block is written from an executor thread so the event loop
+        stays responsive — sounddevice's ``stream.write`` blocks until
+        the block is consumed (~170 ms at 24 kHz).
+        """
         total = len(samples)
         for start in range(0, total, _WRITE_BLOCK_FRAMES):
             if self._stop_event.is_set():
                 return
             end = min(start + _WRITE_BLOCK_FRAMES, total)
-            stream.write(samples[start:end])
+            await asyncio.to_thread(stream.write, samples[start:end])
 
 
 # --- helpers --------------------------------------------------------------

@@ -209,14 +209,15 @@ def test_send_stroke_fires_when_active_app_lookup_errors(monkeypatch):
     send.assert_called_once_with(_FAKE_STROKE)
 
 
-def test_yes_tap_suppressed_in_focused_mode_when_tui_host_focused(monkeypatch):
+@pytest.mark.asyncio
+async def test_yes_tap_suppressed_in_focused_mode_when_tui_host_focused(monkeypatch):
     """End-to-end: a YES tap in focused mode should not synthesize Enter
     when the user is looking at the TUI host terminal."""
     ctx = _stroke_ctx(tui_host_app="kitty")
     ctx.app_mode = "focused"
     monkeypatch.setattr("code_trip2.chords.window.active_app", lambda: "kitty")
     with patch("code_trip2.chords.window.send_keystroke") as send:
-        chords.handle_tap(ctx, "yes")
+        await chords.handle_tap(ctx, "yes")
     send.assert_not_called()
 
 

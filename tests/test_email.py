@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -291,16 +291,19 @@ def _ctx_with_email_mcp(mcp):
         ssh_host="", ssh_options=(), tmux_session="main",
         work_window="work", linear_window="linear", terminal_apps=("kitty",),
     )
+    tts = MagicMock()
+    tts.speak = AsyncMock(return_value=None)
     return modes.Context(
         config=cfg,  # type: ignore[arg-type]
-        tts=MagicMock(),
+        tts=tts,
         log=MagicMock(),
         thinking=MagicMock(),
         email_mcp=mcp,
     )
 
 
-def test_respond_email_creates_draft_via_mcp():
+@pytest.mark.asyncio
+async def test_respond_email_creates_draft_via_mcp():
     mcp = MagicMock()
     ctx = _ctx_with_email_mcp(mcp)
     task = Task(
@@ -316,7 +319,7 @@ def test_respond_email_creates_draft_via_mcp():
     )
     ctx.queue.add(task)
     ctx.current_task = task
-    dispatch._respond_email(ctx, task, "Sure, ill take a look")
+    await dispatch._respond_email(ctx, task, "Sure, ill take a look")
     mcp.call_tool.assert_called_once()
     call = mcp.call_tool.call_args
     assert call.args[0] == "create_draft"
@@ -329,7 +332,8 @@ def test_respond_email_creates_draft_via_mcp():
     assert ctx.current_task is None
 
 
-def test_respond_email_preserves_existing_re_prefix():
+@pytest.mark.asyncio
+async def test_respond_email_preserves_existing_re_prefix():
     """Don't double-prefix the subject when it already starts with Re:."""
     mcp = MagicMock()
     ctx = _ctx_with_email_mcp(mcp)
@@ -344,32 +348,35 @@ def test_respond_email_preserves_existing_re_prefix():
     )
     ctx.queue.add(task)
     ctx.current_task = task
-    dispatch._respond_email(ctx, task, "ok")
+    await dispatch._respond_email(ctx, task, "ok")
     assert mcp.call_tool.call_args.args[1]["subject"] == "Re: ongoing thread"
 
 
-def test_respond_email_without_mcp_speaks_error():
+@pytest.mark.asyncio
+async def test_respond_email_without_mcp_speaks_error():
     ctx = _ctx_with_email_mcp(mcp=None)
     task = Task(kind="email_msg", source={"message_id": "M1", "sender_email": "x@y.com"})
     ctx.queue.add(task)
     ctx.current_task = task
-    dispatch._respond_email(ctx, task, "reply")
+    await dispatch._respond_email(ctx, task, "reply")
     ctx.tts.speak.assert_called_with("Gmail MCP is not configured.")
     assert ctx.queue.get(task.id).state != "done"
 
 
-def test_respond_email_without_sender_speaks_error():
+@pytest.mark.asyncio
+async def test_respond_email_without_sender_speaks_error():
     mcp = MagicMock()
     ctx = _ctx_with_email_mcp(mcp)
     task = Task(kind="email_msg", source={"message_id": "M1", "subject": "x"})
     ctx.queue.add(task)
     ctx.current_task = task
-    dispatch._respond_email(ctx, task, "reply")
+    await dispatch._respond_email(ctx, task, "reply")
     mcp.call_tool.assert_not_called()
     assert ctx.queue.get(task.id).state != "done"
 
 
-def test_respond_email_api_error_keeps_task_active():
+@pytest.mark.asyncio
+async def test_respond_email_api_error_keeps_task_active():
     mcp = MagicMock()
     mcp.call_tool.side_effect = ClaudeMCPError("network down")
     ctx = _ctx_with_email_mcp(mcp)
@@ -379,12 +386,13 @@ def test_respond_email_api_error_keeps_task_active():
     )
     ctx.queue.add(task)
     ctx.current_task = task
-    dispatch._respond_email(ctx, task, "reply")
+    await dispatch._respond_email(ctx, task, "reply")
     assert ctx.queue.get(task.id).state != "done"
     assert ctx.current_task is task
 
 
-def test_dispatch_task_response_routes_email_kind():
+@pytest.mark.asyncio
+async def test_dispatch_task_response_routes_email_kind():
     mcp = MagicMock()
     ctx = _ctx_with_email_mcp(mcp)
     task = Task(
@@ -393,5 +401,5 @@ def test_dispatch_task_response_routes_email_kind():
     )
     ctx.queue.add(task)
     ctx.current_task = task
-    dispatch._dispatch_task_response(ctx, task, "responding")
+    await dispatch._dispatch_task_response(ctx, task, "responding")
     mcp.call_tool.assert_called_once()

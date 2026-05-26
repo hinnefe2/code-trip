@@ -180,18 +180,20 @@ def test_ensure_stream_uses_high_latency():
     assert kwargs["dtype"] == "int16"
 
 
-def test_write_in_blocks_streams_full_array():
+@pytest.mark.asyncio
+async def test_write_in_blocks_streams_full_array():
     c = _stub_client()
     stream = MagicMock()
     samples = np.zeros(_WRITE_BLOCK_FRAMES * 3 + 100, dtype=np.int16)
-    c._write_in_blocks(stream, samples)
+    await c._write_in_blocks(stream, samples)
     # Expect 4 writes: 3 full blocks + a remainder.
     assert stream.write.call_count == 4
     total_written = sum(len(call.args[0]) for call in stream.write.call_args_list)
     assert total_written == len(samples)
 
 
-def test_write_in_blocks_stops_when_event_set():
+@pytest.mark.asyncio
+async def test_write_in_blocks_stops_when_event_set():
     c = _stub_client()
     stream = MagicMock()
     samples = np.zeros(_WRITE_BLOCK_FRAMES * 5, dtype=np.int16)
@@ -202,7 +204,7 @@ def test_write_in_blocks_stops_when_event_set():
         if counter["calls"] == 2:
             c._stop_event.set()
     stream.write.side_effect = fake_write
-    c._write_in_blocks(stream, samples)
+    await c._write_in_blocks(stream, samples)
     # Stop should be honored within one extra block (the loop checks
     # at the top of each iteration).
     assert stream.write.call_count == 2

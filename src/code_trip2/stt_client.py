@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import openai
-from openai import APIConnectionError, APIError, AuthenticationError
+from openai import APIConnectionError, APIError, AsyncOpenAI, AuthenticationError
 
 # --- Module-level defaults ------------------------------------------------
 
@@ -44,7 +44,7 @@ class STTClient:
     model: str = DEFAULT_MODEL
     language: str | None = None
 
-    _client: openai.OpenAI = field(default=None, init=False, repr=False)  # type: ignore[assignment]
+    _client: AsyncOpenAI = field(default=None, init=False, repr=False)  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         resolved_key = self.api_key or os.environ.get(ENV_API_KEY)
@@ -52,11 +52,11 @@ class STTClient:
             raise STTClientError(
                 f"No API key: set {ENV_API_KEY} or pass api_key"
             )
-        self._client = openai.OpenAI(api_key=resolved_key)
+        self._client = AsyncOpenAI(api_key=resolved_key)
 
     # --- public API -------------------------------------------------------
 
-    def transcribe(self, audio_path: Path | str) -> str:
+    async def transcribe(self, audio_path: Path | str) -> str:
         """Transcribe an audio file to text.
 
         Args:
@@ -80,7 +80,7 @@ class STTClient:
         try:
             with open(audio_path, "rb") as f:
                 kwargs["file"] = f
-                response = self._client.audio.transcriptions.create(**kwargs)
+                response = await self._client.audio.transcriptions.create(**kwargs)
         except AuthenticationError as exc:
             raise STTClientError(
                 f"Authentication failed: {exc}"
