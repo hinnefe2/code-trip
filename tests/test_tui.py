@@ -266,6 +266,37 @@ def test_keymap_panel_height_same_in_both_modes():
     assert tui._keymap_panel_size(queue_ctx) == tui._keymap_panel_size(focused_ctx)
 
 
+def test_render_input_panel_hidden_when_buffer_absent():
+    """Default _make_ctx leaves input_buffer=None (openai-STT mode),
+    so the TUI doesn't render the Input panel."""
+    ctx = _make_ctx(app_mode="queue")
+    layout = tui.render(ctx, supervisor=None)
+    out = _render_to_string(layout)
+    assert "Input" not in out or "Input " not in out  # no panel title
+
+
+def test_render_input_panel_shown_when_buffer_present():
+    from code_trip2.input_buffer import InputBuffer
+    ctx = _make_ctx(app_mode="queue")
+    ctx.input_buffer = InputBuffer()
+    layout = tui.render(ctx, supervisor=None)
+    out = _render_to_string(layout)
+    assert "Input" in out
+    assert "Enter submits" in out or "type or wait" in out
+
+
+def test_render_input_panel_shows_buffer_contents():
+    from code_trip2.input_buffer import InputBuffer
+    ctx = _make_ctx(app_mode="queue")
+    buf = InputBuffer()
+    for ch in "archive that email":
+        buf.append(ch)
+    ctx.input_buffer = buf
+    layout = tui.render(ctx, supervisor=None)
+    out = _render_to_string(layout)
+    assert "archive that email" in out
+
+
 def test_render_producers_status_uses_supervisor():
     ctx = _make_ctx()
     sup = ProducerSupervisor()

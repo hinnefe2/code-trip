@@ -216,6 +216,7 @@ class Macropad:
                 skill_mode = self._skill_mode
                 self._skill_mode = False
                 self._release_forward_if_held()
+                logger.info("PTT released in forward mode (skill_mode=%s)", skill_mode)
                 if self.on_ptt_release is not None:
                     try:
                         self.on_ptt_release(skill_mode)

@@ -263,6 +263,28 @@ def _keymap_panel_size(ctx: "Context") -> int:
     return 6
 
 
+def _input_panel(ctx: "Context") -> Panel:
+    """Live edit buffer for the local-STT stdin reader.
+
+    In cbreak mode the terminal doesn't echo, so chars typed or pasted
+    into the orchestrator's stdin would otherwise be invisible. We
+    render them here, with a cursor indicator, so the user can see
+    (and edit) what's about to be submitted.
+    """
+    buf_obj = getattr(ctx, "input_buffer", None)
+    if buf_obj is None:
+        body = Text("(no input buffer)", style="dim italic")
+        return Panel(body, title="Input", border_style="bright_black")
+    text_value = buf_obj.get()
+    if text_value:
+        body = Text.assemble(Text(text_value, style="white"), Text("▏", style="bold cyan"))
+        border = "cyan"
+    else:
+        body = Text("(type or wait for paste — Enter submits, Esc clears)", style="dim italic")
+        border = "bright_black"
+    return Panel(body, title="Input", border_style=border)
+
+
 def _producers_panel(supervisor: "ProducerSupervisor | None") -> Panel:
     if supervisor is None:
         return Panel(Text("(no supervisor)", style="dim"), title="Producers")
@@ -280,12 +302,17 @@ def _producers_panel(supervisor: "ProducerSupervisor | None") -> Panel:
 def render(ctx: "Context", supervisor: "ProducerSupervisor | None") -> Layout:
     """Build the dashboard layout. Pure function; safe to call from tests."""
     layout = Layout()
-    layout.split_column(
+    sections = [
         Layout(_header(ctx), name="header", size=3),
         Layout(name="body"),
+    ]
+    if getattr(ctx, "input_buffer", None) is not None:
+        sections.append(Layout(_input_panel(ctx), name="input", size=3))
+    sections.extend([
         Layout(_keymap_panel(ctx), name="keymap", size=_keymap_panel_size(ctx)),
         Layout(_producers_panel(supervisor), name="producers", size=3),
-    )
+    ])
+    layout.split_column(*sections)
     layout["body"].split_row(
         Layout(name="left", ratio=2),
         Layout(name="right", ratio=1),

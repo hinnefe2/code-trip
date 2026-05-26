@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import argparse
+import atexit
+import faulthandler
 import logging
 import os
 import queue as queue_lib
+import re
 import select
 import signal
 import sys
+import termios
 import threading
 import time
 from pathlib import Path
@@ -21,6 +25,7 @@ from code_trip2.macropad import Macropad, resolve_key
 from code_trip2.modes import Context, stop_playback
 from code_trip2.producers import ProducerSupervisor
 from code_trip2.email_state import EmailState
+from code_trip2.input_buffer import InputBuffer
 from code_trip2.producers.claude import ClaudeProducer
 from code_trip2.producers.email import EmailProducer
 from code_trip2.producers.linear import LinearProducer
@@ -120,6 +125,11 @@ def run(config: Config, *, tui: bool = False) -> None:
             "without --allowedTools restriction.", skills_dir,
         )
 
+    # Live edit buffer for the TUI input panel. Only used in local-STT
+    # mode (the stdin reader thread fills it as bytes arrive); the TUI
+    # renders it whenever it's non-None.
+    input_buffer = InputBuffer() if config.stt_provider != "openai" else None
+
     ctx = Context(
         config=config,
         tts=tts,
@@ -133,6 +143,7 @@ def run(config: Config, *, tui: bool = False) -> None:
         email_mcp=email_mcp,
         agent_mcp=agent_mcp,
         agent_allowed_tools=agent_allowed_tools,
+        input_buffer=input_buffer,
         app_mode=config.startup_mode if config.startup_mode in ("queue", "focused") else "focused",
     )
 
@@ -199,61 +210,117 @@ def run(config: Config, *, tui: bool = False) -> None:
 
     ptt_release_skill_q: queue_lib.Queue[bool] = queue_lib.Queue()
     _BRACKETED_PASTE_RE = (b"\x1b[200~", b"\x1b[201~")
+    # ANSI CSI escape sequence: ESC [ <params> <intermediates> <final>.
+    # Covers things like the forwarded Delete key (\x1b[3~) and arrow
+    # keys (\x1b[A, …) — we strip them before they pollute the input
+    # buffer with junk that the user can't see was typed.
+    _ANSI_CSI_RE = re.compile(rb"\x1b\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]")
 
     def on_ptt_release(skill_mode: bool) -> None:
         # Only push when in queue mode — otherwise Superwhisper pasted
         # into some other app and we won't see a stdin transcript to
         # match the flag against.
+        logger.info(
+            "on_ptt_release(skill_mode=%s) — app_mode=%s — %s",
+            skill_mode, ctx.app_mode,
+            "queued for stdin" if ctx.app_mode == "queue" else "dropped (not in queue mode)",
+        )
         if ctx.app_mode == "queue":
+            # Wipe any junk that accumulated during the PTT hold (e.g.
+            # the forwarded delete key delivered as \x1b[3~ before we
+            # got to strip it, or stray keystrokes from before the PTT
+            # cycle). The upcoming paste should land in a clean buffer.
+            if input_buffer is not None:
+                input_buffer.clear()
             ptt_release_skill_q.put(skill_mode)
 
-    def _stdin_paste_loop() -> None:
-        """Continuously read stdin in chunks; emit transcripts on quiet pauses.
+    # Auto-submit window after the last byte arrives. Long enough that
+    # a burst-paste (Superwhisper) finishes cleanly, short enough that
+    # the user doesn't feel a delay before the skill kicks off.
+    _STDIN_QUIET_S = 0.4
 
-        Superwhisper's paste arrives as a burst of bytes without a
-        trailing newline, so ``readline()`` would block forever. We
-        ``select()`` on stdin, accumulate whatever bytes arrive, and
-        treat a 250 ms quiet stretch after the first byte as "paste
-        done". Bracketed-paste escape markers (``\\x1b[200~`` /
-        ``\\x1b[201~``) are stripped — some terminals emit them in
-        alt-screen mode, some don't.
+    def _stdin_paste_loop() -> None:
+        """Read raw stdin chars into ``ctx.input_buffer``.
+
+        Stdin is in cbreak mode (set up before this thread starts), so
+        ``os.read`` returns bytes as soon as they're available — no
+        line buffering. We append printable chars to the buffer,
+        handle backspace / Esc / Enter as editing keys, and auto-submit
+        on a quiet pause when there's a recent PTT release (the
+        common voice flow: Superwhisper pastes a burst, then idle).
+        Without a PTT release pending we wait for Enter — that's the
+        manual-typing / edit-the-paste flow.
         """
+        if input_buffer is None:
+            return
         try:
             fd = sys.stdin.fileno()
         except (AttributeError, OSError):
             logger.info("stdin has no fileno; paste reader disabled.")
             return
-        buffer = b""
-        last_byte_at: float | None = None
+        try:
+            stdin_isatty = sys.stdin.isatty()
+        except Exception:
+            stdin_isatty = False
+        logger.info("stdin paste reader live (fd=%d, isatty=%s)", fd, stdin_isatty)
         while not shutdown.is_set():
             try:
                 ready, _, _ = select.select([fd], [], [], 0.1)
             except (OSError, ValueError):
-                return  # stdin closed (e.g. on shutdown)
+                return
             if ready:
                 try:
                     chunk = os.read(fd, 4096)
                 except OSError:
                     return
                 if not chunk:
-                    return  # EOF
-                buffer += chunk
-                last_byte_at = time.time()
-                continue
-            if buffer and last_byte_at is not None and (time.time() - last_byte_at) > 0.25:
-                text = buffer
-                for marker in _BRACKETED_PASTE_RE:
-                    text = text.replace(marker, b"")
-                transcript = text.decode("utf-8", errors="replace").strip()
-                buffer = b""
-                last_byte_at = None
-                if transcript:
-                    _dispatch_stdin_transcript(transcript)
+                    logger.info("stdin EOF; paste reader exiting.")
+                    return
+                logger.info("stdin got %d bytes: %r", len(chunk), chunk[:120])
+                _ingest_stdin_chunk(chunk)
+            # Auto-submit on quiet pause when a PTT release is pending
+            # (voice-driven flow). Manual typing without a recent PTT
+            # waits for Enter so the user can edit.
+            if (
+                ctx.app_mode == "queue"
+                and not input_buffer.is_empty()
+                and input_buffer.quiet_seconds() > _STDIN_QUIET_S
+                and not ptt_release_skill_q.empty()
+            ):
+                _submit_input_buffer()
 
-    def _dispatch_stdin_transcript(transcript: str) -> None:
+    def _ingest_stdin_chunk(chunk: bytes) -> None:
+        if input_buffer is None:
+            return
+        # Strip ANSI CSI sequences first so the forwarded Delete key
+        # (\x1b[3~) and friends don't leak into the buffer as junk.
+        text = _ANSI_CSI_RE.sub(b"", chunk)
+        for marker in _BRACKETED_PASTE_RE:
+            text = text.replace(marker, b"")
+        decoded = text.decode("utf-8", errors="replace")
+        for ch in decoded:
+            if ch in ("\r", "\n"):
+                _submit_input_buffer()
+            elif ch in ("\x7f", "\x08"):  # DEL / Backspace
+                input_buffer.backspace()
+            elif ch == "\x1b":  # bare Esc (strip-markers already removed CSI prefixes)
+                input_buffer.clear()
+            elif ch == "\x03":
+                # Ctrl-C in cbreak mode still raises SIGINT via ISIG.
+                # Nothing to do here.
+                pass
+            elif ch == " " or ch.isprintable():
+                input_buffer.append(ch)
+            # Other control chars are dropped.
+
+    def _submit_input_buffer() -> None:
+        if input_buffer is None:
+            return
+        transcript = input_buffer.pop().strip()
+        if not transcript:
+            return
         if ctx.app_mode != "queue":
-            # Drain any stale flag and stay out of the focused-mode
-            # paste path entirely.
+            # Focused mode — discard, and drain any stale flag too.
             try:
                 ptt_release_skill_q.get_nowait()
             except queue_lib.Empty:
@@ -263,7 +330,7 @@ def run(config: Config, *, tui: bool = False) -> None:
             skill_mode = ptt_release_skill_q.get_nowait()
         except queue_lib.Empty:
             skill_mode = False
-        logger.info("stdin transcript (skill_mode=%s): %s", skill_mode, transcript)
+        logger.info("submit transcript (skill_mode=%s): %s", skill_mode, transcript)
         if skill_mode:
             handle_skill(ctx, transcript)
         else:
@@ -320,6 +387,36 @@ def run(config: Config, *, tui: bool = False) -> None:
         ptt_desc,
         config.nav_key,
     )
+    # In local STT mode, the stdin reader needs to see chars as they
+    # arrive (Superwhisper pastes don't end with a newline). Flip stdin
+    # to cbreak: disable canonical buffering + echo, keep ISIG so
+    # Ctrl-C still raises SIGINT.
+    stdin_termios_saved: list | None = None
+    if config.stt_provider != "openai":
+        try:
+            stdin_fd = sys.stdin.fileno()
+            if sys.stdin.isatty():
+                stdin_termios_saved = termios.tcgetattr(stdin_fd)
+                new_attr = termios.tcgetattr(stdin_fd)
+                new_attr[3] &= ~(termios.ICANON | termios.ECHO)
+                termios.tcsetattr(stdin_fd, termios.TCSANOW, new_attr)
+                logger.info("stdin in cbreak mode (no canonical buffering, no echo)")
+                # atexit so even a hard crash that bypasses our finally
+                # block still leaves the user with a usable terminal.
+                _saved = stdin_termios_saved
+                _fd = stdin_fd
+
+                def _restore() -> None:
+                    try:
+                        termios.tcsetattr(_fd, termios.TCSANOW, _saved)
+                    except Exception:
+                        pass
+
+                atexit.register(_restore)
+        except (AttributeError, OSError, termios.error):
+            logger.warning("could not put stdin in cbreak mode", exc_info=True)
+            stdin_termios_saved = None
+
     macropad.start()
     supervisor.start_all()
     consumer.start()
@@ -348,6 +445,15 @@ def run(config: Config, *, tui: bool = False) -> None:
         macropad.stop()
         thinking.stop()
         log.close()
+        if stdin_termios_saved is not None:
+            # Restore the user's terminal modes so they don't end up
+            # in a no-echo shell after we exit.
+            try:
+                termios.tcsetattr(
+                    sys.stdin.fileno(), termios.TCSANOW, stdin_termios_saved
+                )
+            except (OSError, termios.error):
+                logger.warning("could not restore stdin termios", exc_info=True)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -379,6 +485,22 @@ def main(argv: list[str] | None = None) -> int:
             level=logging.DEBUG if args.verbose else logging.INFO,
             format="%(asctime)s %(name)s %(levelname)s: %(message)s",
         )
+
+    # Native crashes (segfaults, aborts from C extensions like PortAudio
+    # / pynput Quartz / Rich's terminal handling) don't print a Python
+    # traceback by default. faulthandler installs signal handlers that
+    # dump a Python-level stack trace to a dedicated file before the
+    # process exits, so "Python crashed with no message" leaves at least
+    # one breadcrumb to chase.
+    fault_log_dir = Path.home() / ".code-trip" / "logs"
+    fault_log_dir.mkdir(parents=True, exist_ok=True)
+    fault_log = fault_log_dir / "faulthandler.log"
+    try:
+        # ``open`` deliberately unclosed — faulthandler needs the fd alive
+        # for the whole process lifetime.
+        faulthandler.enable(file=open(fault_log, "a"), all_threads=True)
+    except Exception:
+        pass
 
     config = load_config(args.config)
     run(config, tui=args.tui)
