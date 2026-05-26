@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from code_trip2._async_utils import event_or_timeout
 from code_trip2.config import Config
 from code_trip2.producers.mcp_client import MCPClient, MCPClientError, MCPServerSpec
 from code_trip2.tasks import TaskQueue
@@ -59,11 +60,8 @@ class LinearProducer:
             # TODO: per poll tick, list_issues via MCP and emit tasks for
             # high-priority new/changed tickets. Skeleton ticks idle.
             while not self._stop.is_set():
-                try:
-                    await asyncio.wait_for(self._stop.wait(), timeout=self._poll)
+                if await event_or_timeout(self._stop, self._poll):
                     return
-                except asyncio.TimeoutError:
-                    continue
         finally:
             if self._client is not None:
                 await asyncio.to_thread(self._client.stop)

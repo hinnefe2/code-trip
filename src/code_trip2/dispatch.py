@@ -2,7 +2,7 @@
 
 The orchestrator runs in one of two **app modes**:
 
-- ``focused`` — today's behavior. Voice routes via ``modes.handle_voice``
+- ``focused`` — today's behavior. Voice routes via ``modes.handle_focused_voice``
   (its globals, voice phrases, and focused-app-aware dispatch).
 - ``queue`` — voice operates against the task queue. Globals are queue
   ops (next / skip / dismiss / snooze / what's in the queue). PTT input
@@ -29,6 +29,7 @@ import time
 from typing import TYPE_CHECKING
 
 from code_trip2 import earcon, modes, remote, tasks as tasks_mod
+from code_trip2._async_utils import event_or_timeout
 from code_trip2.tasks import Task
 
 if TYPE_CHECKING:
@@ -71,7 +72,7 @@ async def handle_voice(ctx: "Context", transcript: str) -> None:
     if ctx.app_mode == MODE_QUEUE:
         await _handle_queue_voice(ctx, t)
     else:
-        await modes.handle_voice(ctx, t)
+        await modes.handle_focused_voice(ctx, t)
 
 
 async def handle_skill(ctx: "Context", transcript: str) -> None:
@@ -219,7 +220,7 @@ async def _handle_queue_voice(ctx: "Context", t: str) -> None:
 
     # No active task: fall through to focused-mode voice phrases (window
     # switching etc. is still useful from queue mode for setup).
-    await modes.handle_voice(ctx, t)
+    await modes.handle_focused_voice(ctx, t)
 
 
 # --- queue ops -------------------------------------------------------------
@@ -329,7 +330,7 @@ async def _announce_body(ctx: "Context") -> None:
     if t is None or not t.body:
         await _speak(ctx, "Nothing to expand.")
         return
-    modes._speak_chunked(ctx, t.body)  # type: ignore[attr-defined]
+    modes.speak_chunked(ctx, t.body)
 
 
 def _kind_label(task: Task) -> str:
@@ -535,10 +536,9 @@ class QueueConsumer:
 
     async def run(self) -> None:
         while not self._stop.is_set():
-            try:
-                await asyncio.wait_for(self._wake.wait(), timeout=self._poll)
-            except asyncio.TimeoutError:
-                pass
+            # We don't care whether the wake fired or the timeout elapsed —
+            # either way we re-check state and maybe announce.
+            await event_or_timeout(self._wake, self._poll)
             self._wake.clear()
             if self._stop.is_set():
                 break

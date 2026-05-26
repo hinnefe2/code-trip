@@ -62,7 +62,7 @@ def test_flip_mode_toggles_and_plays_earcon_only():
 @pytest.mark.asyncio
 async def test_handle_voice_focused_falls_through():
     ctx = _make_ctx(app_mode="focused")
-    with patch.object(modes, "handle_voice", new_callable=AsyncMock) as mocked:
+    with patch.object(modes, "handle_focused_voice", new_callable=AsyncMock) as mocked:
         await dispatch.handle_voice(ctx, "some transcript")
     mocked.assert_awaited_once_with(ctx, "some transcript")
 
@@ -155,7 +155,7 @@ async def test_queue_yes_tap_with_active_task_expands_body():
     ctx = _make_ctx(app_mode="queue")
     t = ctx.queue.add(Task(kind="note", headline="hi", body="more details here"))
     ctx.current_task = t
-    with patch.object(modes, "_speak_chunked") as mocked:
+    with patch.object(modes, "speak_chunked") as mocked:
         await dispatch.queue_yes_tap(ctx)
     mocked.assert_called_with(ctx, "more details here")
 

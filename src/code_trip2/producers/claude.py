@@ -20,6 +20,7 @@ import shlex
 import time
 
 from code_trip2 import remote
+from code_trip2._async_utils import event_or_timeout
 from code_trip2.config import Config
 from code_trip2.summarizer import Summarizer, SummarizerError
 from code_trip2.tasks import Task, TaskQueue
@@ -64,21 +65,13 @@ class ClaudeProducer:
                 await self._poll_once(host, opts)
             except remote.RemoteError as exc:
                 logger.warning("ClaudeProducer poll failed: %s", exc)
-                if await self._sleep_or_stop(self._poll * 4):
+                if await event_or_timeout(self._stop, self._poll * 4):
                     return
                 continue
             except Exception:
                 logger.exception("ClaudeProducer unexpected error")
-            if await self._sleep_or_stop(self._poll):
+            if await event_or_timeout(self._stop, self._poll):
                 return
-
-    async def _sleep_or_stop(self, timeout: float) -> bool:
-        """Sleep ``timeout`` seconds or until stop fires. Returns True if stop fired."""
-        try:
-            await asyncio.wait_for(self._stop.wait(), timeout=timeout)
-            return True
-        except asyncio.TimeoutError:
-            return False
 
     async def _poll_once(self, host: str, opts: tuple[str, ...]) -> None:
         files = await self._list_remote_events(host, opts)

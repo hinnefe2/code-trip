@@ -25,6 +25,7 @@ import re
 import time
 from typing import TYPE_CHECKING
 
+from code_trip2._async_utils import event_or_timeout
 from code_trip2.config import Config
 from code_trip2.email_state import EmailState
 from code_trip2.producers.claude_mcp import ClaudeMCPClient, ClaudeMCPError
@@ -83,27 +84,20 @@ class EmailProducer:
     def request_stop(self) -> None:
         self._stop.set()
 
-    async def _sleep_or_stop(self, timeout: float) -> bool:
-        try:
-            await asyncio.wait_for(self._stop.wait(), timeout=timeout)
-            return True
-        except asyncio.TimeoutError:
-            return False
-
     # ---- poll loop ------------------------------------------------------
 
     async def run(self) -> None:
         if self._mcp is None or not self._mcp.enabled:
             logger.info("EmailProducer: ClaudeMCPClient unavailable; not starting.")
             return
-        if await self._sleep_or_stop(self._STARTUP_DELAY_S):
+        if await event_or_timeout(self._stop, self._STARTUP_DELAY_S):
             return
         while not self._stop.is_set():
             try:
                 await self._poll_once()
             except Exception:
                 logger.exception("EmailProducer poll failed")
-            if await self._sleep_or_stop(self._config.email_poll_interval):
+            if await event_or_timeout(self._stop, self._config.email_poll_interval):
                 return
 
     async def _poll_once(self) -> None:

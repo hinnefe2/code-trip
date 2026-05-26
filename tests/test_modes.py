@@ -290,7 +290,7 @@ async def test_dispatch_terminal_app_routes_to_work(monkeypatch):
         work_calls.append(t)
 
     monkeypatch.setattr(modes, "_work_voice", fake_work)
-    await modes.handle_voice(ctx, "do the thing")
+    await modes.handle_focused_voice(ctx, "do the thing")
     assert work_calls == ["do the thing"]
 
 
@@ -304,7 +304,7 @@ async def test_dispatch_non_terminal_app_routes_to_dictate(monkeypatch):
         dictate_calls.append(t)
 
     monkeypatch.setattr(modes, "_dictate_voice", fake_dictate)
-    await modes.handle_voice(ctx, "type this in the browser")
+    await modes.handle_focused_voice(ctx, "type this in the browser")
     assert dictate_calls == ["type this in the browser"]
 
 
@@ -322,7 +322,7 @@ async def test_dispatch_falls_back_to_work_on_active_app_error(monkeypatch):
         work_calls.append(t)
 
     monkeypatch.setattr(modes, "_work_voice", fake_work)
-    await modes.handle_voice(ctx, "hi")
+    await modes.handle_focused_voice(ctx, "hi")
     assert work_calls == ["hi"]
 
 
@@ -337,7 +337,7 @@ async def test_dispatch_voice_phrase_wins_over_focus(monkeypatch):
         work_calls.append(t)
 
     monkeypatch.setattr(modes, "_work_voice", fake_work)
-    await modes.handle_voice(ctx, "next")
+    await modes.handle_focused_voice(ctx, "next")
     # ticket step ran, NOT _work_voice
     assert work_calls == []
     assert ctx.ticket_index == 0  # only one ticket; modulo wraps to 0
@@ -347,7 +347,7 @@ async def test_dispatch_voice_phrase_wins_over_focus(monkeypatch):
 async def test_empty_transcript_is_noop(monkeypatch):
     ctx = _real_ctx()
     monkeypatch.setattr(window, "active_app", lambda: "kitty")
-    await modes.handle_voice(ctx, "   ")
+    await modes.handle_focused_voice(ctx, "   ")
     ctx.tts.speak.assert_not_called()
 
 
@@ -453,7 +453,7 @@ async def test_speak_chunked_drains_queue_via_worker(monkeypatch):
     # Avoid actually calling sounddevice via earcon.completion in the worker.
     monkeypatch.setattr(modes.earcon, "completion", lambda: None)
 
-    modes._speak_chunked(ctx, "Sentence one. Sentence two.\n\nNew para here.")
+    modes.speak_chunked(ctx, "Sentence one. Sentence two.\n\nNew para here.")
     # Wait for the playback task to finish.
     if ctx._playback_task is not None:
         await asyncio.wait_for(ctx._playback_task, timeout=2.0)
@@ -481,7 +481,7 @@ async def test_stop_during_playback_drops_remaining(monkeypatch):
     ctx.tts.speak = AsyncMock(side_effect=slow_speak)
     monkeypatch.setattr(modes.earcon, "completion", lambda: None)
 
-    modes._speak_chunked(ctx, "Chunk one. " + ("x. " * 80))
+    modes.speak_chunked(ctx, "Chunk one. " + ("x. " * 80))
     await asyncio.wait_for(started.wait(), timeout=2.0)
     modes.stop_playback(ctx)
     proceed.set()

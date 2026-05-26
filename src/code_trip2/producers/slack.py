@@ -32,6 +32,7 @@ import time
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
+from code_trip2._async_utils import event_or_timeout
 from code_trip2.config import Config
 from code_trip2.producers.claude_mcp import ClaudeMCPClient, ClaudeMCPError
 from code_trip2.slack_state import SlackState
@@ -166,14 +167,6 @@ class SlackProducer:
     def request_stop(self) -> None:
         self._stop.set()
 
-    async def _sleep_or_stop(self, timeout: float) -> bool:
-        """Sleep ``timeout`` seconds or until stop. Returns True if stop fired."""
-        try:
-            await asyncio.wait_for(self._stop.wait(), timeout=timeout)
-            return True
-        except asyncio.TimeoutError:
-            return False
-
     # ---- setup ----------------------------------------------------------
 
     async def _fetch_user_id(self) -> str:
@@ -212,21 +205,21 @@ class SlackProducer:
             return
         # Slight stagger so we don't hammer claude at the same instant the
         # orchestrator starts.
-        if await self._sleep_or_stop(self._STARTUP_DELAY_S):
+        if await event_or_timeout(self._stop, self._STARTUP_DELAY_S):
             return
         # Retry setup until it succeeds. A transient claude --print
         # failure (auth blip, rate-limit, etc) should not permanently
         # disable the producer for the rest of the session — the task
         # stays alive and retries every poll interval.
         while not await self._setup_in_thread():
-            if await self._sleep_or_stop(self._config.slack_poll_interval):
+            if await event_or_timeout(self._stop, self._config.slack_poll_interval):
                 return
         while not self._stop.is_set():
             try:
                 await self._poll_once()
             except Exception:
                 logger.exception("SlackProducer poll failed")
-            if await self._sleep_or_stop(self._config.slack_poll_interval):
+            if await event_or_timeout(self._stop, self._config.slack_poll_interval):
                 return
 
     async def _setup_in_thread(self) -> bool:

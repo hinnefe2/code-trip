@@ -109,8 +109,14 @@ class Context:
 # --- top-level dispatch ----------------------------------------------------
 
 
-async def handle_voice(ctx: Context, transcript: str) -> None:
-    """Route a PTT transcript: globals → voice phrases → app focus."""
+async def handle_focused_voice(ctx: Context, transcript: str) -> None:
+    """Route a PTT transcript inside focused mode: globals → voice phrases → app focus.
+
+    ``dispatch.handle_voice`` is the top-level entry point that picks
+    between queue-mode handling and this function based on
+    ``ctx.app_mode``. Naming this distinctly keeps the call graph
+    self-documenting.
+    """
     t = transcript.strip()
     if not t:
         return
@@ -395,10 +401,6 @@ def chunk_text(
         if cur:
             chunks.append(cur)
     return chunks
-
-
-def _speak_chunked(ctx: Context, text: str) -> None:
-    speak_chunked(ctx, text)
 
 
 def speak_chunked(ctx: Context, text: str) -> None:
