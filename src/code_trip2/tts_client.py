@@ -94,6 +94,14 @@ class TTSClient:
     _stream_lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False
     )
+    # Serializes the body of speak() so two threads can't both write into
+    # the persistent OutputStream's ring buffer at once. PortAudio's
+    # PaUtil_WriteRingBuffer is single-writer; concurrent writes corrupt
+    # the head/tail pointers and segfault the process (DiagnosticReports
+    # 2026-05-22 onward: PaUtil_WriteRingBuffer + 180, KERN_INVALID_ADDRESS).
+    _speak_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False
+    )
     _stop_event: threading.Event = field(
         default_factory=threading.Event, init=False, repr=False
     )
@@ -115,6 +123,10 @@ class TTSClient:
         thread to interrupt mid-sentence (latency: ~170 ms = one write
         block).
 
+        Concurrent callers serialize on ``_speak_lock`` — PortAudio's
+        ring buffer is single-writer, so two threads writing at once
+        would corrupt it and segfault the process.
+
         Raises:
             TTSClientError: if the text is empty or the API call fails.
         """
@@ -122,44 +134,51 @@ class TTSClient:
         if not text:
             raise TTSClientError("Empty text cannot be synthesized")
 
-        try:
-            response = self._client.audio.speech.create(
-                model=self.model,
-                voice=self.voice,
-                input=text,
-                speed=self.speed,
-                response_format=DEFAULT_FORMAT,
-            )
-        except AuthenticationError as exc:
-            raise TTSClientError(f"Authentication failed: {exc}") from exc
-        except APIConnectionError as exc:
-            raise TTSClientError(f"Network error: {exc}") from exc
-        except APIError as exc:
-            raise TTSClientError(f"API error: {exc}") from exc
+        with self._speak_lock:
+            try:
+                response = self._client.audio.speech.create(
+                    model=self.model,
+                    voice=self.voice,
+                    input=text,
+                    speed=self.speed,
+                    response_format=DEFAULT_FORMAT,
+                )
+            except AuthenticationError as exc:
+                raise TTSClientError(f"Authentication failed: {exc}") from exc
+            except APIConnectionError as exc:
+                raise TTSClientError(f"Network error: {exc}") from exc
+            except APIError as exc:
+                raise TTSClientError(f"API error: {exc}") from exc
 
-        audio: bytes = response.content
-        if not audio:
-            raise TTSClientError("Empty audio returned")
+            audio: bytes = response.content
+            if not audio:
+                raise TTSClientError("Empty audio returned")
 
-        samples, sample_rate = _decode_wav(audio)
-        channels = 1 if samples.ndim == 1 else samples.shape[1]
+            samples, sample_rate = _decode_wav(audio)
+            channels = 1 if samples.ndim == 1 else samples.shape[1]
 
-        self._stop_event.clear()
-        stream = self._ensure_stream(sample_rate, channels)
-        self._playing = True
-        try:
-            self._write_in_blocks(stream, samples)
-        finally:
-            self._playing = False
+            self._stop_event.clear()
+            stream = self._ensure_stream(sample_rate, channels)
+            self._playing = True
+            try:
+                self._write_in_blocks(stream, samples)
+            finally:
+                self._playing = False
 
     def stop(self) -> None:
-        """Interrupt any in-progress playback.
+        """Interrupt any in-progress playback and wait for it to exit.
 
-        Sets a stop flag; the write loop exits at the next block
-        boundary (~170 ms). The OutputStream itself is left open so
+        Sets a stop flag, then briefly acquires ``_speak_lock`` to wait
+        until the in-flight ``speak()`` call has returned. Bounded by
+        one write block (~170 ms). Returning before the writer exits
+        would let the next ``speak()`` race the dying one — the whole
+        point of this method is "by the time I return, nothing is
+        touching the OutputStream." The stream itself is left open so
         the next ``speak()`` doesn't pay the reopen cost.
         """
         self._stop_event.set()
+        with self._speak_lock:
+            pass
 
     def is_playing(self) -> bool:
         """True while ``speak()`` is blocked on playback."""
