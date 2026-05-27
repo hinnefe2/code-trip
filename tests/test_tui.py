@@ -204,6 +204,21 @@ def test_producers_panel_no_supervisor():
     assert "no supervisor" in out
 
 
+def test_producers_panel_shows_polling_state():
+    """Producer with ``is_polling=True`` shows as ``polling`` in cyan."""
+    sup = ProducerSupervisor()
+    sup.add(SimpleNamespace(
+        name="email",
+        is_polling=True,
+        request_stop=lambda: None,
+        run=lambda: None,
+    ))
+    sup._tasks["email"] = SimpleNamespace(done=lambda: False)
+    out = _render(tui._producers_panel(sup))
+    assert "email" in out
+    assert "polling" in out
+
+
 # --- auto-handle log panel ------------------------------------------------
 
 

@@ -98,6 +98,7 @@ def _truncate(s: str, n: int) -> str:
 _STATE_COLOR = {
     "running": "green",
     "ready": "green",
+    "polling": "cyan",
     "idle": "yellow",
     "stopped": "red",
 }

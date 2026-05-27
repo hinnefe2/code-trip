@@ -31,6 +31,12 @@ class Producer(Protocol):
     # (e.g. ManualProducer, which only exists so the dispatch surface is
     # uniform). Drives the "ready" vs "stopped" distinction in status().
     has_background_work: bool
+    # Optional. True while the producer is blocked on an external call
+    # (e.g. ``claude --print`` for MCP-backed producers). When True,
+    # status() returns "polling" instead of "running" so the TUI can
+    # show what we're actually doing. Producers that don't set this
+    # default to False via ``getattr``.
+    is_polling: bool
 
     async def run(self) -> None: ...
     def request_stop(self) -> None: ...
@@ -85,10 +91,12 @@ class ProducerSupervisor:
     def status(self) -> list[tuple[str, str]]:
         """Best-effort ``(name, state)`` per producer for the TUI / debug.
 
-        State is one of ``running`` (task alive), ``stopped`` (task ended),
-        ``ready`` (no background work expected — task done is the normal
-        state), or ``idle`` (never started, e.g. because start_all hasn't
-        been called yet).
+        State is one of:
+        - ``polling`` — alive AND mid-external-call (``is_polling`` True)
+        - ``running`` — alive, between calls
+        - ``stopped`` — task ended
+        - ``ready`` — no background work expected; task done is normal
+        - ``idle`` — never started (start_all hasn't been called yet)
         """
         out: list[tuple[str, str]] = []
         for p in self._producers:
@@ -97,7 +105,10 @@ class ProducerSupervisor:
             if task is None:
                 out.append((p.name, "ready" if not has_bg else "idle"))
             elif not task.done():
-                out.append((p.name, "running"))
+                if getattr(p, "is_polling", False):
+                    out.append((p.name, "polling"))
+                else:
+                    out.append((p.name, "running"))
             else:
                 out.append((p.name, "ready" if not has_bg else "stopped"))
         return out

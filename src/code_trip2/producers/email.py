@@ -91,6 +91,10 @@ class EmailProducer:
         # surfaces, regardless of when it arrived. Subsequent polls
         # revert to the incremental ``after:<last_message_ts>`` query.
         self._first_poll = True
+        # True while an MCP call is in flight. The supervisor reads
+        # this so the TUI can show "polling" instead of "running"
+        # while we're waiting on ``claude --print``.
+        self.is_polling = False
 
     # ---- lifecycle ------------------------------------------------------
 
@@ -124,6 +128,10 @@ class EmailProducer:
             query = base_query
         else:
             query = f"{base_query} after:{self._after_param(last_ts)}".strip()
+        # Flag mid-MCP-call so the supervisor / TUI can show "polling"
+        # while we're blocked on ``claude --print``. ``try/finally`` so
+        # the flag clears even when the call raises.
+        self.is_polling = True
         try:
             result = await self._mcp.call_tool(
                 "search_threads",
@@ -137,6 +145,8 @@ class EmailProducer:
             # Don't burn the first-poll wide window on a transient
             # failure — retry on the next tick.
             return
+        finally:
+            self.is_polling = False
 
         threads = self._extract_threads(result)
         emitted = 0

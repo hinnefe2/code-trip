@@ -313,6 +313,26 @@ async def test_producer_resilient_to_mcp_errors(tmp_path: Path):
     mcp.call_tool.side_effect = ClaudeMCPError("network")
     await p._poll_once()  # must not raise
     assert q.all() == []
+    # is_polling must clear even on error — otherwise the TUI would
+    # be stuck showing "polling" forever after a transient failure.
+    assert p.is_polling is False
+
+
+@pytest.mark.asyncio
+async def test_producer_is_polling_true_while_call_in_flight(tmp_path: Path):
+    """``is_polling`` flips True around the MCP call and False on return."""
+    p, _q, mcp, _state = _producer(tmp_path)
+    observed: list[bool] = []
+
+    async def slow_call(*_a, **_kw):
+        observed.append(p.is_polling)
+        return {"threads": []}
+
+    mcp.call_tool.side_effect = slow_call
+    assert p.is_polling is False
+    await p._poll_once()
+    assert observed == [True]      # mid-call snapshot
+    assert p.is_polling is False   # cleared after
 
 
 @pytest.mark.asyncio
