@@ -183,10 +183,21 @@ async def main_async(config: Config, *, tui: bool = False) -> None:
     screener_stop = asyncio.Event()
 
     def _on_screener_outcome(outcome: ScreeningOutcome) -> None:
+        # Append to the TUI log first — the session log and queue log
+        # are useful for offline analysis but the user is staring at
+        # the TUI right now, and we don't want a logging hiccup to
+        # eat the visible entry.
+        if outcome.action != "forward" or outcome.dry_run_nominated:
+            ctx.autohandle_log.append(
+                AutohandleLogEntry(ts=time.time(), outcome=outcome)
+            )
+        # ``task_kind``, not ``kind`` — SessionLogger.event() takes
+        # ``kind`` as its positional event-name parameter, so a kwarg
+        # of the same name collides at call time.
         log.event(
             "task_screened",
             task_id=outcome.task.id,
-            kind=outcome.task.kind,
+            task_kind=outcome.task.kind,
             topic=outcome.task.topic,
             action=outcome.action,
             skill=outcome.skill,
@@ -199,13 +210,6 @@ async def main_async(config: Config, *, tui: bool = False) -> None:
         # offline replay/analysis can attribute them.
         if outcome.action == "handled":
             queue_log.record("autohandle", outcome.task)
-        # Surface "interesting" outcomes in the TUI's auto-handle log.
-        # A plain forward with no skill nominated is just pass-through
-        # — boring and would drown out real actions.
-        if outcome.action != "forward" or outcome.dry_run_nominated:
-            ctx.autohandle_log.append(
-                AutohandleLogEntry(ts=time.time(), outcome=outcome)
-            )
 
     if autohandle_active:
         submit_to_intake: Callable[[Task], None] = intake_q.put_nowait

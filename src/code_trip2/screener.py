@@ -192,10 +192,15 @@ async def classify(
         return None
     prompt = build_classifier_prompt(task, candidates)
     try:
+        # Budget is sized for the context-load cost, not the model's
+        # output: ``claude --print`` loads the full MCP tool catalog
+        # into context every invocation (~$0.02–0.04 of cache reads),
+        # and the model itself emits maybe one short line. $0.10 gives
+        # headroom without enabling runaway loops.
         reply = await mcp.run_agent(
             prompt=prompt,
             allowed_tools=(),     # classifier shouldn't call any tool
-            max_budget_usd=0.02,
+            max_budget_usd=0.10,
         )
     except ClaudeMCPError as exc:
         logger.warning("Screener classifier failed: %s", exc)
