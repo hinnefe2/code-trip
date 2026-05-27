@@ -9,6 +9,7 @@ import pytest
 
 from code_trip2 import modes
 from code_trip2.summarizer import Summarizer, SummarizerError
+from conftest import make_mock_tts
 
 
 # --- Summarizer itself -----------------------------------------------------
@@ -96,9 +97,7 @@ async def test_summarizer_api_error_raises():
 
 
 def _make_ctx_for_strip(summarizer=None):
-    tts = MagicMock()
-    tts.is_playing.return_value = False
-    tts.speak = AsyncMock(return_value=None)
+    tts = make_mock_tts()
     cfg = SimpleNamespace(
         ssh_host="",
         ssh_options=(),

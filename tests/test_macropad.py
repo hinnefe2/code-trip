@@ -16,6 +16,7 @@ from code_trip2 import chords, window
 from code_trip2 import macropad as macropad_module
 from code_trip2.macropad import Macropad
 from code_trip2.window import Chord, KeyStroke
+from conftest import make_mock_tts
 
 
 KEYMAP = {
@@ -408,9 +409,8 @@ def _ctx(
     tmux_session="s",
     active_window="work",
 ):
-    tts = MagicMock()
+    tts = make_mock_tts()
     tts.is_playing.return_value = playing
-    tts.speak = AsyncMock(return_value=None)
     config = SimpleNamespace(
         app_cycle=app_cycle,
         terminal_apps=terminal_apps,

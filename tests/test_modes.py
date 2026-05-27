@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from code_trip2 import chords, modes, window
+from conftest import make_mock_tts
 
 
 # --- chunk_text ------------------------------------------------------------
@@ -123,10 +124,7 @@ def _real_ctx(*, terminal_apps=("kitty",)) -> modes.Context:
         terminal_apps=terminal_apps,
         wait_timeout=1.0,
     )
-    tts = MagicMock()
-    tts.is_playing.return_value = False
-    # speak is awaited by the async handlers; sync MagicMock would error.
-    tts.speak = AsyncMock(return_value=None)
+    tts = make_mock_tts()
     log = MagicMock()
     thinking = MagicMock()
     return modes.Context(config=config, tts=tts, log=log, thinking=thinking)

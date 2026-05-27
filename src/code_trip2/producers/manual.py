@@ -10,7 +10,6 @@ hotkey-driven adds) have a home.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 
 logger = logging.getLogger(__name__)
@@ -20,12 +19,10 @@ class ManualProducer:
     """No-op run/stop; manual adds are pull-driven from dispatch."""
 
     name = "manual"
-
-    def __init__(self) -> None:
-        self._stop = asyncio.Event()
+    has_background_work = False
 
     def request_stop(self) -> None:
-        self._stop.set()
+        return
 
     async def run(self) -> None:
         return

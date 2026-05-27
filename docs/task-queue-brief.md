@@ -6,8 +6,8 @@ You're picking up work on the **`task-queue`** branch of [code-trip](../README.m
 
 Replacing the original five-mode FSM (`IDLE` / `DICTATE` / `WORK` / `NAVIGATING` / `LINEAR` / `SLACK`) with a **task-queue** interaction model. The user no longer cycles between modes to "go check Slack" or "talk to Claude." Instead:
 
-- **Producers** (background threads) push tasks into a queue: Slack @-mentions, Gmail inbox, Claude Stop-hook events from a remote tmux session, manual voice notes.
-- A **consumer thread** auto-announces the highest-scoring pending task whenever the user is idle in queue mode.
+- **Producers** (asyncio tasks) push tasks into a queue: Slack @-mentions, Gmail inbox, Claude Stop-hook events from a remote tmux session, manual voice notes.
+- An **async consumer task** auto-announces the highest-scoring pending task whenever the user is idle in queue mode.
 - The user **engages** via voice (PTT) or macropad chord on the announced task.
 - The mental model: an old paper inbox. Take the top item, deal with it, take the next.
 
@@ -46,7 +46,7 @@ Chords (mostly mode-independent):
 ## Architecture sketch
 
 ```
-producers (threads)         queue              consumer / dispatch
+producers (asyncio tasks)   queue              consumer / dispatch
   • claude (tmux stop hook)   │
   • slack (claude.ai MCP)     │── push ──▶  TaskQueue ──▶ auto-announce
   • manual (voice add)        │              + scoring     + voice routing
@@ -59,7 +59,9 @@ state on disk: ~/.code-trip/queue/queue-YYYY-MM-DD.jsonl
                               /logs/orchestrator.log
 ```
 
-Topic-affinity scoring lives in `tasks.score()`. The consumer wakes on queue mutations + a short timer.
+Topic-affinity scoring lives in `tasks.score()`. The consumer wakes on queue mutations (an `asyncio.Event`) plus a short timer.
+
+**Single event loop architecture.** `main_async` owns one asyncio loop; producers, consumer, dispatch, TTS/STT/summarizer, MCP subprocess calls, SSH calls, and the Textual TUI all run on it. The only threaded code is the irreducible C-callback boundary at pynput (keyboard listener) and sounddevice (PortAudio capture + playback). Both are single-source bridges: the macropad's pynput thread hands callbacks to the loop via the `_from_thread` helper in `main.py`; sounddevice's `stream.write` is wrapped in `asyncio.to_thread` inside `TTSClient`. See `docs/async-migration-plan.md` for the full history and per-module checklist.
 
 ## Key modules to know about
 
@@ -81,8 +83,8 @@ Topic-affinity scoring lives in `tasks.score()`. The consumer wakes on queue mut
   - `claude_mcp.py` — wrapper around `claude --print` for invoking MCP tools. Parses the `tool_result` block out of stream-json output; ignores LLM prose. The whole "MCP proxy via Claude CLI" mechanism lives here.
   - `manual.py` — voice-driven manual task add (a no-op start/stop; logic is in dispatch).
   - `linear.py` — stub.
-- **`slack_state.py`** / **`email_state.py`** — per-producer cursors persisted as JSON.
-- **`tui.py`** — Rich live dashboard (`--tui` flag). Also: TUI-host detection + keystroke suppression so synthesized Enter/Esc/Down doesn't scroll the alternate-screen buffer.
+- **`slack_state.py`** / **`email_state.py`** — per-producer cursors persisted as JSON. No locks; single-loop discipline serializes access.
+- **`tui.py`** — Textual app (`--tui` flag). `CodeTripApp` owns the foreground; an `Input` widget catches voice-paste in local-STT mode. Also: TUI-host detection + keystroke suppression so synthesized Enter/Esc/Down doesn't scroll the alternate-screen buffer.
 - **`remote.py`** — SSH + tmux helpers (`send-keys`, `capture-pane`, `wait_done`).
 - **`window.py`** — macOS-only: active-app, app activation, keystroke synthesis.
 
@@ -93,7 +95,7 @@ Topic-affinity scoring lives in `tasks.score()`. The consumer wakes on queue mut
 Two engines, picked once via `stt.provider` in `config.toml`:
 
 - `openai` — orchestrator captures audio with sounddevice on PTT, sends to Whisper API, dispatches the transcript via `on_audio`.
-- `local` (Superwhisper-style) — PTT forwards `stt.local.hotkey` to the external STT tool. That tool records, transcribes, populates the clipboard, and pastes (Cmd+V) into the focused app. In queue mode, the orchestrator reads that paste off **stdin** — a background reader thread accumulates bytes, emits on a ~250 ms quiet pause, strips bracketed-paste markers, and dispatches. The macropad pushes a `skill_mode` flag (ACT+PTT) into a small FIFO on PTT release; the stdin reader pops one per transcript to choose between `handle_voice` and `handle_skill`. Focused mode is intentionally hands-off: the orchestrator drops any stdin lines that arrive when `app_mode != "queue"` so Superwhisper's paste (into Slack, kitty, …) remains the only effect. The user is expected to keep the TUI's host terminal focused while in queue mode for the paste to land in our stdin.
+- `local` (Superwhisper-style) — PTT forwards `stt.local.hotkey` to the external STT tool. That tool records, transcribes, populates the clipboard, and pastes (Cmd+V) into the focused app. **Requires `--tui`**: the orchestrator's Textual `Input` widget catches the paste directly when the TUI host terminal is focused. PTT release posts a `PttReleased(skill_mode)` message from the macropad's pynput thread; the next `Input.Submitted` dispatches `handle_voice` or `handle_skill` based on that flag. An autosubmit timer (0.4 s of input quiet, 5 s max wait) submits without needing a trailing newline. The user keeps the TUI's host terminal focused while in queue mode so Superwhisper's paste lands in the Input widget; in focused mode the paste lands in whatever app the user actually meant.
 
 ## Skill-based task completion
 
@@ -113,13 +115,13 @@ Each `SKILL.md` declares an `allowed-tools` list in its YAML frontmatter. The or
 
 4. **TTS uses a persistent `sd.OutputStream`.** Repeated `sd.play()` reopens (which the original code did) cause audio-device reinit on every chunk → buffer underruns → crackle throughout playback. The persistent stream + `latency='high'` fixed it. See the docstring in `tts_client.py`.
 
-5. **`--tui` redirects Python logging to a file.** Rich's live display can't share stdout with logging. Logs go to `~/.code-trip/logs/orchestrator.log`. `tail -f` that file when debugging.
+5. **`--tui` redirects Python logging to a file.** Textual owns the foreground; logs go to `~/.code-trip/logs/orchestrator.log`. `tail -f` that file when debugging.
 
 6. **Synthesized keystrokes are suppressed when frontmost app == TUI host.** Otherwise tapping YES (Enter) into the kitty hosting the dashboard would scroll the alternate-screen buffer up by a line. Detection via `TERM_PROGRAM` → mapped to the macOS app name `osascript` reports.
 
 ## Current state at a glance
 
-- **Working**: Task queue + scoring + persistence; mode flip; TUI dashboard with mode-aware keymap; Slack producer (@-mentions across all channels + per-channel polling for "watched" channels); Gmail producer (configurable Gmail-syntax search, draft-only reply); Claude Stop-hook producer over SSH to a remote tmux; manual voice-add; summarizer LLM; persistent-stream TTS playback. Slack + Gmail both collapse a stream of in-thread messages into one live task.
+- **Working**: Task queue + scoring + persistence; mode flip; Textual TUI with mode-aware keymap; Slack producer (@-mentions across all channels + per-channel polling for "watched" channels); Gmail producer (configurable Gmail-syntax search, draft-only reply); Claude Stop-hook producer over SSH to a remote tmux; manual voice-add; summarizer LLM; persistent-stream TTS playback. Slack + Gmail both collapse a stream of in-thread messages into one live task.
 - **Stubbed**: Linear producer (no MCP wiring).
 - **Known gaps**: DMs that don't @-mention the user aren't surfaced (claude.ai Slack MCP doesn't expose a clean "all DMs since X"). Slack/email reply via voice works but without LLM body-shaping (you reply with literal STT text). Gmail send goes through `create_draft` — the user has to open Gmail to actually send.
 
@@ -144,7 +146,7 @@ python -m pytest \
 
 **Do NOT run `pytest tests/` whole-directory** — there are several stale test files (`test_audio_recorder.py`, `test_browse.py`, `test_intent_classifier.py`, `test_keypad.py`, `test_mode_fsm.py`, `test_orchestrator.py`, `test_push_to_talk.py`, `test_remote_tmux.py`, `test_review.py`, `test_ship.py`, `test_stt_client.py`, `test_summarizer.py`'s old version, `test_work.py`) that import from the defunct `code_trip` package (note no `2`) and error on collection.
 
-**Debug**: `~/.code-trip/logs/orchestrator.log` (TUI mode), or just run without `--tui` to get logs on stdout.
+**Debug**: `~/.code-trip/logs/orchestrator.log` (TUI mode), or run without `--tui` to get logs on stdout (openai-STT only — local-STT mode requires `--tui` for the Input widget).
 
 ## State files the user may reset
 

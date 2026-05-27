@@ -1,6 +1,6 @@
 # Asyncio migration plan
 
-> **Status:** Phases 1–7 landed 2026-05-27 on the `async-migration` branch.
+> **Status:** Phases 1–8 landed 2026-05-27 on the `async-migration` branch. Migration complete.
 
 ## Motivation
 
@@ -170,10 +170,24 @@ The locks at `email_state.py`, `slack_state.py`, `input_buffer.py` are no-ops un
 
 ### Phase 8 — Cleanup
 
-- Audit for any remaining `threading.Lock` / `threading.Event` / daemon threads in our code. Should be exactly two: the pynput listener and any sounddevice executor threads in flight. Document them in CLAUDE.md / brief.
-- Remove the `threading.Event` shutdown-bridge added in Phase 1.
-- Update `docs/task-queue-brief.md` to reflect the async architecture.
-- Remove pytest-asyncio's auto-mode if we adopted strict mode (recommended) — confirm every test that needs the loop is explicitly marked.
+- **Producer protocol gained `has_background_work: bool`.** `ProducerSupervisor.status()` drops the hardcoded `if p.name == "manual"` special case in favor of the protocol attribute. `ManualProducer` sets it to `False`.
+- **`ManualProducer.request_stop()` simplified.** The unused `asyncio.Event` flag (set but never read by `run()`, which returned immediately) is gone. `request_stop` is now an explicit no-op.
+- **`tests/conftest.py` extracted.** `make_mock_tts()` + a `mock_tts` pytest fixture replace 6+ inline `tts.speak = AsyncMock(...)` duplicates across `test_dispatch.py`, `test_email.py`, `test_macropad.py`, `test_modes.py`, `test_slack.py`, `test_summarizer.py`, `test_tui.py`.
+- **`email_state.py` / `slack_state.py` locks removed.** Single-loop discipline (one async producer task at a time touches each state object) replaces the previous `threading.Lock`. Docstrings updated.
+- **`threading.Event` shutdown bridge in `main.py` — already removed in Phase 7** along with the stdin reader thread.
+- **Strict asyncio mode confirmed.** `pyproject.toml` already has `asyncio_mode = "strict"`; no auto-mode to roll back.
+- **`docs/task-queue-brief.md` rewritten** to reflect: async producers/consumer, Textual TUI, local-STT requires `--tui`, single event loop architecture.
+
+**Final thread catalog (the only threads our code still owns):**
+
+| Thread | Module | Why |
+|---|---|---|
+| pynput keyboard listener | `macropad.py` | pynput's C-callback API has no async port |
+| sounddevice `InputStream` (mic capture) | `macropad.py` | PortAudio C callback |
+| sounddevice playback in `earcon.Thinking` | `earcon.py` | PortAudio playback boundary |
+| sounddevice `OutputStream.write` (TTS playback) | `tts_client.py` (via `asyncio.to_thread`) | PortAudio playback boundary; executor thread per block |
+
+The corresponding locks (`macropad._lock`, `tts_client._stream_lock`, `tts_client._stop_event`) all bridge between these threads and the loop; they stay.
 
 ## Per-module conversion checklist
 

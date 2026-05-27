@@ -27,6 +27,10 @@ logger = logging.getLogger(__name__)
 
 class Producer(Protocol):
     name: str
+    # False for producers that have nothing to run in the background
+    # (e.g. ManualProducer, which only exists so the dispatch surface is
+    # uniform). Drives the "ready" vs "stopped" distinction in status().
+    has_background_work: bool
 
     async def run(self) -> None: ...
     def request_stop(self) -> None: ...
@@ -82,19 +86,20 @@ class ProducerSupervisor:
         """Best-effort ``(name, state)`` per producer for the TUI / debug.
 
         State is one of ``running`` (task alive), ``stopped`` (task ended),
-        ``ready`` (manual producer — no background work expected), or
-        ``idle`` (never started, e.g. because the relevant config was
-        empty or start_all hasn't been called).
+        ``ready`` (no background work expected — task done is the normal
+        state), or ``idle`` (never started, e.g. because start_all hasn't
+        been called yet).
         """
         out: list[tuple[str, str]] = []
         for p in self._producers:
             task = self._tasks.get(p.name)
+            has_bg = getattr(p, "has_background_work", True)
             if task is None:
-                out.append((p.name, "ready" if p.name == "manual" else "idle"))
+                out.append((p.name, "ready" if not has_bg else "idle"))
             elif not task.done():
                 out.append((p.name, "running"))
             else:
-                out.append((p.name, "ready" if p.name == "manual" else "stopped"))
+                out.append((p.name, "ready" if not has_bg else "stopped"))
         return out
 
     def __iter__(self):

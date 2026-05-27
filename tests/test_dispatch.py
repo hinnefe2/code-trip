@@ -9,13 +9,12 @@ import pytest
 
 from code_trip2 import dispatch, modes
 from code_trip2.tasks import RecentTopics, Task, TaskQueue
+from conftest import make_mock_tts
 
 
 def _make_ctx(app_mode: str = "focused") -> modes.Context:
     """Build a Context wired up enough for dispatch tests."""
-    tts = MagicMock()
-    tts.is_playing.return_value = False
-    tts.speak = AsyncMock(return_value=None)
+    tts = make_mock_tts()
     cfg = SimpleNamespace(
         ssh_host="",
         ssh_options=(),

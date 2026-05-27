@@ -22,11 +22,11 @@ from code_trip2 import chords, modes, tui
 from code_trip2.producers import ProducerSupervisor
 from code_trip2.tasks import Task
 from code_trip2.window import Chord, KeyStroke
+from conftest import make_mock_tts
 
 
 def _make_ctx(*, app_mode="queue", summarizer_enabled=False):
-    tts = MagicMock()
-    tts.is_playing.return_value = False
+    tts = make_mock_tts()
     cfg = SimpleNamespace(
         ssh_host="",
         ssh_options=(),

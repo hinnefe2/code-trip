@@ -14,6 +14,7 @@ from code_trip2.email_state import EmailState
 from code_trip2.producers.claude_mcp import ClaudeMCPClient, ClaudeMCPError
 from code_trip2.producers.email import EmailProducer, _parse_ts, _split_name_addr
 from code_trip2.tasks import Task, TaskQueue
+from conftest import make_mock_tts
 
 
 # --- EmailState ----------------------------------------------------------
@@ -291,11 +292,9 @@ def _ctx_with_email_mcp(mcp):
         ssh_host="", ssh_options=(), tmux_session="main",
         work_window="work", linear_window="linear", terminal_apps=("kitty",),
     )
-    tts = MagicMock()
-    tts.speak = AsyncMock(return_value=None)
     return modes.Context(
         config=cfg,  # type: ignore[arg-type]
-        tts=tts,
+        tts=make_mock_tts(),
         log=MagicMock(),
         thinking=MagicMock(),
         email_mcp=mcp,

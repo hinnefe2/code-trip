@@ -15,7 +15,6 @@ import json
 import logging
 import os
 import tempfile
-import threading
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -29,16 +28,18 @@ def default_state_path() -> Path:
 
 
 class EmailState:
-    """Thread-safe JSON-backed cursor store for the Email producer."""
+    """JSON-backed cursor store for the Email producer.
+
+    Single-loop discipline (one asyncio task at a time touches this
+    object) replaces the previous ``threading.Lock``.
+    """
 
     def __init__(self, path: Path | None = None) -> None:
         self.path = path or default_state_path()
-        self._lock = threading.Lock()
         self._data: dict[str, int] = self._load()
 
     def last_message_ts(self) -> int | None:
-        with self._lock:
-            v = self._data.get(_LAST_MESSAGE_TS_KEY)
+        v = self._data.get(_LAST_MESSAGE_TS_KEY)
         if v is None:
             return None
         try:
@@ -51,16 +52,14 @@ class EmailState:
         if not ts or int(ts) <= 0:
             return
         new = int(ts)
-        with self._lock:
-            prior = self._data.get(_LAST_MESSAGE_TS_KEY)
-            if prior is not None and int(prior) >= new:
-                return
-            self._data[_LAST_MESSAGE_TS_KEY] = new
+        prior = self._data.get(_LAST_MESSAGE_TS_KEY)
+        if prior is not None and int(prior) >= new:
+            return
+        self._data[_LAST_MESSAGE_TS_KEY] = new
         self._save()
 
     def all(self) -> dict[str, int]:
-        with self._lock:
-            return dict(self._data)
+        return dict(self._data)
 
     def _load(self) -> dict[str, int]:
         if not self.path.exists():

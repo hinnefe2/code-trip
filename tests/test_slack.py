@@ -15,6 +15,7 @@ from code_trip2.producers.claude_mcp import ClaudeMCPClient, ClaudeMCPError
 from code_trip2.producers.slack import SlackProducer
 from code_trip2.slack_state import SlackState
 from code_trip2.tasks import Task, TaskQueue
+from conftest import make_mock_tts
 
 
 # --- ClaudeMCPClient stream parsing --------------------------------------
@@ -889,11 +890,9 @@ def _ctx_with_slack_mcp(mcp):
         ssh_host="", ssh_options=(), tmux_session="main",
         work_window="work", linear_window="linear", terminal_apps=("kitty",),
     )
-    tts = MagicMock()
-    tts.speak = AsyncMock(return_value=None)
     return modes.Context(
         config=cfg,  # type: ignore[arg-type]
-        tts=tts,
+        tts=make_mock_tts(),
         log=MagicMock(),
         thinking=MagicMock(),
         slack_mcp=mcp,
