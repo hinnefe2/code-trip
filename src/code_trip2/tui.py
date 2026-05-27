@@ -276,6 +276,7 @@ def _keymap_panel_size(ctx: "Context") -> int:
 _AUTOHANDLE_LABEL_STYLE = {
     "HANDLED": "bold green",
     "FAILED": "bold red",
+    "DISMISSED": "bold bright_black",
     "DRY-RUN": "bold yellow",
 }
 

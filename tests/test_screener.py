@@ -196,6 +196,136 @@ async def test_screen_dry_run_logs_pick_but_forwards():
     assert mcp.run_agent.await_count == 1
 
 
+# --- dismiss skills --------------------------------------------------------
+
+
+def _dismiss_manifest(
+    name: str,
+    *,
+    kinds: tuple[str, ...] = ("slack_msg",),
+    description: str = "dismiss noise",
+) -> SkillManifest:
+    return SkillManifest(
+        name=name,
+        description=description,
+        allowed_tools=(),
+        auto_handle=False,
+        auto_handle_kinds=frozenset(),
+        dismiss=True,
+        dismiss_kinds=frozenset(kinds),
+    )
+
+
+@pytest.mark.asyncio
+async def test_screen_dismiss_skill_returns_dismissed_outcome():
+    """A dismiss skill matched → outcome `dismissed`, no executor call."""
+    mcp = _mcp(agent_reply="DISMISS: drop-standups")
+    outcome = await screen(
+        _task("slack_msg"),
+        [_dismiss_manifest("drop-standups")],
+        mcp,
+    )
+    assert outcome.action == "dismissed"
+    assert outcome.skill == "drop-standups"
+    # Only the classifier ran; executor was skipped.
+    assert mcp.run_agent.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_screen_dismiss_skill_prefix_mismatch_still_dispatches_by_flag():
+    """Classifier said HANDLE: for a dismiss-only skill — we trust the
+    skill's flag, dispatch as dismiss anyway."""
+    mcp = _mcp(agent_reply="HANDLE: drop-standups")  # wrong prefix
+    outcome = await screen(
+        _task("slack_msg"),
+        [_dismiss_manifest("drop-standups")],
+        mcp,
+    )
+    assert outcome.action == "dismissed"
+
+
+@pytest.mark.asyncio
+async def test_screen_dismiss_skill_in_dry_run_forwards():
+    """Dry-run forwards even for dismiss outcomes, with the pick logged."""
+    mcp = _mcp(agent_reply="DISMISS: drop-standups")
+    outcome = await screen(
+        _task("slack_msg"),
+        [_dismiss_manifest("drop-standups")],
+        mcp,
+        dry_run=True,
+    )
+    assert outcome.action == "forward"
+    assert outcome.skill == "drop-standups"
+    assert outcome.dry_run_nominated is True
+
+
+@pytest.mark.asyncio
+async def test_screen_mixed_candidates_classifier_chooses_dismiss():
+    """When both handle and dismiss skills are candidates, the
+    classifier's pick determines which fires."""
+    mcp = _mcp(agent_reply="DISMISS: drop-standups")
+    outcome = await screen(
+        _task("slack_msg"),
+        [
+            _manifest("handle-slack", kinds=("slack_msg",)),
+            _dismiss_manifest("drop-standups"),
+        ],
+        mcp,
+    )
+    assert outcome.action == "dismissed"
+    assert outcome.skill == "drop-standups"
+
+
+@pytest.mark.asyncio
+async def test_loop_dismissed_outcome_does_not_add_to_queue():
+    """``dismissed`` outcomes suppress the task just like ``handled``."""
+    intake: "asyncio.Queue[Task]" = asyncio.Queue()
+    added: list[Task] = []
+    outcomes: list[ScreeningOutcome] = []
+    stop = asyncio.Event()
+
+    intake.put_nowait(_task("slack_msg"))
+
+    mcp = _mcp(agent_reply="DISMISS: drop-standups")
+
+    async def driver() -> None:
+        while not outcomes:
+            await asyncio.sleep(0)
+        stop.set()
+
+    loop_task = asyncio.create_task(
+        run_screener_loop(
+            intake=intake,
+            manifests=(_dismiss_manifest("drop-standups"),),
+            mcp=mcp,
+            add_to_queue=added.append,
+            on_outcome=outcomes.append,
+            allowed_kinds=None,
+            dry_run=False,
+            stop=stop,
+        )
+    )
+    await asyncio.wait_for(asyncio.gather(driver(), loop_task), timeout=2.0)
+    assert added == []  # dismissed, not forwarded
+    assert [o.action for o in outcomes] == ["dismissed"]
+
+
+def test_parse_classifier_reply_accepts_dismiss_prefix():
+    cands = [_manifest("h")]
+    assert parse_classifier_reply("DISMISS: h", cands) is cands[0]
+    assert parse_classifier_reply("DISMISS:h", cands) is cands[0]
+
+
+def test_candidates_for_includes_dismiss_skills():
+    handle = _manifest("h", kinds=("slack_msg",))
+    dismiss = _dismiss_manifest("d", kinds=("slack_msg",))
+    out = candidates_for(_task("slack_msg"), [handle, dismiss])
+    assert handle in out
+    assert dismiss in out
+    # Other kinds: neither applies.
+    assert candidates_for(_task("note"), [handle, dismiss]) == []
+
+
 # --- run_screener_loop ----------------------------------------------------
 
 

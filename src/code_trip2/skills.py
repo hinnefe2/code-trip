@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 _FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*$", re.DOTALL | re.MULTILINE)
 _DESCRIPTION_RE = re.compile(r"^description\s*:\s*(.+?)\s*$", re.MULTILINE)
 _AUTO_HANDLE_RE = re.compile(r"^auto[-_]handle\s*:\s*(\S+)\s*$", re.MULTILINE)
+_DISMISS_RE = re.compile(r"^dismiss\s*:\s*(\S+)\s*$", re.MULTILINE)
 # List blocks: a key followed by lines starting with whitespace + "-".
 _ALLOWED_TOOLS_BLOCK_RE = re.compile(
     r"^allowed[-_]tools\s*:\s*\n((?:[ \t]+-[ \t]*[^\n]+\n?)+)",
@@ -42,10 +43,14 @@ _AUTO_HANDLE_KINDS_BLOCK_RE = re.compile(
     r"^auto[-_]handle[-_]kinds\s*:\s*\n((?:[ \t]+-[ \t]*[^\n]+\n?)+)",
     re.MULTILINE,
 )
+_DISMISS_KINDS_BLOCK_RE = re.compile(
+    r"^dismiss[-_]kinds\s*:\s*\n((?:[ \t]+-[ \t]*[^\n]+\n?)+)",
+    re.MULTILINE,
+)
 _LIST_ITEM_RE = re.compile(r"^[ \t]+-[ \t]*([^\n#]+?)\s*(?:#.*)?$", re.MULTILINE)
 # Inline list form: ``auto-handle-kinds: [email_msg, slack_msg]``.
 _INLINE_LIST_RE = re.compile(
-    r"^(?P<key>auto[-_]handle[-_]kinds|allowed[-_]tools)\s*:\s*\[([^\]]*)\]\s*$",
+    r"^(?P<key>auto[-_]handle[-_]kinds|dismiss[-_]kinds|allowed[-_]tools)\s*:\s*\[([^\]]*)\]\s*$",
     re.MULTILINE,
 )
 
@@ -54,9 +59,20 @@ _INLINE_LIST_RE = re.compile(
 class SkillManifest:
     """One ``.claude/skills/<name>/SKILL.md``, parsed.
 
-    Frozen so callers can stash it in tuples / sets without surprises.
-    ``allowed_tools`` and ``auto_handle_kinds`` are immutable
-    collections; the screener treats them as read-only.
+    A skill is one of two purposes, distinguished by frontmatter flags:
+
+    - **Auto-handle** (``auto-handle: true``): the screener picks it and
+      runs its body via the executor. Used for skills that actually do
+      something (RSVP, draft, archive, etc.). ``auto-handle-kinds``
+      lists the task kinds it applies to.
+    - **Dismiss** (``dismiss: true``): the screener picks it and
+      suppresses the task without an executor call. Used for skills
+      whose only job is "this isn't worth surfacing to the user."
+      ``dismiss-kinds`` lists the task kinds it applies to.
+
+    A skill is normally one or the other; setting both flags is
+    accepted but redundant. Frozen so callers can stash manifests in
+    tuples/sets without surprises.
     """
 
     name: str
@@ -64,6 +80,8 @@ class SkillManifest:
     allowed_tools: tuple[str, ...] = ()
     auto_handle: bool = False
     auto_handle_kinds: frozenset[str] = field(default_factory=frozenset)
+    dismiss: bool = False
+    dismiss_kinds: frozenset[str] = field(default_factory=frozenset)
 
 
 # --- frontmatter parsers --------------------------------------------------
@@ -107,8 +125,12 @@ def _parse_auto_handle_kinds(fm: str) -> frozenset[str]:
     return frozenset(_parse_list_block(fm, _AUTO_HANDLE_KINDS_BLOCK_RE, ("auto-handle-kinds",)))
 
 
-def _parse_auto_handle(fm: str) -> bool:
-    m = _AUTO_HANDLE_RE.search(fm)
+def _parse_dismiss_kinds(fm: str) -> frozenset[str]:
+    return frozenset(_parse_list_block(fm, _DISMISS_KINDS_BLOCK_RE, ("dismiss-kinds",)))
+
+
+def _parse_bool(text_re: re.Pattern[str], fm: str) -> bool:
+    m = text_re.search(fm)
     if not m:
         return False
     return m.group(1).strip().strip('"').strip("'").lower() in ("true", "yes", "1", "on")
@@ -134,8 +156,10 @@ def _parse_manifest(path: Path, text: str) -> SkillManifest | None:
         name=path.parent.name,
         description=_parse_description(fm),
         allowed_tools=tuple(_parse_list_block(fm, _ALLOWED_TOOLS_BLOCK_RE, ("allowed-tools",))),
-        auto_handle=_parse_auto_handle(fm),
+        auto_handle=_parse_bool(_AUTO_HANDLE_RE, fm),
         auto_handle_kinds=_parse_auto_handle_kinds(fm),
+        dismiss=_parse_bool(_DISMISS_RE, fm),
+        dismiss_kinds=_parse_dismiss_kinds(fm),
     )
 
 

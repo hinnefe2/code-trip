@@ -37,7 +37,7 @@ from code_trip2.tasks import Task
 logger = logging.getLogger(__name__)
 
 
-ScreeningAction = Literal["forward", "handled", "failed"]
+ScreeningAction = Literal["forward", "handled", "failed", "dismissed"]
 
 
 @dataclass(frozen=True)
@@ -46,16 +46,19 @@ class ScreeningOutcome:
 
     - ``forward``: no skill matched (no candidates, classifier
       declined, or dry-run). Caller adds the task to the user queue.
-    - ``handled``: a skill matched and the executor reported success.
-      Caller does NOT add to the user queue.
-    - ``failed``: a skill matched but the executor raised. Task is
-      forwarded to the user queue with the error annotated in body, so
-      nothing falls through the cracks.
+    - ``handled``: an auto-handle skill matched and the executor
+      reported success. Caller does NOT add to the user queue.
+    - ``failed``: an auto-handle skill matched but the executor
+      raised. Task is forwarded to the user queue with the error
+      annotated in body, so nothing falls through the cracks.
+    - ``dismissed``: a dismiss-style skill matched. The task is
+      suppressed from the user queue without an executor call —
+      classifier judgement alone says it isn't worth surfacing.
 
     ``dry_run_nominated`` carries the classifier's pick when dry-run
-    mode prevented execution — useful for comparing dry-run decisions
-    to live behavior offline. The action is still ``forward`` in that
-    case (the user sees the task).
+    mode prevented execution / dismissal — useful for comparing
+    dry-run decisions to live behavior offline. The action is still
+    ``forward`` in that case (the user sees the task).
     """
 
     action: ScreeningAction
@@ -86,16 +89,25 @@ class AutohandleLogEntry:
 def candidates_for(
     task: Task, manifests: Iterable[SkillManifest]
 ) -> list[SkillManifest]:
-    """Skills that opt into auto-handling this task's kind."""
+    """Skills that apply to this task — either as auto-handlers or as
+    dismissers. The classifier picks one (or none); the screener
+    dispatches based on which flag the chosen skill carries.
+    """
     return [
         m for m in manifests
-        if m.auto_handle and task.kind in m.auto_handle_kinds
+        if (m.auto_handle and task.kind in m.auto_handle_kinds)
+        or (m.dismiss and task.kind in m.dismiss_kinds)
     ]
 
 
 # Permissive — the model often wraps the answer in prose. Conservative
 # fallback (no match → None → forward) keeps the failure mode safe.
-_HANDLE_RE = re.compile(r"HANDLE\s*[:= ]\s*([A-Za-z0-9_\-]+)")
+# Both HANDLE: and DISMISS: route to the same parser; the chosen
+# manifest's own ``auto_handle`` / ``dismiss`` flags decide the action
+# in :func:`screen`. Trusting flags over prefixes means a model that
+# mis-tags an auto-handle skill as DISMISS still gets the right
+# behavior.
+_PICK_RE = re.compile(r"(?:HANDLE|DISMISS)\s*[:= ]\s*([A-Za-z0-9_\-]+)")
 
 
 def parse_classifier_reply(
@@ -105,7 +117,7 @@ def parse_classifier_reply(
     if not text:
         return None
     name_to_manifest = {c.name: c for c in candidates}
-    m = _HANDLE_RE.search(text)
+    m = _PICK_RE.search(text)
     if not m:
         return None
     return name_to_manifest.get(m.group(1).strip())
@@ -114,8 +126,17 @@ def parse_classifier_reply(
 def build_classifier_prompt(
     task: Task, candidates: list[SkillManifest]
 ) -> str:
+    def _purpose(c: SkillManifest) -> str:
+        if c.auto_handle and c.dismiss:
+            return "[handle or dismiss]"
+        if c.auto_handle:
+            return "[handle]"
+        if c.dismiss:
+            return "[dismiss]"
+        return "[?]"
+
     skills_block = "\n".join(
-        f"- {c.name}: {c.description}" for c in candidates
+        f"- {c.name} {_purpose(c)}: {c.description}" for c in candidates
     )
     try:
         source_json = json.dumps(task.source, default=str)
@@ -123,10 +144,13 @@ def build_classifier_prompt(
         source_json = "{}"
     return (
         "You are a router for a voice-driven inbox. A task just "
-        "arrived. Decide whether any skill below can FULLY handle it "
-        "end-to-end without asking the user anything.\n"
+        "arrived. Decide whether any skill below applies. Skills "
+        "tagged [handle] DO something on the user's behalf (RSVP, "
+        "draft a reply, archive, etc.). Skills tagged [dismiss] mark "
+        "the task as not worth surfacing — the user doesn't need to "
+        "see or respond to it.\n"
         "\n"
-        "Skills (name: description):\n"
+        "Skills (name [purpose]: description):\n"
         f"{skills_block}\n"
         "\n"
         "Task:\n"
@@ -137,12 +161,14 @@ def build_classifier_prompt(
         f"  source: {source_json}\n"
         "\n"
         "Reply with EXACTLY ONE line, in one of these formats:\n"
-        "  HANDLE: <skill-name>\n"
-        "  NONE\n"
+        "  HANDLE: <skill-name>     (skill will act on the task)\n"
+        "  DISMISS: <skill-name>    (skill says this isn't worth surfacing)\n"
+        "  NONE                     (user should see this task)\n"
         "\n"
-        "Only reply HANDLE if you are confident the named skill can "
-        "complete the task unambiguously. When unsure, reply NONE — "
-        "the user can handle it."
+        "The reply prefix must match the skill's purpose tag. Only "
+        "reply HANDLE or DISMISS if you are confident the named skill "
+        "applies unambiguously. When unsure, reply NONE — the user "
+        "can handle it."
     )
 
 
@@ -252,6 +278,14 @@ async def screen(
             "forward", task, skill=chosen.name, dry_run_nominated=True,
         )
 
+    # Dismiss skills are pure classifier judgements — no executor call.
+    # Trust the skill's own ``dismiss`` flag over the classifier's
+    # HANDLE/DISMISS prefix. When a skill carries both flags
+    # (unusual), prefer auto-handle since it's the more interesting
+    # action.
+    if chosen.dismiss and not chosen.auto_handle:
+        return ScreeningOutcome("dismissed", task, skill=chosen.name)
+
     try:
         summary = await execute(task, chosen, mcp)
     except Exception as exc:
@@ -341,6 +375,9 @@ async def run_screener_loop(
             on_outcome(outcome)
         except Exception:
             logger.exception("on_outcome callback raised; continuing")
+        # Only ``forward`` and ``failed`` outcomes surface to the user.
+        # ``handled`` (executor ran) and ``dismissed`` (classifier said
+        # not worth surfacing) both suppress the task from the queue.
         if outcome.action in ("forward", "failed"):
             try:
                 add_to_queue(outcome.task)

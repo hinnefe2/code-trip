@@ -249,3 +249,44 @@ def test_load_skill_manifests_is_sorted_by_directory(tmp_path: Path):
     _write_skill(tmp_path, "mango", "name: mango\ndescription: d\n")
     manifests = load_skill_manifests(tmp_path)
     assert [m.name for m in manifests] == ["alpha", "mango", "zebra"]
+
+
+# --- dismiss-skill metadata -----------------------------------------------
+
+
+def test_load_skill_manifests_parses_dismiss_metadata(tmp_path: Path):
+    _write_skill(
+        tmp_path,
+        "dismiss-channel-noise",
+        "name: dismiss-channel-noise\n"
+        "description: Drop standup-style status updates with no action item.\n"
+        "dismiss: true\n"
+        "dismiss-kinds:\n"
+        "  - slack_msg\n",
+    )
+    [m] = load_skill_manifests(tmp_path)
+    assert m.dismiss is True
+    assert m.dismiss_kinds == frozenset({"slack_msg"})
+    # Auto-handle defaults stay off for a pure dismiss skill.
+    assert m.auto_handle is False
+    assert m.auto_handle_kinds == frozenset()
+
+
+def test_load_skill_manifests_dismiss_defaults_false(tmp_path: Path):
+    _write_skill(tmp_path, "handler-only", "name: x\ndescription: d\nauto-handle: true\n")
+    [m] = load_skill_manifests(tmp_path)
+    assert m.dismiss is False
+    assert m.dismiss_kinds == frozenset()
+
+
+def test_load_skill_manifests_dismiss_kinds_inline_form(tmp_path: Path):
+    _write_skill(
+        tmp_path,
+        "multi",
+        "name: multi\ndescription: d\ndismiss: true\n"
+        "dismiss-kinds: [slack_msg, email_msg]\n",
+    )
+    [m] = load_skill_manifests(tmp_path)
+    assert m.dismiss_kinds == frozenset({"slack_msg", "email_msg"})
+
+

@@ -292,6 +292,20 @@ def test_autohandle_panel_renders_dry_run_nominated_entry():
     assert "accept-invite" in out
 
 
+def test_autohandle_panel_renders_dismissed_entry():
+    ctx = _make_ctx(autohandle_enabled=True, autohandle_kinds=("slack_msg",))
+    ctx.autohandle_log.append(_log_entry(
+        action="dismissed",
+        skill="drop-standups",
+        headline="Alice: standup update for thursday",
+        summary=None,
+    ))
+    out = _render(tui._autohandle_panel(ctx))
+    assert "DISMISSED" in out
+    assert "drop-standups" in out
+    assert "Alice" in out
+
+
 def test_autohandle_panel_newest_entry_appears_first():
     ctx = _make_ctx(autohandle_enabled=True, autohandle_kinds=("email_msg",))
     ctx.autohandle_log.append(_log_entry(
