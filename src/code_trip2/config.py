@@ -63,9 +63,9 @@ class Config:
     # email (via the claude.ai Gmail MCP — auth piggy-backs on claude CLI)
     email_poll_interval: float = 120.0
     # Gmail search syntax. ``after:<unix_ts>`` is appended automatically per
-    # poll. Defaults to "unread inbox, not from me" which approximates an
-    # action-needed view.
-    email_search_query: str = "in:inbox -from:me is:unread"
+    # poll. Defaults to "unread Primary inbox, not from me" which approximates
+    # an action-needed view (excludes Promotions/Updates/Social/Forums tabs).
+    email_search_query: str = "in:inbox category:primary -from:me is:unread"
     email_max_results: int = 20
     # linear (MCP — server choice TBD, still stubbed)
     linear_mcp_command: str = ""

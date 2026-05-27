@@ -89,7 +89,7 @@ def test_split_name_addr_empty():
 # --- EmailProducer -------------------------------------------------------
 
 
-def _producer(tmp_path: Path, *, poll_interval=120.0, search_query="in:inbox -from:me is:unread", max_results=20):
+def _producer(tmp_path: Path, *, poll_interval=120.0, search_query="in:inbox category:primary -from:me is:unread", max_results=20):
     cfg = SimpleNamespace(
         email_poll_interval=poll_interval,
         email_search_query=search_query,
