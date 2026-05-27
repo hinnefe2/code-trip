@@ -272,6 +272,64 @@ def _keymap_panel_size(ctx: "Context") -> int:
     return 6
 
 
+_AUTOHANDLE_LABEL_STYLE = {
+    "HANDLED": "bold green",
+    "FAILED": "bold red",
+    "DRY-RUN": "bold yellow",
+}
+
+
+def _autohandle_panel(ctx: "Context") -> Panel:
+    """One line per recent screener outcome, newest at top.
+
+    Only screener outcomes that represent a real or would-be action
+    land in ``ctx.autohandle_log`` (the main.py callback filters out
+    plain pass-throughs), so every visible row corresponds to a skill
+    that ran, failed, or — in dry-run mode — would have run.
+    """
+    entries = list(getattr(ctx, "autohandle_log", ()) or ())
+    enabled = bool(getattr(ctx.config, "autohandle_enabled", False))
+    kinds = tuple(getattr(ctx.config, "autohandle_kinds", ()) or ())
+    if not entries:
+        if not enabled or not kinds:
+            body = Text("(auto-handle disabled)", style="dim italic")
+        else:
+            body = Text("(no recent actions)", style="dim italic")
+        return Panel(body, title="Auto-handle log", border_style="bright_black")
+
+    now = time.time()
+    lines: list[Text] = []
+    # deque has oldest at left; reversed gives newest-first display.
+    for entry in reversed(entries):
+        out = entry.outcome
+        if out.dry_run_nominated:
+            label = "DRY-RUN"
+        else:
+            label = out.action.upper()
+        style = _AUTOHANDLE_LABEL_STYLE.get(label, "white")
+        age = _format_age(now - entry.ts)
+        skill = out.skill or "?"
+        headline = _truncate(out.task.headline or "", 60)
+        suffix_text = ""
+        if out.action == "failed" and out.error:
+            suffix_text = f"  ({_truncate(out.error, 40)})"
+        elif out.action == "handled" and out.summary:
+            suffix_text = f"  — {_truncate(out.summary, 40)}"
+        lines.append(Text.assemble(
+            Text(f"{age:>4}  ", style="dim"),
+            Text(f"{label:<8}", style=style),
+            Text(f"{skill}: ", style="cyan"),
+            Text(headline, style="white"),
+            Text(suffix_text, style="dim"),
+        ))
+
+    visible = lines[:10]  # deque holds 20; cap display so the panel doesn't grow
+    title = f"Auto-handle log ({len(entries)})"
+    if len(entries) > len(visible):
+        title += f"  (+{len(entries) - len(visible)} older)"
+    return Panel(Group(*visible), title=title, border_style="bright_black")
+
+
 def _producers_panel(supervisor: "ProducerSupervisor | None") -> Panel:
     if supervisor is None:
         return Panel(Text("(no supervisor)", style="dim"), title="Producers")
@@ -380,6 +438,7 @@ class CodeTripApp(App):
             with Vertical(id="left"):
                 yield Static(_current_task_panel(self.ctx), id="current_task")
                 yield Static(_queue_table(self.ctx), id="queue")
+                yield Static(_autohandle_panel(self.ctx), id="autohandle")
             yield Static(_topics_panel(self.ctx), id="right")
         input_widget = Input(
             placeholder="type or wait for paste — Enter submits, Esc clears",
@@ -399,6 +458,7 @@ class CodeTripApp(App):
             self.query_one("#header", Static).update(_header(self.ctx))
             self.query_one("#current_task", Static).update(_current_task_panel(self.ctx))
             self.query_one("#queue", Static).update(_queue_table(self.ctx))
+            self.query_one("#autohandle", Static).update(_autohandle_panel(self.ctx))
             self.query_one("#right", Static).update(_topics_panel(self.ctx))
             self.query_one("#keymap", Static).update(_keymap_panel(self.ctx))
             self.query_one("#producers", Static).update(_producers_panel(self.supervisor))

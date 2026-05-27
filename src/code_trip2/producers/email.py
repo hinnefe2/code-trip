@@ -23,7 +23,7 @@ import asyncio
 import logging
 import re
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from code_trip2._async_utils import event_or_timeout
 from code_trip2.config import Config
@@ -69,15 +69,28 @@ class EmailProducer:
         queue: TaskQueue,
         mcp: ClaudeMCPClient | None = None,
         state: EmailState | None = None,
+        intake: Callable[[Task], None] | None = None,
     ) -> None:
         self._config = config
         self._queue = queue
         self._mcp = mcp
         self._state = state or EmailState()
+        # ``intake`` routes new tasks through the screener (or directly
+        # to the queue when no screener is configured). Thread-collapse
+        # updates skip the intake — they mutate an already-visible task
+        # in the user queue, so there's nothing to screen.
+        self._intake: Callable[[Task], None] = intake or queue.add
         self._stop = asyncio.Event()
         # Per-session dedup keyed by (thread_id, latest_message_id).
-        # State file already handles cross-restart dedup via last_message_ts.
+        # Cross-restart dedup is the inbox itself: ``main.py`` drops
+        # replayed ``email_msg`` tasks and the first poll re-populates
+        # from the current inbox state.
         self._recent_keys: set[str] = set()
+        # First poll of the session uses a wide-window query (no
+        # ``after:`` clause) so anything currently in the inbox
+        # surfaces, regardless of when it arrived. Subsequent polls
+        # revert to the incremental ``after:<last_message_ts>`` query.
+        self._first_poll = True
 
     # ---- lifecycle ------------------------------------------------------
 
@@ -102,9 +115,15 @@ class EmailProducer:
 
     async def _poll_once(self) -> None:
         last_ts = self._state.last_message_ts()
-        after = self._after_param(last_ts)
         base_query = (self._config.email_search_query or "").strip()
-        query = f"{base_query} after:{after}".strip()
+        wide_poll = self._first_poll
+        if wide_poll:
+            # Fresh-pull on startup: no ``after:`` clause. Inbox-state
+            # is the source of truth; the persistent processed map +
+            # in-queue thread-collapse handle dedup.
+            query = base_query
+        else:
+            query = f"{base_query} after:{self._after_param(last_ts)}".strip()
         try:
             result = await self._mcp.call_tool(
                 "search_threads",
@@ -115,11 +134,13 @@ class EmailProducer:
             )
         except ClaudeMCPError as exc:
             logger.warning("EmailProducer: search call failed: %s", exc)
+            # Don't burn the first-poll wide window on a transient
+            # failure — retry on the next tick.
             return
 
         threads = self._extract_threads(result)
         emitted = 0
-        skipped_old = 0
+        skipped = 0
         max_ts_seen = last_ts or 0
         for th in threads:
             ts = th.get("ts_unix") or 0
@@ -128,11 +149,14 @@ class EmailProducer:
             if not thread_id or not ts:
                 continue
             key = f"{thread_id}:{msg_id}"
-            if last_ts and ts <= last_ts:
-                skipped_old += 1
-                continue
             if key in self._recent_keys:
-                skipped_old += 1
+                skipped += 1
+                continue
+            # On incremental polls, the ``after:`` filter already
+            # excludes older messages — but the wide first poll has
+            # no time floor, so the cursor is purely advisory.
+            if not wide_poll and last_ts and ts <= last_ts:
+                skipped += 1
                 continue
             try:
                 self._emit_task(th)
@@ -147,16 +171,29 @@ class EmailProducer:
             self._state.set_last_message_ts(max_ts_seen)
 
         logger.info(
-            "EmailProducer: poll — %d threads (%d emitted, %d already-seen)",
-            len(threads), emitted, skipped_old,
+            "EmailProducer: %s poll — %d threads (%d emitted, %d already-seen)",
+            "wide" if wide_poll else "incremental",
+            len(threads), emitted, skipped,
         )
+
+        # Wide-poll only happens once per session. Even if it returned
+        # no results, flip the flag so we don't keep paying the wider
+        # cost on every interval.
+        self._first_poll = False
 
         if len(self._recent_keys) > 500:
             self._recent_keys = set(sorted(self._recent_keys)[-250:])
 
     def _after_param(self, last_ts: int | None) -> str:
-        """Gmail's ``after:`` operator accepts a unix timestamp. Floor at
-        5pm of the previous workday on first run."""
+        """Gmail's ``after:`` operator accepts a unix timestamp.
+
+        Used only on incremental polls — the first poll of a session
+        is wide (no ``after:``). When ``last_message_ts`` is unset on
+        an incremental poll (shouldn't happen because the first poll
+        sets it, but defensive), fall back to 5pm of the previous
+        workday so we don't accidentally re-fetch everything mid-
+        session.
+        """
         if last_ts and last_ts > 0:
             return str(int(last_ts))
         return str(_previous_workday_5pm_unix())
@@ -339,7 +376,7 @@ class EmailProducer:
             source=source,
             created_at=time.time(),
         )
-        self._queue.add(task)
+        self._intake(task)
 
     def _find_pending_thread_task(self, thread_id: str) -> Task | None:
         if not thread_id:

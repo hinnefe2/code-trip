@@ -1,6 +1,9 @@
 ---
 name: accept-invite
-description: Accept a Google Calendar invite that arrived as an email and archive the email. Use when the user wants to accept / RSVP yes / confirm attendance for an invite that's currently sitting in their inbox.
+description: Accept a Google Calendar invite that arrived as an email and archive the email. Use when the email is a calendar invitation that the user would say yes to (1:1s, team meetings, standups, syncs). Skip for ambiguous "save the date" emails, external/unknown senders, or anything where attendance isn't clearly expected.
+auto-handle: true
+auto-handle-kinds:
+  - email_msg
 allowed-tools:
   - mcp__claude_ai_Google_Calendar__list_events
   - mcp__claude_ai_Google_Calendar__respond_to_event
@@ -18,8 +21,12 @@ You're being invoked on an email task that contains a calendar invite. Complete 
    - Call `mcp__claude_ai_Google_Calendar__respond_to_event` with that `eventId` and `responseStatus="accepted"`.
 
 2. **Archive the email.**
-   - Use `mcp__claude_ai_Gmail__unlabel_thread` with the email's `thread_id` and `labelIds=["INBOX"]`.
+   - Use `mcp__claude_ai_Gmail__unlabel_thread` with the email's `thread_id` (from the task source) and `labelIds=["INBOX"]`.
 
 Don't ask for confirmation. When both steps are done, return ONE sentence: `Accepted "<event title>" and archived the email.`
 
 If you can't find the calendar event (e.g. the email isn't actually an invite, or the event is too far in the past/future to locate), say so in one sentence and skip the archive — don't guess.
+
+This skill runs in two modes:
+- **ACT+PTT (voice):** the user is holding the active task and has spoken an instruction. Their words are the trigger.
+- **Auto-handle (screener):** no user instruction; you're invoked because the screener classifier picked this skill. Apply the same logic — the task source contains everything you need.

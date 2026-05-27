@@ -2,7 +2,13 @@
 
 Tracks the highest Unix timestamp we've already surfaced from the Gmail
 inbox. Stored at ``~/.code-trip/email-state.json`` so the cursor
-survives restarts and old messages don't resurface.
+survives restarts and the per-poll ``after:<ts>`` search-query
+optimization keeps working across sessions.
+
+This is *not* the dedup mechanism — the inbox is the source of truth.
+On startup ``main.py`` drops any replayed ``email_msg`` tasks and the
+producer's first poll does a wide pull. The cursor just keeps the
+mid-session incremental polls cheap.
 
 Mirror of :mod:`code_trip2.slack_state` — kept in a sibling file rather
 than unified so each producer's persistence is independent and the

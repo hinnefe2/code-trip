@@ -25,7 +25,13 @@ from code_trip2.window import Chord, KeyStroke
 from conftest import make_mock_tts
 
 
-def _make_ctx(*, app_mode="queue", summarizer_enabled=False):
+def _make_ctx(
+    *,
+    app_mode="queue",
+    summarizer_enabled=False,
+    autohandle_enabled=False,
+    autohandle_kinds=(),
+):
     tts = make_mock_tts()
     cfg = SimpleNamespace(
         ssh_host="",
@@ -34,6 +40,8 @@ def _make_ctx(*, app_mode="queue", summarizer_enabled=False):
         work_window="work",
         linear_window="linear",
         terminal_apps=("kitty",),
+        autohandle_enabled=autohandle_enabled,
+        autohandle_kinds=autohandle_kinds,
     )
     summarizer = None
     if summarizer_enabled:
@@ -194,6 +202,103 @@ def test_producers_panel_uses_supervisor_status():
 def test_producers_panel_no_supervisor():
     out = _render(tui._producers_panel(None))
     assert "no supervisor" in out
+
+
+# --- auto-handle log panel ------------------------------------------------
+
+
+def _log_entry(
+    *,
+    action: str = "handled",
+    skill: str = "accept-invite",
+    headline: str = "John Doe: Standup invite",
+    summary: str | None = "Accepted and archived.",
+    error: str | None = None,
+    dry_run_nominated: bool = False,
+    age_seconds: float = 5.0,
+):
+    """Build one ``AutohandleLogEntry`` for panel tests."""
+    import time as _t
+    from code_trip2.screener import AutohandleLogEntry, ScreeningOutcome
+    task = Task(kind="email_msg", topic="john-doe", headline=headline)
+    outcome = ScreeningOutcome(
+        action=action,
+        task=task,
+        skill=skill,
+        summary=summary,
+        error=error,
+        dry_run_nominated=dry_run_nominated,
+    )
+    return AutohandleLogEntry(ts=_t.time() - age_seconds, outcome=outcome)
+
+
+def test_autohandle_panel_empty_when_disabled():
+    ctx = _make_ctx(autohandle_enabled=False, autohandle_kinds=())
+    out = _render(tui._autohandle_panel(ctx))
+    assert "auto-handle disabled" in out.lower()
+
+
+def test_autohandle_panel_empty_when_enabled_with_no_entries():
+    ctx = _make_ctx(autohandle_enabled=True, autohandle_kinds=("email_msg",))
+    out = _render(tui._autohandle_panel(ctx))
+    assert "no recent actions" in out.lower()
+
+
+def test_autohandle_panel_renders_handled_entry():
+    ctx = _make_ctx(autohandle_enabled=True, autohandle_kinds=("email_msg",))
+    ctx.autohandle_log.append(_log_entry())
+    out = _render(tui._autohandle_panel(ctx))
+    assert "HANDLED" in out
+    assert "accept-invite" in out
+    assert "John Doe" in out
+
+
+def test_autohandle_panel_renders_failed_entry_with_error_suffix():
+    ctx = _make_ctx(autohandle_enabled=True, autohandle_kinds=("email_msg",))
+    ctx.autohandle_log.append(_log_entry(
+        action="failed",
+        summary=None,
+        error="MCP timed out after 60s",
+    ))
+    out = _render(tui._autohandle_panel(ctx))
+    assert "FAILED" in out
+    assert "MCP timed out" in out
+
+
+def test_autohandle_panel_renders_dry_run_nominated_entry():
+    ctx = _make_ctx(autohandle_enabled=True, autohandle_kinds=("email_msg",))
+    ctx.autohandle_log.append(_log_entry(
+        action="forward",
+        dry_run_nominated=True,
+        summary=None,
+    ))
+    out = _render(tui._autohandle_panel(ctx))
+    assert "DRY-RUN" in out
+    assert "accept-invite" in out
+
+
+def test_autohandle_panel_newest_entry_appears_first():
+    ctx = _make_ctx(autohandle_enabled=True, autohandle_kinds=("email_msg",))
+    ctx.autohandle_log.append(_log_entry(
+        headline="OLDER ITEM", age_seconds=600,
+    ))
+    ctx.autohandle_log.append(_log_entry(
+        headline="NEWER ITEM", age_seconds=10,
+    ))
+    out = _render(tui._autohandle_panel(ctx))
+    assert out.find("NEWER ITEM") < out.find("OLDER ITEM")
+
+
+def test_autohandle_panel_caps_visible_rows_with_overflow_indicator():
+    """More entries than the visible cap → title says how many are hidden."""
+    ctx = _make_ctx(autohandle_enabled=True, autohandle_kinds=("email_msg",))
+    for i in range(15):
+        ctx.autohandle_log.append(_log_entry(
+            headline=f"item-{i:02d}", age_seconds=float(i),
+        ))
+    out = _render(tui._autohandle_panel(ctx))
+    assert "(15)" in out          # total count
+    assert "+5 older" in out      # 15 entries, 10 visible
 
 
 # --- host-terminal detection ----------------------------------------------

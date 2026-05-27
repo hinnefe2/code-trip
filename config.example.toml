@@ -59,3 +59,22 @@ poll_interval = 120.0
 search_query = "in:inbox category:primary -from:me is:unread"
 # Max threads per poll.
 max_results = 20
+
+[autohandle]
+# Let auto-handle-eligible skills (those declaring ``auto-handle: true``
+# in their SKILL.md frontmatter) silently complete matching tasks
+# before they reach the user-facing queue. Example: the
+# ``accept-invite`` skill RSVPs to calendar-invite emails and archives
+# them, with no spoken announcement.
+#
+# Disabled by default. Two-step opt-in: set ``enabled = true`` AND list
+# the kinds you want auto-handled in ``kinds``. The kinds list is a
+# whitelist; a skill that claims it handles a kind not in this list
+# stays inert.
+#
+# ``dry_run = true`` runs the classifier (logging its decision) but
+# always forwards the task to the user. Useful for watching decisions
+# for a few days before trusting auto-execution.
+enabled = false
+dry_run = false
+kinds = []     # e.g. ["email_msg"]

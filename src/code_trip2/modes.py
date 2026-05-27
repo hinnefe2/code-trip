@@ -24,11 +24,13 @@ import asyncio
 import json
 import logging
 import re
+from collections import deque
 from dataclasses import dataclass, field
 
 from code_trip2 import earcon, remote, window
 from code_trip2.config import Config
 from code_trip2.queue_log import QueueLog
+from code_trip2.screener import AutohandleLogEntry
 from code_trip2.session_log import SessionLogger
 from code_trip2.summarizer import Summarizer, SummarizerError
 from code_trip2.tasks import RecentTopics, Task, TaskQueue
@@ -91,6 +93,12 @@ class Context:
     # frontmatter. Passed to ``run_agent`` so Claude can't reach for a
     # tool that isn't in any skill's declared set.
     agent_allowed_tools: tuple[str, ...] = ()
+    # Bounded log of recent screener outcomes for TUI display. Only
+    # "interesting" outcomes land here — handled / failed / dry-run-
+    # nominated forwards — never a plain "no skill cared" pass-through.
+    autohandle_log: "deque[AutohandleLogEntry]" = field(
+        default_factory=lambda: deque(maxlen=20)
+    )
 
     def __post_init__(self) -> None:
         if not self.active_window:

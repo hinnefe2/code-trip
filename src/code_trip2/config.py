@@ -70,6 +70,16 @@ class Config:
     # linear (MCP — server choice TBD, still stubbed)
     linear_mcp_command: str = ""
     linear_mcp_args: tuple[str, ...] = ()
+    # autohandle: skill-driven silent handling of producer tasks. When
+    # enabled, every task a producer emits is screened against the
+    # auto-handle-eligible skills in ``.claude/skills/`` before it
+    # reaches the user-facing queue. ``kinds`` is the whitelist of task
+    # kinds eligible for screening — empty disables auto-handling even
+    # if ``enabled`` is true. ``dry_run`` runs the classifier but always
+    # forwards (useful for watching decisions before trusting them).
+    autohandle_enabled: bool = False
+    autohandle_dry_run: bool = False
+    autohandle_kinds: tuple[str, ...] = ()
 
 
 def _select(src: dict, *fields: str) -> dict:
@@ -173,5 +183,13 @@ def load_config(path: Path | str) -> Config:
         kw["linear_mcp_command"] = linear_cfg["mcp_command"]
     if "mcp_args" in linear_cfg:
         kw["linear_mcp_args"] = tuple(linear_cfg["mcp_args"])
+
+    autohandle_cfg = data.get("autohandle", {})
+    if "enabled" in autohandle_cfg:
+        kw["autohandle_enabled"] = bool(autohandle_cfg["enabled"])
+    if "dry_run" in autohandle_cfg:
+        kw["autohandle_dry_run"] = bool(autohandle_cfg["dry_run"])
+    if "kinds" in autohandle_cfg:
+        kw["autohandle_kinds"] = tuple(str(k) for k in autohandle_cfg["kinds"])
 
     return Config(**kw)

@@ -115,16 +115,43 @@ async def test_producer_skips_when_mcp_unavailable(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_producer_passes_after_param_in_query(tmp_path: Path):
-    """Each poll should append ``after:<unix_ts>`` to the configured query."""
+async def test_producer_incremental_poll_uses_after_clause(tmp_path: Path):
+    """Polls AFTER the first one append ``after:<unix_ts>`` to the configured query."""
     p, _q, mcp, state = _producer(tmp_path)
     state.set_last_message_ts(1716000000)
+    p._first_poll = False  # simulate not-the-first-poll-of-the-session
     mcp.call_tool.return_value = {"threads": []}
     await p._poll_once()
     call = mcp.call_tool.call_args
     assert call.args[0] == "search_threads"
     assert "after:1716000000" in call.args[1]["query"]
     assert "in:inbox" in call.args[1]["query"]
+
+
+@pytest.mark.asyncio
+async def test_producer_wide_first_poll_omits_after_clause(tmp_path: Path):
+    """First poll of a session does a fresh inbox pull with no time floor."""
+    p, _q, mcp, state = _producer(tmp_path)
+    state.set_last_message_ts(1716000000)  # would normally constrain
+    mcp.call_tool.return_value = {"threads": []}
+    await p._poll_once()
+    call = mcp.call_tool.call_args
+    assert "after:" not in call.args[1]["query"]
+    assert "in:inbox" in call.args[1]["query"]
+
+
+@pytest.mark.asyncio
+async def test_producer_first_poll_flag_flips_after_one_call(tmp_path: Path):
+    """After the wide first poll, subsequent polls revert to incremental."""
+    p, _q, mcp, _state = _producer(tmp_path)
+    mcp.call_tool.return_value = {"threads": []}
+    assert p._first_poll is True
+    await p._poll_once()
+    assert p._first_poll is False
+    # Second poll should now use after:
+    await p._poll_once()
+    second_call = mcp.call_tool.call_args
+    assert "after:" in second_call.args[1]["query"]
 
 
 @pytest.mark.asyncio
@@ -159,9 +186,11 @@ async def test_producer_emits_task_from_structured_threads(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_producer_skips_threads_at_or_before_last_ts(tmp_path: Path):
+async def test_producer_incremental_skips_threads_at_or_before_last_ts(tmp_path: Path):
+    """On incremental polls the ``last_ts`` floor still excludes older messages."""
     p, q, mcp, state = _producer(tmp_path)
     state.set_last_message_ts(1716000100)
+    p._first_poll = False  # incremental-mode behavior
     mcp.call_tool.return_value = {
         "threads": [
             {
@@ -192,6 +221,33 @@ async def test_producer_skips_threads_at_or_before_last_ts(tmp_path: Path):
     [task] = q.all()
     assert task.source["thread_id"] == "T2"
     assert state.last_message_ts() == 1716000200
+
+
+@pytest.mark.asyncio
+async def test_producer_wide_first_poll_ignores_last_ts_floor(tmp_path: Path):
+    """First poll surfaces older inbox emails even if last_message_ts is set."""
+    p, q, mcp, state = _producer(tmp_path)
+    state.set_last_message_ts(1716000100)
+    mcp.call_tool.return_value = {
+        "threads": [
+            {
+                "id": "T1",
+                "messages": [
+                    {
+                        "id": "M1",
+                        "subject": "older",
+                        "from": "x@y.com",
+                        "internalDate": "1716000050000",  # before last_ts
+                    }
+                ],
+            },
+        ]
+    }
+    await p._poll_once()
+    [task] = q.all()
+    assert task.source["thread_id"] == "T1"
+
+
 
 
 @pytest.mark.asyncio

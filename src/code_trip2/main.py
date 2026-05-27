@@ -8,7 +8,9 @@ import faulthandler
 import logging
 import signal
 import sys
+import time
 from pathlib import Path
+from typing import Callable
 
 from code_trip2 import earcon
 from code_trip2.chords import handle_chord, handle_tap
@@ -25,12 +27,17 @@ from code_trip2.producers.manual import ManualProducer
 from code_trip2.producers.slack import SlackProducer
 from code_trip2.queue_log import QueueLog
 from code_trip2.producers.claude_mcp import ClaudeMCPClient
+from code_trip2.screener import (
+    AutohandleLogEntry,
+    ScreeningOutcome,
+    run_screener_loop,
+)
 from code_trip2.session_log import SessionLogger, default_session_path
-from code_trip2.skills import load_skill_allowed_tools
+from code_trip2.skills import load_skill_manifests
 from code_trip2.slack_state import SlackState
 from code_trip2.stt_client import STTClient, STTClientError
 from code_trip2.summarizer import Summarizer
-from code_trip2.tasks import TaskQueue
+from code_trip2.tasks import Task, TaskQueue
 from code_trip2.tts_client import TTSClient
 from code_trip2.tui import CodeTripApp, detect_tui_host_app
 
@@ -87,9 +94,22 @@ async def main_async(config: Config, *, tui: bool = False) -> None:
     # Replay last 24h of queue events so deferred / snoozed work survives a
     # restart. Log records the replay-load so it shows up in offline analysis.
     replayed = queue_log.replay()
+    # Drop ``email_msg`` tasks from the replay — EmailProducer's first
+    # poll does a wide pull from the current inbox, which IS the source
+    # of truth for what should be visible. Anything the user already
+    # archived in Gmail won't come back; anything left in the inbox
+    # will resurface as a fresh task. No need to remember dismissed-
+    # without-archive state across restarts.
+    dropped_email = sum(1 for t in replayed if t.kind == "email_msg")
+    replayed = [t for t in replayed if t.kind != "email_msg"]
     if replayed:
         queue.load(replayed)
         logger.info("Replayed %d tasks from queue log", len(replayed))
+    if dropped_email:
+        logger.info(
+            "Dropped %d replayed email_msg tasks; first poll will refresh from inbox",
+            dropped_email,
+        )
 
     tui_host_app = detect_tui_host_app() if tui else None
     if tui and tui_host_app:
@@ -108,19 +128,22 @@ async def main_async(config: Config, *, tui: bool = False) -> None:
             "Gmail MCP via claude CLI not available; Email producer will "
             "stay idle. Install claude CLI to enable."
         )
-    # Free-form skill invocation (ACT+PTT). server_id is unused — run_agent
-    # doesn't restrict to a single tool.
+    # Free-form skill invocation (ACT+PTT) and auto-handle screener.
+    # ``server_id`` is unused — run_agent doesn't restrict to a single tool.
     agent_mcp = ClaudeMCPClient(server_id="agent")
-    # Union of allowed-tools declared by every skill in .claude/skills/.
-    # Loaded once on startup; constrains what run_agent will let Claude
-    # touch. Resolves relative to CWD because the user runs the
-    # orchestrator from the project root.
+    # Skill manifests for both the ACT+PTT path (allowed-tools union)
+    # and the screener (per-skill metadata: description, auto-handle
+    # flags, kinds). Loaded once on startup. Resolves relative to CWD
+    # because the user runs the orchestrator from the project root.
     skills_dir = Path.cwd() / ".claude" / "skills"
-    agent_allowed_tools = load_skill_allowed_tools(skills_dir)
+    skill_manifests = load_skill_manifests(skills_dir)
+    agent_allowed_tools: tuple[str, ...] = tuple(sorted({
+        tool for m in skill_manifests for tool in m.allowed_tools
+    }))
     if agent_allowed_tools:
         logger.info(
-            "Loaded %d allowed-tools across project skills from %s",
-            len(agent_allowed_tools), skills_dir,
+            "Loaded %d skill manifests, %d unique allowed-tools from %s",
+            len(skill_manifests), len(agent_allowed_tools), skills_dir,
         )
     else:
         logger.info(
@@ -144,10 +167,70 @@ async def main_async(config: Config, *, tui: bool = False) -> None:
         app_mode=config.startup_mode if config.startup_mode in ("queue", "focused") else "focused",
     )
 
+    # Task screener intake. Producers either call ``submit`` (= push
+    # through the screener) or fall back to ``queue.add`` directly,
+    # depending on autohandle config. The screener coroutine is only
+    # scheduled when autohandle is actually doing something — otherwise
+    # we save the loop the cost of a worker task that would just
+    # forward every task untouched.
+    autohandle_active = (
+        config.autohandle_enabled
+        and config.autohandle_kinds
+        and any(m.auto_handle for m in skill_manifests)
+        and agent_mcp.enabled
+    )
+    intake_q: "asyncio.Queue[Task]" = asyncio.Queue()
+    screener_stop = asyncio.Event()
+
+    def _on_screener_outcome(outcome: ScreeningOutcome) -> None:
+        log.event(
+            "task_screened",
+            task_id=outcome.task.id,
+            kind=outcome.task.kind,
+            topic=outcome.task.topic,
+            action=outcome.action,
+            skill=outcome.skill,
+            summary=outcome.summary,
+            error=outcome.error,
+            dry_run_nominated=outcome.dry_run_nominated,
+        )
+        # Handled tasks never enter ``queue`` and so don't appear in
+        # the queue log via the listener; record a synthetic entry so
+        # offline replay/analysis can attribute them.
+        if outcome.action == "handled":
+            queue_log.record("autohandle", outcome.task)
+        # Surface "interesting" outcomes in the TUI's auto-handle log.
+        # A plain forward with no skill nominated is just pass-through
+        # — boring and would drown out real actions.
+        if outcome.action != "forward" or outcome.dry_run_nominated:
+            ctx.autohandle_log.append(
+                AutohandleLogEntry(ts=time.time(), outcome=outcome)
+            )
+
+    if autohandle_active:
+        submit_to_intake: Callable[[Task], None] = intake_q.put_nowait
+        logger.info(
+            "Autohandle ON: kinds=%s dry_run=%s (%d eligible skills)",
+            list(config.autohandle_kinds),
+            config.autohandle_dry_run,
+            sum(1 for m in skill_manifests if m.auto_handle),
+        )
+    else:
+        submit_to_intake = queue.add
+        logger.info(
+            "Autohandle OFF (enabled=%s, kinds=%s, agent_mcp.enabled=%s)",
+            config.autohandle_enabled,
+            list(config.autohandle_kinds),
+            agent_mcp.enabled,
+        )
+
     supervisor = ProducerSupervisor()
     supervisor.add(ClaudeProducer(config=config, queue=queue, summarizer=summarizer))
     supervisor.add(SlackProducer(config=config, queue=queue, mcp=slack_mcp, state=SlackState()))
-    supervisor.add(EmailProducer(config=config, queue=queue, mcp=email_mcp, state=EmailState()))
+    supervisor.add(EmailProducer(
+        config=config, queue=queue, mcp=email_mcp,
+        state=EmailState(), intake=submit_to_intake,
+    ))
     supervisor.add(LinearProducer(config=config, queue=queue))
     supervisor.add(ManualProducer())
 
@@ -275,6 +358,21 @@ async def main_async(config: Config, *, tui: bool = False) -> None:
     macropad.start()
     supervisor.start_all()
     consumer_task = asyncio.create_task(consumer.run(), name="consumer")
+    screener_task: asyncio.Task | None = None
+    if autohandle_active:
+        screener_task = asyncio.create_task(
+            run_screener_loop(
+                intake=intake_q,
+                manifests=skill_manifests,
+                mcp=agent_mcp,
+                add_to_queue=queue.add,
+                on_outcome=_on_screener_outcome,
+                allowed_kinds=frozenset(config.autohandle_kinds),
+                dry_run=config.autohandle_dry_run,
+                stop=screener_stop,
+            ),
+            name="screener",
+        )
     try:
         if app is not None:
             # Textual owns the foreground until exit. The signal handler
@@ -292,6 +390,16 @@ async def main_async(config: Config, *, tui: bool = False) -> None:
                 await consumer_task
             except (asyncio.CancelledError, Exception):
                 pass
+        if screener_task is not None:
+            screener_stop.set()
+            try:
+                await asyncio.wait_for(screener_task, timeout=2.0)
+            except asyncio.TimeoutError:
+                screener_task.cancel()
+                try:
+                    await screener_task
+                except (asyncio.CancelledError, Exception):
+                    pass
         await supervisor.stop_all()
         macropad.stop()
         thinking.stop()
