@@ -469,6 +469,103 @@ async def test_respond_email_api_error_keeps_task_active():
     assert ctx.current_task is task
 
 
+# --- archive intent ------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "transcript",
+    [
+        "archive",
+        "Archive",
+        "archive it",
+        "archive this",
+        "archive the email",
+        "archive please",
+        "Archive.",
+        "archive it.",
+    ],
+)
+@pytest.mark.asyncio
+async def test_respond_email_archive_intent_calls_unlabel_thread(transcript: str):
+    """Various phrasings of "archive" → unlabel_thread, not create_draft."""
+    mcp = MagicMock()
+    mcp.call_tool = AsyncMock()
+    ctx = _ctx_with_email_mcp(mcp)
+    task = Task(
+        kind="email_msg",
+        source={
+            "thread_id": "T1",
+            "message_id": "M1",
+            "sender_email": "alice@example.com",
+            "subject": "Help",
+        },
+    )
+    ctx.queue.add(task)
+    ctx.current_task = task
+    await dispatch._respond_email(ctx, task, transcript)
+    mcp.call_tool.assert_called_once()
+    call = mcp.call_tool.call_args
+    assert call.args[0] == "unlabel_thread"
+    assert call.args[1] == {"thread_id": "T1", "labelIds": ["INBOX"]}
+    assert ctx.queue.get(task.id).state == "done"
+    assert ctx.current_task is None
+
+
+@pytest.mark.asyncio
+async def test_respond_email_archive_in_a_sentence_still_drafts():
+    """The archive regex is anchored — 'archive the deploy notes' is a reply,
+    not an archive command."""
+    mcp = MagicMock()
+    mcp.call_tool = AsyncMock()
+    ctx = _ctx_with_email_mcp(mcp)
+    task = Task(
+        kind="email_msg",
+        source={
+            "thread_id": "T1",
+            "message_id": "M1",
+            "sender_email": "x@y.com",
+            "subject": "deploy",
+        },
+    )
+    ctx.queue.add(task)
+    ctx.current_task = task
+    await dispatch._respond_email(ctx, task, "We should archive the deploy notes")
+    assert mcp.call_tool.call_args.args[0] == "create_draft"
+
+
+@pytest.mark.asyncio
+async def test_respond_email_archive_without_thread_id_speaks_error():
+    mcp = MagicMock()
+    mcp.call_tool = AsyncMock()
+    ctx = _ctx_with_email_mcp(mcp)
+    task = Task(
+        kind="email_msg",
+        source={"message_id": "M1", "sender_email": "x@y.com", "subject": "x"},
+        # no thread_id
+    )
+    ctx.queue.add(task)
+    ctx.current_task = task
+    await dispatch._respond_email(ctx, task, "archive")
+    mcp.call_tool.assert_not_called()
+    assert ctx.queue.get(task.id).state != "done"
+
+
+@pytest.mark.asyncio
+async def test_respond_email_archive_api_error_keeps_task_active():
+    mcp = MagicMock()
+    mcp.call_tool = AsyncMock(side_effect=ClaudeMCPError("network down"))
+    ctx = _ctx_with_email_mcp(mcp)
+    task = Task(
+        kind="email_msg",
+        source={"thread_id": "T1", "sender_email": "x@y.com"},
+    )
+    ctx.queue.add(task)
+    ctx.current_task = task
+    await dispatch._respond_email(ctx, task, "archive")
+    assert ctx.queue.get(task.id).state != "done"
+    assert ctx.current_task is task
+
+
 @pytest.mark.asyncio
 async def test_dispatch_task_response_routes_email_kind():
     mcp = MagicMock()

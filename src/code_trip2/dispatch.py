@@ -245,6 +245,10 @@ async def _skip_current(ctx: "Context") -> None:
     ctx.current_task = None
     if t is None:
         return
+    # Cut any in-flight announcement (headline read, body expansion)
+    # the moment the user skips — they've decided this isn't worth
+    # finishing. Matches what ``dismiss_current_task`` already does.
+    modes.stop_playback(ctx)
     ctx.queue.defer(t.id, 300.0)  # 5-minute soft-defer
     await _speak(ctx, "Skipped.")
 
@@ -255,6 +259,7 @@ async def _drop_current(ctx: "Context") -> None:
     if t is None:
         await _speak(ctx, "Nothing active.")
         return
+    modes.stop_playback(ctx)
     ctx.queue.mark_done(t.id)
     await _speak(ctx, "Done.")
 
@@ -266,6 +271,7 @@ async def _snooze_current(ctx: "Context", amount: str | None, unit: str | None) 
         return
     seconds = _parse_snooze_seconds(amount, unit)
     ctx.current_task = None
+    modes.stop_playback(ctx)
     ctx.queue.defer(t.id, seconds)
     await _speak(ctx, f"Snoozed {int(seconds)} seconds.")
 
@@ -380,16 +386,31 @@ async def _respond_claude(ctx: "Context", task: Task, transcript: str) -> None:
     await _speak(ctx, "Sent.")
 
 
-async def _respond_email(ctx: "Context", task: Task, transcript: str) -> None:
-    """Draft a reply to the source email via the Gmail MCP.
+# "archive" / "archive it" / "archive this" / "archive the email" /
+# "archive please" — tight enough that the word doesn't accidentally
+# match if the user's actually trying to reply with a sentence
+# containing "archive".
+_EMAIL_ARCHIVE_RE = re.compile(
+    r"^archive(\s+(it|this|please|the email))?[.!?]*$",
+    re.IGNORECASE,
+)
 
-    The claude.ai Gmail MCP has no send tool — only ``create_draft``. We
-    don't actually send: the user reviews the draft from Gmail and sends
-    it themselves. That's the safer default for voice anyway.
+
+async def _respond_email(ctx: "Context", task: Task, transcript: str) -> None:
+    """Voice response on an email task — archive or draft a reply.
+
+    The claude.ai Gmail MCP has no send tool — only ``create_draft``.
+    When the user says "archive" / "archive it", we call
+    ``unlabel_thread`` (removing INBOX) instead of drafting. Any other
+    transcript becomes the body of a draft reply; the user reviews and
+    sends from Gmail. That's the safer default for voice anyway.
     """
     mcp = ctx.email_mcp
     if mcp is None:
         await _speak(ctx, "Gmail MCP is not configured.")
+        return
+    if _EMAIL_ARCHIVE_RE.match(transcript.strip()):
+        await _archive_email(ctx, task)
         return
     to_addr = task.source.get("sender_email") or ""
     msg_id = task.source.get("message_id") or ""
@@ -418,6 +439,39 @@ async def _respond_email(ctx: "Context", task: Task, transcript: str) -> None:
         sent=transcript,
     )
     await _speak(ctx, "Drafted.")
+
+
+async def _archive_email(ctx: "Context", task: Task) -> None:
+    """Archive the email by removing the INBOX label.
+
+    Same Gmail MCP call the ``accept-invite`` skill uses. Marks the
+    task done; on the next wide poll the producer won't re-surface it
+    because the email is no longer ``in:inbox``.
+    """
+    mcp = ctx.email_mcp
+    thread_id = (task.source or {}).get("thread_id") or ""
+    if not thread_id:
+        await _speak(ctx, "Missing thread id; can't archive.")
+        return
+    try:
+        await mcp.call_tool(
+            "unlabel_thread",
+            {"thread_id": thread_id, "labelIds": ["INBOX"]},
+        )
+    except Exception as exc:
+        logger.exception("Email archive failed")
+        await _speak(ctx, f"Could not archive: {exc}")
+        return
+    ctx.queue.mark_done(task.id)
+    ctx.current_task = None
+    ctx.log.event(
+        "queue_turn",
+        task_id=task.id,
+        kind=task.kind,
+        topic=task.topic,
+        action="archive",
+    )
+    await _speak(ctx, "Archived.")
 
 
 async def _respond_slack(ctx: "Context", task: Task, transcript: str) -> None:
