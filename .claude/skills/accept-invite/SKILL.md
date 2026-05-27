@@ -1,6 +1,6 @@
 ---
 name: accept-invite
-description: Accept a Google Calendar invite that arrived as an email and archive the email. Use when the email is a calendar invitation that the user would say yes to (1:1s, team meetings, standups, syncs). Skip for ambiguous "save the date" emails, external/unknown senders, or anything where attendance isn't clearly expected.
+description: Accept a Google Calendar invitation email and archive it. The prototype case is any Google Calendar invitation auto-email — subject begins with "Invitation:" and the body contains "You have been invited by". Pick this skill for ALL such invites from internal/colleague senders, regardless of meeting type — 1:1s, team meetings, standups, syncs, demos, presentations, reviews, planning meetings. Internal-colleague invites default to "yes, will attend." Only skip when the sender is clearly external (an unknown company or vendor) or the email is not actually a Google Calendar invitation auto-message (e.g. a personal "want to grab coffee?" note).
 auto-handle: true
 auto-handle-kinds:
   - email_msg
