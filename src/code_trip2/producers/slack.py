@@ -322,6 +322,20 @@ class SlackProducer:
             return
 
         messages = self._extract_messages(result)
+        # The claude.ai Slack MCP's search treats ``<@U…>`` as a fuzzy
+        # signal rather than a strict mention operator — it returns
+        # hits in adjacent threads, messages mentioning other people,
+        # etc. Drop anything whose raw body doesn't contain the
+        # user's literal encoded mention in either bare (``<@U…>``)
+        # or display-name (``<@U…|Henry>``) form. Loses usergroup
+        # mentions the user belongs to, but the false-positive rate
+        # without this filter is worse.
+        mention_re = re.compile(rf"<@{re.escape(self._user_id)}[|>]")
+        strict_messages = [
+            m for m in messages if mention_re.search(m.get("text") or "")
+        ]
+        skipped_non_mention = len(messages) - len(strict_messages)
+        messages = strict_messages
         emitted = 0
         skipped_bot = 0
         skipped_old = 0
@@ -349,11 +363,12 @@ class SlackProducer:
             self._state.set_last_search_ts(ts)
 
         logger.info(
-            "SlackProducer: mention poll — %d matches (%d emitted, %d bot, %d already-seen)",
+            "SlackProducer: mention poll — %d strict (%d emitted, %d bot, %d already-seen, %d non-mention dropped)",
             len(messages),
             emitted,
             skipped_bot,
             skipped_old,
+            skipped_non_mention,
         )
 
     async def _poll_watched_channel(self, channel_name: str, channel_id: str) -> None:

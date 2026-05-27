@@ -471,7 +471,7 @@ _DETAILED_FIXTURE = (
     "Reply count: 3\n"
     "Permalink: [link](https://x.slack.com/archives/CENG/p1716000002000000?thread_ts=1716000000.500000&cid=CENG)\n"
     "Text: \n"
-    "follow-up question\n"
+    "<@UME> follow-up question\n"
     "\n"
     "---\n\n"
 )
@@ -509,7 +509,7 @@ async def test_producer_poll_skips_bot_messages_by_default(tmp_path: Path):
         "Message_ts: 1716000099.000000\n"
         "Permalink: [link](https://x.slack.com/archives/CALERT/p1716000099000000?thread_ts=1716000099.000000)\n"
         "Text: \n"
-        "Created issue ABC-123\n"
+        "<@UME> created issue ABC-123\n"
         "\n"
         "---\n\n"
     )
@@ -532,7 +532,7 @@ async def test_producer_poll_skips_messages_at_or_before_last_ts(tmp_path: Path)
         "Message_ts: 1716000005.000000\n"
         "Permalink: [link](https://x.slack.com/archives/C1/p1716000005000000?thread_ts=1716000005.000000)\n"
         "Text: \n"
-        "old\n\n"
+        "<@UME> old\n\n"
         "---\n\n"
         "### Result 2 of 2\n"
         "Channel: #c (ID: C1)\n"
@@ -540,7 +540,7 @@ async def test_producer_poll_skips_messages_at_or_before_last_ts(tmp_path: Path)
         "Message_ts: 1716000006.000000\n"
         "Permalink: [link](https://x.slack.com/archives/C1/p1716000006000000?thread_ts=1716000006.000000)\n"
         "Text: \n"
-        "new\n\n"
+        "<@UME> new\n\n"
         "---\n\n"
     )
     p, q, mcp, state = _producer(tmp_path)
@@ -561,7 +561,7 @@ async def test_producer_poll_dedupes_within_session(tmp_path: Path):
         "Message_ts: 1716000010.000000\n"
         "Permalink: [link](https://x.slack.com/archives/C1/p1716000010000000?thread_ts=1716000010.000000)\n"
         "Text: \n"
-        "ping\n\n"
+        "<@UME> ping\n\n"
         "---\n\n"
     )
     p, q, mcp, _state = _producer(tmp_path)
@@ -570,6 +570,42 @@ async def test_producer_poll_dedupes_within_session(tmp_path: Path):
     await p._poll_once()
     await p._poll_once()  # same poll result; second pass should be a no-op
     assert len(q.all()) == 1
+
+
+@pytest.mark.asyncio
+async def test_producer_poll_drops_non_mention_results(tmp_path: Path):
+    """The claude.ai Slack MCP search isn't strict on `<@USER_ID>` — a
+    post-filter drops anything whose raw body doesn't contain the
+    user's literal encoded mention. See the Valeria→Molly bug in the
+    main branch: a third-party @-mention in a channel-search hit
+    surfaced as a task even though the user wasn't named anywhere.
+    """
+    fixture = (
+        "### Result 1 of 2\n"
+        "Channel: #channel-a (ID: CA)\n"
+        "From: Alice (ID: UALICE) \n"
+        "Message_ts: 1716000050.000000\n"
+        "Permalink: [link](https://x.slack.com/archives/CA/p1716000050000000?thread_ts=1716000050.000000)\n"
+        "Text: \n"
+        "<@UME> need your input on the deploy\n\n"
+        "---\n\n"
+        "### Result 2 of 2\n"
+        "Channel: #channel-b (ID: CB)\n"
+        "From: Bob (ID: UBOB) \n"
+        "Message_ts: 1716000051.000000\n"
+        "Permalink: [link](https://x.slack.com/archives/CB/p1716000051000000?thread_ts=1716000051.000000)\n"
+        "Text: \n"
+        "<@USOMEONE_ELSE> can you look at this\n\n"  # not the user
+        "---\n\n"
+    )
+    p, q, mcp, _state = _producer(tmp_path)
+    p._user_id = "UME"
+    mcp.call_tool.return_value = {"results": fixture}
+    await p._poll_once()
+    tasks = q.all()
+    assert len(tasks) == 1
+    assert tasks[0].source["channel_id"] == "CA"
+    assert "deploy" in tasks[0].body
 
 
 @pytest.mark.asyncio
@@ -591,7 +627,7 @@ async def test_producer_poll_handles_structured_messages_too(tmp_path: Path):
         "messages": [
             {
                 "ts": "1.0",
-                "text": "ping",
+                "text": "<@UME> ping",
                 "channel_id": "C1",
                 "channel_name": "c",
                 "sender_id": "U1",
@@ -963,6 +999,11 @@ async def test_dispatch_task_response_routes_slack_kind():
 
 
 def _thread_fixture(thread_ts: str, msg_ts: str, body: str, sender: str = "Alice") -> str:
+    """Build one detailed-markdown result block. The body is prefixed
+    with the test user's `<@UME>` mention so the producer's strict
+    mention filter doesn't drop it — these fixtures exist to test
+    thread-collapse / dedup logic, not the mention filter itself.
+    """
     return (
         f"### Result 1 of 1\n"
         f"Channel: #ai-tools (ID: CTHREAD)\n"
@@ -971,7 +1012,7 @@ def _thread_fixture(thread_ts: str, msg_ts: str, body: str, sender: str = "Alice
         f"Permalink: [link](https://x.slack.com/archives/CTHREAD/p{msg_ts.replace('.','')}"
         f"?thread_ts={thread_ts}&cid=CTHREAD)\n"
         f"Text: \n"
-        f"{body}\n\n"
+        f"<@UME> {body}\n\n"
         f"---\n\n"
     )
 
