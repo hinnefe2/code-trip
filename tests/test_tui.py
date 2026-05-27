@@ -1,8 +1,10 @@
-"""Tests for the TUI render function.
+"""Tests for the Textual TUI panel-builders and host detection.
 
-We don't start a real ``Live`` display in tests — just verify ``render``
-produces a non-empty Layout that prints cleanly for the relevant states
-(idle queue, active task, populated queue, etc.).
+The Textual ``CodeTripApp`` itself isn't exercised here — that's a Pilot
+test (``test_codetrip_app.py``-style harness, future work). These tests
+verify the pure Rich panel-builders that the app's Static widgets render,
+plus the macOS host-app detection used to suppress synthesized keystrokes
+when the user is looking at the TUI host terminal.
 """
 
 from __future__ import annotations
@@ -14,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from rich.console import Console
-from rich.layout import Layout
+from rich.panel import Panel
 
 from code_trip2 import chords, modes, tui
 from code_trip2.producers import ProducerSupervisor
@@ -48,11 +50,10 @@ def _make_ctx(*, app_mode="queue", summarizer_enabled=False):
     return ctx
 
 
-def _render_to_string(layout: Layout) -> str:
-    """Render the layout to a string so we can assert presence of pieces."""
+def _render(renderable) -> str:
     buf = io.StringIO()
     console = Console(file=buf, width=120, height=40, force_terminal=False)
-    console.print(layout)
+    console.print(renderable)
     return buf.getvalue()
 
 
@@ -71,73 +72,131 @@ def test_truncate_handles_newlines_and_caps():
     assert tui._truncate("x" * 100, 10) == "x" * 9 + "…"
 
 
-# --- render ----------------------------------------------------------------
+# --- panel builders -------------------------------------------------------
 
 
-def test_render_idle_queue_mode():
+def test_header_renders_mode_and_window():
     ctx = _make_ctx(app_mode="queue")
-    layout = tui.render(ctx, supervisor=None)
-    out = _render_to_string(layout)
+    out = _render(tui._header(ctx))
     assert "QUEUE" in out
     assert "ticket-42" in out
-    assert "queue empty" in out.lower()
-    assert "idle" in out.lower() or "say 'next'" in out.lower()
 
 
-def test_render_focused_mode_shows_summarizer_state():
+def test_header_focused_mode_shows_summarizer_model():
     ctx = _make_ctx(app_mode="focused", summarizer_enabled=True)
-    layout = tui.render(ctx, supervisor=None)
-    out = _render_to_string(layout)
+    out = _render(tui._header(ctx))
     assert "FOCUSED" in out
     assert "gpt-4o-mini" in out
 
 
-def test_render_summarizer_off_when_disabled():
+def test_header_summarizer_off_when_disabled():
     ctx = _make_ctx(summarizer_enabled=False)
-    layout = tui.render(ctx, supervisor=None)
-    out = _render_to_string(layout)
-    assert "off" in out  # the "off" label for missing summarizer
+    out = _render(tui._header(ctx))
+    assert "off" in out
 
 
-def test_render_current_task():
+def test_current_task_idle_panel():
     ctx = _make_ctx()
-    t = Task(
+    out = _render(tui._current_task_panel(ctx))
+    assert "idle" in out.lower() or "say 'next'" in out.lower()
+
+
+def test_current_task_panel_with_active_task():
+    ctx = _make_ctx()
+    ctx.current_task = Task(
         kind="claude_reply",
         topic="ticket-42",
         headline="replied to: run the tests",
         body="Tests passed in two files.",
     )
-    ctx.current_task = t
-    layout = tui.render(ctx, supervisor=None)
-    out = _render_to_string(layout)
+    out = _render(tui._current_task_panel(ctx))
     assert "claude_reply" in out
     assert "ticket-42" in out
     assert "replied to: run the tests" in out
 
 
-def test_render_populated_queue_shows_pending_count_and_top():
+def test_queue_table_empty():
+    ctx = _make_ctx()
+    out = _render(tui._queue_table(ctx))
+    assert "queue empty" in out.lower()
+
+
+def test_queue_table_populated_shows_pending_count_and_top():
     ctx = _make_ctx()
     ctx.queue.add(Task(kind="claude_reply", topic="ticket-42", headline="top item",
                        created_at=1.0))
     ctx.queue.add(Task(kind="slack_msg", topic="general", headline="alice pinged",
                        created_at=100.0))
-    layout = tui.render(ctx, supervisor=None)
-    out = _render_to_string(layout)
+    out = _render(tui._queue_table(ctx))
     assert "2 pending" in out
     assert "top item" in out
     assert "alice pinged" in out
 
 
-def test_render_recent_topics_shows_recent_first():
+def test_topics_panel_orders_most_recent_first():
     ctx = _make_ctx()
     import time as _t
     ctx.recent_topics.touch("ticket-1", now=_t.time() - 60)
     ctx.recent_topics.touch("ticket-2", now=_t.time() - 5)
-    layout = tui.render(ctx, supervisor=None)
-    out = _render_to_string(layout)
-    # Both topics rendered; ticket-2 (more recent) should appear before
-    # ticket-1 in the output stream.
+    out = _render(tui._topics_panel(ctx))
     assert out.find("ticket-2") < out.find("ticket-1")
+
+
+def test_keymap_queue_mode_shows_queue_relevant_keys():
+    ctx = _make_ctx(app_mode="queue")
+    out = _render(tui._keymap_panel(ctx))
+    assert "Macropad" in out
+    assert "accept" in out or "expand" in out
+    assert "skip task" in out
+    assert "→ focused" in out
+    assert "stop audio" in out
+    assert "NAV+" in out
+    assert "ACT+" in out
+    assert "dismiss" in out
+    assert "Ctrl+U" not in out
+    assert "clear line" not in out
+
+
+def test_keymap_focused_mode_shows_full_chord_set():
+    ctx = _make_ctx(app_mode="focused")
+    out = _render(tui._keymap_panel(ctx))
+    assert "Macropad" in out
+    assert "Enter" in out
+    assert "Esc" in out
+    assert "→ queue" in out
+    assert "per-app" in out
+    assert "NAV+" in out
+    assert "ACT+" in out
+    assert "Ctrl+U" in out
+
+
+def test_keymap_panel_height_same_in_both_modes():
+    queue_ctx = _make_ctx(app_mode="queue")
+    focused_ctx = _make_ctx(app_mode="focused")
+    assert tui._keymap_panel_size(queue_ctx) == tui._keymap_panel_size(focused_ctx)
+
+
+def test_producers_panel_uses_supervisor_status():
+    sup = ProducerSupervisor()
+    sup.add(SimpleNamespace(name="claude", request_stop=lambda: None,
+                            run=lambda: None))
+    sup.add(SimpleNamespace(name="slack", request_stop=lambda: None,
+                            run=lambda: None))
+    # Simulate "claude task was created and is alive"; slack never started.
+    sup._tasks["claude"] = SimpleNamespace(done=lambda: False)
+    out = _render(tui._producers_panel(sup))
+    assert "claude" in out
+    assert "running" in out
+    assert "slack" in out
+    assert "idle" in out
+
+
+def test_producers_panel_no_supervisor():
+    out = _render(tui._producers_panel(None))
+    assert "no supervisor" in out
+
+
+# --- host-terminal detection ----------------------------------------------
 
 
 def test_detect_tui_host_app_maps_known_terms(monkeypatch):
@@ -227,96 +286,93 @@ async def test_yes_tap_suppressed_in_focused_mode_when_tui_host_focused(monkeypa
     send.assert_not_called()
 
 
-def test_render_keymap_in_queue_mode_shows_only_queue_relevant_keys():
-    ctx = _make_ctx(app_mode="queue")
-    layout = tui.render(ctx, supervisor=None)
-    out = _render_to_string(layout)
-    assert "Macropad" in out
-    # Queue-flavored solo taps.
-    assert "accept" in out or "expand" in out
-    assert "skip task" in out
-    # NAV solo flips mode; ACT solo interrupts audio.
-    assert "→ focused" in out
-    assert "stop audio" in out
-    # NAV-modifier chords still useful (user often glances at the screen).
-    assert "NAV+" in out
-    # ACT+NO in queue mode dismisses the current task (replaces the
-    # focused-mode-only Ctrl+U binding).
-    assert "ACT+" in out
-    assert "dismiss" in out
-    assert "Ctrl+U" not in out
-    assert "clear line" not in out
+# --- CodeTripApp via Pilot ------------------------------------------------
 
 
-def test_render_keymap_in_focused_mode_shows_full_chord_set():
-    ctx = _make_ctx(app_mode="focused")
-    layout = tui.render(ctx, supervisor=None)
-    out = _render_to_string(layout)
-    assert "Macropad" in out
-    # Keyboard-style solo taps.
-    assert "Enter" in out
-    assert "Esc" in out
-    # NAV solo flips mode; ACT solo does per-app.
-    assert "→ queue" in out
-    assert "per-app" in out
-    # All chord rows shown.
-    assert "NAV+" in out
-    assert "ACT+" in out
-    assert "Ctrl+U" in out
-
-
-def test_keymap_panel_height_same_in_both_modes():
-    """Both modes now render three content rows: queue mode has ACT+NO
-    dismiss-task; focused mode has ACT+NO Ctrl+U."""
-    queue_ctx = _make_ctx(app_mode="queue")
-    focused_ctx = _make_ctx(app_mode="focused")
-    assert tui._keymap_panel_size(queue_ctx) == tui._keymap_panel_size(focused_ctx)
-
-
-def test_render_input_panel_hidden_when_buffer_absent():
-    """Default _make_ctx leaves input_buffer=None (openai-STT mode),
-    so the TUI doesn't render the Input panel."""
-    ctx = _make_ctx(app_mode="queue")
-    layout = tui.render(ctx, supervisor=None)
-    out = _render_to_string(layout)
-    assert "Input" not in out or "Input " not in out  # no panel title
-
-
-def test_render_input_panel_shown_when_buffer_present():
-    from code_trip2.input_buffer import InputBuffer
-    ctx = _make_ctx(app_mode="queue")
-    ctx.input_buffer = InputBuffer()
-    layout = tui.render(ctx, supervisor=None)
-    out = _render_to_string(layout)
-    assert "Input" in out
-    assert "Enter submits" in out or "type or wait" in out
-
-
-def test_render_input_panel_shows_buffer_contents():
-    from code_trip2.input_buffer import InputBuffer
-    ctx = _make_ctx(app_mode="queue")
-    buf = InputBuffer()
-    for ch in "archive that email":
-        buf.append(ch)
-    ctx.input_buffer = buf
-    layout = tui.render(ctx, supervisor=None)
-    out = _render_to_string(layout)
-    assert "archive that email" in out
-
-
-def test_render_producers_status_uses_supervisor():
+@pytest.mark.asyncio
+async def test_app_input_submit_dispatches_handle_voice(monkeypatch):
+    """Submitting the Input widget calls handle_voice when no PTT release
+    primed skill mode."""
     ctx = _make_ctx()
-    sup = ProducerSupervisor()
-    # Fake two producers: one running, one never-started (idle).
-    sup.add(SimpleNamespace(name="claude", request_stop=lambda: None,
-                            run=lambda: None))
-    sup.add(SimpleNamespace(name="slack", request_stop=lambda: None,
-                            run=lambda: None))
-    # Simulate "claude task was created and is alive"; slack never started.
-    sup._tasks["claude"] = SimpleNamespace(done=lambda: False)
-    layout = tui.render(ctx, supervisor=sup)
-    out = _render_to_string(layout)
-    assert "claude" in out
-    assert "running" in out
-    assert "slack" in out
-    assert "idle" in out
+    called: list[str] = []
+
+    async def fake_handle_voice(c, t):
+        called.append(("voice", t))
+
+    async def fake_handle_skill(c, t):
+        called.append(("skill", t))
+
+    monkeypatch.setattr("code_trip2.dispatch.handle_voice", fake_handle_voice)
+    monkeypatch.setattr("code_trip2.dispatch.handle_skill", fake_handle_skill)
+
+    app = tui.CodeTripApp(ctx, supervisor=None, local_stt=True)
+    async with app.run_test() as pilot:
+        input_widget = app.query_one("#voice_input", tui.Input)
+        input_widget.value = "what's next"
+        await input_widget.action_submit()
+        await pilot.pause()
+        # Yield once more so the create_task() coroutine actually runs.
+        await pilot.pause()
+
+    assert called == [("voice", "what's next")]
+
+
+@pytest.mark.asyncio
+async def test_app_ptt_release_routes_to_skill(monkeypatch):
+    """PttReleased(skill_mode=True) primes skill_mode; the next Input submit
+    dispatches handle_skill."""
+    ctx = _make_ctx()
+    called: list[str] = []
+
+    async def fake_handle_voice(c, t):
+        called.append(("voice", t))
+
+    async def fake_handle_skill(c, t):
+        called.append(("skill", t))
+
+    monkeypatch.setattr("code_trip2.dispatch.handle_voice", fake_handle_voice)
+    monkeypatch.setattr("code_trip2.dispatch.handle_skill", fake_handle_skill)
+
+    app = tui.CodeTripApp(ctx, supervisor=None, local_stt=True)
+    async with app.run_test() as pilot:
+        app.post_message(tui.PttReleased(skill_mode=True))
+        await pilot.pause()
+        input_widget = app.query_one("#voice_input", tui.Input)
+        input_widget.value = "archive this email"
+        await input_widget.action_submit()
+        await pilot.pause()
+        await pilot.pause()
+
+    assert called == [("skill", "archive this email")]
+
+
+@pytest.mark.asyncio
+async def test_app_input_hidden_in_openai_mode():
+    """In openai-STT mode the Input is composed but marked hidden so it
+    doesn't take up screen real estate."""
+    ctx = _make_ctx()
+    app = tui.CodeTripApp(ctx, supervisor=None, local_stt=False)
+    async with app.run_test():
+        input_widget = app.query_one("#voice_input", tui.Input)
+        assert "hidden" in input_widget.classes
+
+
+@pytest.mark.asyncio
+async def test_app_ptt_release_ignored_when_not_local_stt(monkeypatch):
+    """PTT release in openai-STT mode is a no-op — the audio path handles
+    skill_mode via on_audio's skill_mode kwarg, not via the Input widget."""
+    ctx = _make_ctx()
+    called: list[str] = []
+
+    async def fake_handle_voice(c, t):
+        called.append(("voice", t))
+
+    monkeypatch.setattr("code_trip2.dispatch.handle_voice", fake_handle_voice)
+
+    app = tui.CodeTripApp(ctx, supervisor=None, local_stt=False)
+    async with app.run_test() as pilot:
+        app.post_message(tui.PttReleased(skill_mode=True))
+        await pilot.pause()
+        # No flag should have been set; verify the input widget wasn't
+        # focused/cleared and pending state stays false.
+        assert app._pending_skill_mode is False

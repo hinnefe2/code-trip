@@ -91,11 +91,6 @@ class Context:
     # frontmatter. Passed to ``run_agent`` so Claude can't reach for a
     # tool that isn't in any skill's declared set.
     agent_allowed_tools: tuple[str, ...] = ()
-    # Live edit buffer for the TUI input panel. Set in local-STT mode;
-    # the stdin reader thread appends/edits chars here, and the TUI
-    # renders it so the user can see and correct pasted transcripts
-    # before submitting.
-    input_buffer: object | None = None
 
     def __post_init__(self) -> None:
         if not self.active_window:

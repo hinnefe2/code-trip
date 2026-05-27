@@ -1,6 +1,6 @@
 # Asyncio migration plan
 
-> **Status:** Phases 1–6 landed 2026-05-26 on the `async-migration` branch.
+> **Status:** Phases 1–7 landed 2026-05-27 on the `async-migration` branch.
 
 ## Motivation
 
@@ -160,8 +160,13 @@ The locks at `email_state.py`, `slack_state.py`, `input_buffer.py` are no-ops un
 
 ### Phase 7 — Migrate TUI to Textual
 
-- Separate detailed plan; Textual's loop integrates natively with the asyncio loop set up in Phase 1.
-- Delete the cbreak/termios setup, the stdin paste reader, the `InputBuffer`, the `BRACKETED_PASTE_RE` / `_ANSI_CSI_RE` code, the `on_ptt_release` FIFO. Replace with Textual's `Input` widget + a message from macropad's bridge.
+- `tui.py` rewritten: Rich `Live` `Dashboard` replaced by `CodeTripApp(App)`. The panel-builders (`_header`, `_current_task_panel`, `_queue_table`, `_topics_panel`, `_keymap_panel`, `_producers_panel`) stayed pure-Rich and are rendered through Textual `Static` widgets, refreshed at 2 Hz from a `set_interval` timer.
+- Voice/skill input goes through a Textual `Input` widget (visible only in local-STT mode). Submission dispatches via `handle_voice` / `handle_skill`. PTT release in local-STT mode posts a `PttReleased` message from the pynput thread (`app.call_from_thread(app.post_message, …)`), which clears the field and arms an autosubmit timer so a Superwhisper paste burst dispatches without a trailing newline (matches the old `_INPUT_QUIET_S = 0.4` semantics, with a 5 s timeout).
+- Removed in `main.py`: cbreak/termios setup, the stdin paste reader thread, `_BRACKETED_PASTE_RE`, `_ANSI_CSI_RE`, `ptt_release_skill_q`, `_ingest_stdin_chunk`, `_submit_input_buffer`, `_stdin_paste_loop`, the `threading.Event` shutdown bridge, the `input_buffer` wiring. The `_from_thread` helper stays (still needed for macropad's pynput thread).
+- Deleted: `src/code_trip2/input_buffer.py`, `tests/test_input_buffer.py`. `modes.Context.input_buffer` field removed.
+- **Breaking change in CLI semantics:** local-STT mode (`stt_provider != "openai"`) now requires `--tui`. `main_async` raises `SystemExit` with an explanatory message if the combination is misconfigured. There's no longer a non-TUI path that accepts pasted transcripts.
+- Tests: existing Rich-panel assertions kept (the panel builders are unchanged); new Pilot-based tests cover Input submit → `handle_voice`, PttReleased → `handle_skill`, and the openai-mode hidden-Input case.
+- `textual>=0.80` added to `dependencies` in `pyproject.toml`.
 
 ### Phase 8 — Cleanup
 

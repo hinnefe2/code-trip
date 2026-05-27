@@ -1,29 +1,38 @@
-"""Live status dashboard for the orchestrator.
+"""Textual TUI for the orchestrator.
 
-Enabled by ``--tui``. Suppresses normal Python logging so the live
-display owns the terminal. The dashboard is read-only: it shows
-mode, active window, summarizer state, current task, queue contents,
-recent topics, and per-producer health. No input handling — taps and
-voice still go through the macropad / voice loop.
+Enabled by ``--tui``. The app owns the foreground terminal; logs go to a
+file instead. Panels render the orchestrator state (mode, active window,
+summarizer, current task, queue, recent topics, keymap, producers) at
+~2 Hz so a queue mutation is visible within ~500 ms.
 
-Refreshes at ``refresh_hz`` (default 2 Hz, so the longest a queue mutation
-sits invisible is ~500 ms). The render function is pure (reads context
-fields, builds a Rich Layout) so it can be tested without starting Live.
+The :class:`CodeTripApp` also exposes an :class:`Input` widget used in
+local-STT mode (Superwhisper / clipboard-paste) — the macropad bridges
+PTT release into :class:`PttReleased`, which clears the input field and
+arms an auto-submit timer so a pasted transcript dispatches without
+needing a trailing newline.
+
+Panel-builders (``_header``, ``_current_task_panel``, …) stay as pure
+Rich-returning functions so the existing assertions still apply.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
-import threading
 import time
 from typing import TYPE_CHECKING
 
 from rich.console import Group
-from rich.layout import Layout
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
+
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical
+from textual.message import Message
+from textual.widgets import Input, Static
 
 if TYPE_CHECKING:
     from code_trip2.modes import Context
@@ -94,7 +103,7 @@ _STATE_COLOR = {
 }
 
 
-# --- render --------------------------------------------------------------
+# --- panel builders (pure Rich; used by Static widgets) -------------------
 
 
 def _header(ctx: "Context") -> Panel:
@@ -263,28 +272,6 @@ def _keymap_panel_size(ctx: "Context") -> int:
     return 6
 
 
-def _input_panel(ctx: "Context") -> Panel:
-    """Live edit buffer for the local-STT stdin reader.
-
-    In cbreak mode the terminal doesn't echo, so chars typed or pasted
-    into the orchestrator's stdin would otherwise be invisible. We
-    render them here, with a cursor indicator, so the user can see
-    (and edit) what's about to be submitted.
-    """
-    buf_obj = getattr(ctx, "input_buffer", None)
-    if buf_obj is None:
-        body = Text("(no input buffer)", style="dim italic")
-        return Panel(body, title="Input", border_style="bright_black")
-    text_value = buf_obj.get()
-    if text_value:
-        body = Text.assemble(Text(text_value, style="white"), Text("▏", style="bold cyan"))
-        border = "cyan"
-    else:
-        body = Text("(type or wait for paste — Enter submits, Esc clears)", style="dim italic")
-        border = "bright_black"
-    return Panel(body, title="Input", border_style=border)
-
-
 def _producers_panel(supervisor: "ProducerSupervisor | None") -> Panel:
     if supervisor is None:
         return Panel(Text("(no supervisor)", style="dim"), title="Producers")
@@ -299,95 +286,206 @@ def _producers_panel(supervisor: "ProducerSupervisor | None") -> Panel:
     return Panel(body, title="Producers", border_style="bright_black")
 
 
-def render(ctx: "Context", supervisor: "ProducerSupervisor | None") -> Layout:
-    """Build the dashboard layout. Pure function; safe to call from tests."""
-    layout = Layout()
-    sections = [
-        Layout(_header(ctx), name="header", size=3),
-        Layout(name="body"),
-    ]
-    if getattr(ctx, "input_buffer", None) is not None:
-        sections.append(Layout(_input_panel(ctx), name="input", size=3))
-    sections.extend([
-        Layout(_keymap_panel(ctx), name="keymap", size=_keymap_panel_size(ctx)),
-        Layout(_producers_panel(supervisor), name="producers", size=3),
-    ])
-    layout.split_column(*sections)
-    layout["body"].split_row(
-        Layout(name="left", ratio=2),
-        Layout(name="right", ratio=1),
-    )
-    layout["left"].split_column(
-        Layout(_current_task_panel(ctx), size=7),
-        Layout(_queue_table(ctx)),
-    )
-    layout["right"].update(_topics_panel(ctx))
-    return layout
+# --- Textual messages from the macropad bridge ---------------------------
 
 
-# --- live dashboard --------------------------------------------------------
-
-
-class Dashboard:
-    """Background thread that drives a Rich ``Live`` display.
-
-    Lifecycle: construct → :meth:`start` (enters Live) → polling thread
-    re-renders every ``1/refresh_hz`` seconds → :meth:`stop` (exits Live,
-    restores terminal). Safe to call ``stop`` multiple times.
+class PttReleased(Message):
+    """Posted from the macropad's pynput thread when PTT is released in
+    local-STT (key-forwarding) mode. ``skill_mode`` rides along so the
+    next submitted Input value dispatches to ``handle_skill`` instead of
+    ``handle_voice``.
     """
+
+    def __init__(self, skill_mode: bool) -> None:
+        super().__init__()
+        self.skill_mode = skill_mode
+
+
+# --- the app --------------------------------------------------------------
+
+
+# Auto-submit window after the last input change with a PTT release pending.
+# Long enough for a burst-paste (Superwhisper) to finish; short enough not
+# to feel like a delay before the skill kicks off. Matches the value used
+# by the pre-Textual stdin reader.
+_INPUT_QUIET_S = 0.4
+
+# Maximum time to wait for a paste to arrive after PTT release before the
+# autosubmit timer gives up. Prevents a leftover "pending skill mode" flag
+# from consuming the next unrelated keystroke.
+_INPUT_AUTOSUBMIT_TIMEOUT_S = 5.0
+
+# Periodic refresh of the dynamic panels (current task, queue, topics,
+# producers). The orchestrator pushes via message in a few spots but most
+# state mutates without a TUI hook; a poll at 2 Hz keeps it close enough.
+_REFRESH_HZ = 2.0
+
+
+class CodeTripApp(App):
+    """Textual app that owns the foreground terminal during ``--tui``.
+
+    Read-only display of orchestrator state plus an ``Input`` widget for
+    local-STT mode. The macropad still drives chords/taps/voice via the
+    bridge in ``main.py``; the app only routes PTT-release-then-paste
+    and Input-Enter through ``handle_voice`` / ``handle_skill``.
+    """
+
+    CSS = """
+    Screen {
+        layout: vertical;
+    }
+    #body {
+        height: 1fr;
+    }
+    #left {
+        width: 2fr;
+    }
+    #right {
+        width: 1fr;
+    }
+    #voice_input {
+        height: 3;
+    }
+    #voice_input.hidden {
+        display: none;
+    }
+    Static {
+        height: auto;
+    }
+    """
+
+    BINDINGS = [
+        Binding("ctrl+c", "quit", "Quit", priority=True),
+    ]
 
     def __init__(
         self,
         ctx: "Context",
         supervisor: "ProducerSupervisor | None" = None,
         *,
-        refresh_hz: float = 2.0,
+        local_stt: bool = False,
     ) -> None:
-        self._ctx = ctx
-        self._supervisor = supervisor
-        self._refresh_hz = refresh_hz
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._live = None  # type: ignore[var-annotated]
+        super().__init__()
+        self.ctx = ctx
+        self.supervisor = supervisor
+        self.local_stt = local_stt
+        self._pending_skill_mode = False
+        self._last_input_change = 0.0
+        self._autosubmit_handle = None
+        self._autosubmit_deadline = 0.0
 
-    def start(self) -> None:
-        from rich.console import Console
-        from rich.live import Live
-
-        if self._live is not None:
-            return
-        console = Console()
-        self._live = Live(
-            render(self._ctx, self._supervisor),
-            console=console,
-            screen=True,
-            refresh_per_second=self._refresh_hz,
-            redirect_stdout=False,
-            redirect_stderr=False,
+    def compose(self) -> ComposeResult:
+        yield Static(_header(self.ctx), id="header")
+        with Horizontal(id="body"):
+            with Vertical(id="left"):
+                yield Static(_current_task_panel(self.ctx), id="current_task")
+                yield Static(_queue_table(self.ctx), id="queue")
+            yield Static(_topics_panel(self.ctx), id="right")
+        input_widget = Input(
+            placeholder="type or wait for paste — Enter submits, Esc clears",
+            id="voice_input",
         )
-        self._live.__enter__()
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
+        if not self.local_stt:
+            input_widget.add_class("hidden")
+        yield input_widget
+        yield Static(_keymap_panel(self.ctx), id="keymap")
+        yield Static(_producers_panel(self.supervisor), id="producers")
 
-    def stop(self) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-            self._thread = None
-        if self._live is not None:
-            try:
-                self._live.__exit__(None, None, None)
-            except Exception:
-                logger.exception("Live exit failed")
-            self._live = None
+    def on_mount(self) -> None:
+        self.set_interval(1.0 / _REFRESH_HZ, self._refresh_panels)
 
-    def _run(self) -> None:
-        interval = 1.0 / max(0.5, self._refresh_hz)
-        while not self._stop.is_set():
-            try:
-                self._live.update(render(self._ctx, self._supervisor))
-            except Exception:
-                logger.exception("Dashboard render failed")
-            if self._stop.wait(interval):
-                return
+    def _refresh_panels(self) -> None:
+        try:
+            self.query_one("#header", Static).update(_header(self.ctx))
+            self.query_one("#current_task", Static).update(_current_task_panel(self.ctx))
+            self.query_one("#queue", Static).update(_queue_table(self.ctx))
+            self.query_one("#right", Static).update(_topics_panel(self.ctx))
+            self.query_one("#keymap", Static).update(_keymap_panel(self.ctx))
+            self.query_one("#producers", Static).update(_producers_panel(self.supervisor))
+        except Exception:
+            logger.exception("TUI refresh failed")
+
+    # --- macropad bridge --------------------------------------------------
+
+    def on_ptt_released(self, message: PttReleased) -> None:
+        """Wipe the input, arm autosubmit for the upcoming Superwhisper paste."""
+        if not self.local_stt:
+            return
+        self._pending_skill_mode = message.skill_mode
+        try:
+            input_widget = self.query_one("#voice_input", Input)
+        except Exception:
+            return
+        input_widget.value = ""
+        input_widget.focus()
+        self._last_input_change = time.monotonic()
+        self._autosubmit_deadline = self._last_input_change + _INPUT_AUTOSUBMIT_TIMEOUT_S
+        self._cancel_autosubmit_timer()
+        # Poll on a short interval so we can detect the quiet-pause after
+        # the paste burst lands. The handler self-cancels when it submits
+        # or hits the timeout.
+        self._autosubmit_handle = self.set_interval(0.1, self._check_autosubmit)
+        logger.info("on_ptt_released — autosubmit armed (skill_mode=%s)", message.skill_mode)
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id != "voice_input":
+            return
+        self._last_input_change = time.monotonic()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id != "voice_input":
+            return
+        text = event.value.strip()
+        event.input.value = ""
+        self._cancel_autosubmit_timer()
+        if not text:
+            self._pending_skill_mode = False
+            return
+        self._dispatch_transcript(text)
+
+    def _check_autosubmit(self) -> None:
+        now = time.monotonic()
+        try:
+            input_widget = self.query_one("#voice_input", Input)
+        except Exception:
+            self._cancel_autosubmit_timer()
+            return
+        value = input_widget.value.strip()
+        # Time out so a stale PTT-release flag can't latch onto an unrelated
+        # later keystroke. Drop the pending skill_mode too.
+        if now > self._autosubmit_deadline:
+            self._cancel_autosubmit_timer()
+            self._pending_skill_mode = False
+            return
+        if value and (now - self._last_input_change) > _INPUT_QUIET_S:
+            input_widget.value = ""
+            self._cancel_autosubmit_timer()
+            self._dispatch_transcript(value)
+
+    def _cancel_autosubmit_timer(self) -> None:
+        if self._autosubmit_handle is not None:
+            self._autosubmit_handle.stop()
+            self._autosubmit_handle = None
+
+    def _dispatch_transcript(self, text: str) -> None:
+        skill = self._pending_skill_mode
+        self._pending_skill_mode = False
+        # Local imports to keep tui.py importable in tests that stub
+        # the dispatch module — and to keep the loop happy if Textual
+        # ever decides to import tui before dispatch wires up.
+        from code_trip2.dispatch import handle_skill, handle_voice
+
+        logger.info("submit transcript (skill_mode=%s): %s", skill, text)
+        if skill:
+            asyncio.create_task(handle_skill(self.ctx, text))
+        else:
+            asyncio.create_task(handle_voice(self.ctx, text))
+
+    # --- thread-safe entry from the pynput listener -----------------------
+
+    def post_ptt_release_from_thread(self, skill_mode: bool) -> None:
+        """Schedule a :class:`PttReleased` post from the macropad's thread."""
+        try:
+            self.call_from_thread(self.post_message, PttReleased(skill_mode))
+        except Exception:
+            logger.exception("Failed to post PttReleased from thread")
