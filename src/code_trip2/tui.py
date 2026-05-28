@@ -406,6 +406,11 @@ class CodeTripApp(App):
 
     BINDINGS = [
         Binding("ctrl+c", "quit", "Quit", priority=True),
+        # Arrow nav through the queue. ``priority=True`` so they fire
+        # even when the Input widget has focus (Input doesn't use up/
+        # down itself, so we're not stealing a real edit affordance).
+        Binding("up", "queue_prev", "Prev task", priority=True),
+        Binding("down", "queue_next", "Next task", priority=True),
     ]
 
     def __init__(
@@ -524,6 +529,26 @@ class CodeTripApp(App):
             asyncio.create_task(handle_skill(self.ctx, text))
         else:
             asyncio.create_task(handle_voice(self.ctx, text))
+
+    # --- queue navigation actions -----------------------------------------
+
+    async def action_queue_prev(self) -> None:
+        await self._queue_arrow(-1)
+
+    async def action_queue_next(self) -> None:
+        await self._queue_arrow(+1)
+
+    async def _queue_arrow(self, direction: int) -> None:
+        """Forward up/down to dispatch.queue_navigate, queue-mode only.
+
+        Local import mirrors :meth:`_dispatch_transcript` — keeps tui
+        importable in tests that stub the dispatch module.
+        """
+        from code_trip2 import dispatch
+
+        if self.ctx.app_mode != dispatch.MODE_QUEUE:
+            return
+        await dispatch.queue_navigate(self.ctx, direction=direction)
 
     # --- thread-safe entry from the pynput listener -----------------------
 

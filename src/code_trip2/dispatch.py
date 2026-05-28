@@ -584,6 +584,47 @@ async def queue_no_tap(ctx: "Context") -> None:
     await _skip_current(ctx)
 
 
+async def queue_navigate(ctx: "Context", *, direction: int) -> None:
+    """Move the active-task cursor through the ranked queue.
+
+    ``direction`` is ``-1`` (up / previous) or ``+1`` (down / next).
+    Demotes any currently-active task back to ``pending`` *without*
+    deferring it — the user is browsing, not skipping. Then activates
+    the neighbor at ``cur_idx + direction`` in the re-ranked order.
+    Clamps at the boundaries instead of wrapping.
+
+    Doesn't touch ``recent_topics`` — arrow navigation is exploratory,
+    so it shouldn't bias the scheduler the way an explicit "next" or
+    a skill engagement does.
+    """
+    modes.stop_playback(ctx)
+    cur = ctx.current_task
+    # Demote first so the snapshot we rank against includes the
+    # previously-active task at its rightful position.
+    if cur is not None and cur.state == tasks_mod.STATE_ACTIVE:
+        ctx.queue.set_state(cur.id, tasks_mod.STATE_PENDING)
+    ranked = ctx.queue.ranked(now=time.time(), recent=ctx.recent_topics)
+    if not ranked:
+        ctx.current_task = None
+        await _speak(ctx, "Queue is empty.")
+        return
+    pending_ids = [t.id for t, _ in ranked]
+    if cur is None:
+        new_idx = 0 if direction > 0 else len(pending_ids) - 1
+    else:
+        try:
+            cur_idx = pending_ids.index(cur.id)
+        except ValueError:
+            cur_idx = 0
+        new_idx = max(0, min(len(pending_ids) - 1, cur_idx + direction))
+    new_task = ctx.queue.get(pending_ids[new_idx])
+    if new_task is None:
+        return
+    ctx.queue.mark_active(new_task.id)
+    ctx.current_task = new_task
+    _announce_headline(ctx, new_task)
+
+
 async def dismiss_current_task(ctx: "Context") -> None:
     """ACT+NO chord in queue mode: mark current task done.
 

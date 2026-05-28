@@ -207,6 +207,107 @@ async def test_dismiss_current_task_with_nothing_active_speaks():
     ctx.tts.speak.assert_called_with("Nothing active.")
 
 
+# --- queue_navigate (TUI arrow keys) --------------------------------------
+
+
+def _seed_three(ctx) -> tuple[Task, Task, Task]:
+    """Add three pending tasks with descending priority so the ranked
+    order is deterministic: oldest first wins on the age tiebreaker."""
+    import time as _time
+    base = _time.time() - 100
+    a = ctx.queue.add(Task(kind="note", topic="a", headline="A", created_at=base))
+    b = ctx.queue.add(Task(kind="note", topic="b", headline="B", created_at=base + 10))
+    c = ctx.queue.add(Task(kind="note", topic="c", headline="C", created_at=base + 20))
+    return a, b, c
+
+
+@pytest.mark.asyncio
+async def test_queue_navigate_down_from_idle_activates_top_task():
+    ctx = _make_ctx(app_mode="queue")
+    a, _b, _c = _seed_three(ctx)
+    with patch.object(modes, "speak_chunked"):
+        await dispatch.queue_navigate(ctx, direction=+1)
+    assert ctx.current_task is a
+    assert ctx.queue.get(a.id).state == "active"
+
+
+@pytest.mark.asyncio
+async def test_queue_navigate_up_from_idle_activates_bottom_task():
+    ctx = _make_ctx(app_mode="queue")
+    _a, _b, c = _seed_three(ctx)
+    with patch.object(modes, "speak_chunked"):
+        await dispatch.queue_navigate(ctx, direction=-1)
+    assert ctx.current_task is c
+
+
+@pytest.mark.asyncio
+async def test_queue_navigate_down_demotes_current_and_activates_next():
+    ctx = _make_ctx(app_mode="queue")
+    a, b, _c = _seed_three(ctx)
+    ctx.current_task = a
+    ctx.queue.mark_active(a.id)
+    with patch.object(modes, "speak_chunked"):
+        await dispatch.queue_navigate(ctx, direction=+1)
+    assert ctx.current_task is b
+    assert ctx.queue.get(a.id).state == "pending"
+    # No ready_at bump — browsing isn't skipping.
+    assert ctx.queue.get(a.id).ready_at == 0
+
+
+@pytest.mark.asyncio
+async def test_queue_navigate_up_walks_backward():
+    ctx = _make_ctx(app_mode="queue")
+    a, b, _c = _seed_three(ctx)
+    ctx.current_task = b
+    ctx.queue.mark_active(b.id)
+    with patch.object(modes, "speak_chunked"):
+        await dispatch.queue_navigate(ctx, direction=-1)
+    assert ctx.current_task is a
+
+
+@pytest.mark.asyncio
+async def test_queue_navigate_clamps_at_end():
+    ctx = _make_ctx(app_mode="queue")
+    _a, _b, c = _seed_three(ctx)
+    ctx.current_task = c
+    ctx.queue.mark_active(c.id)
+    with patch.object(modes, "speak_chunked"):
+        await dispatch.queue_navigate(ctx, direction=+1)
+    assert ctx.current_task is c  # clamped, not wrapped
+
+
+@pytest.mark.asyncio
+async def test_queue_navigate_clamps_at_start():
+    ctx = _make_ctx(app_mode="queue")
+    a, _b, _c = _seed_three(ctx)
+    ctx.current_task = a
+    ctx.queue.mark_active(a.id)
+    with patch.object(modes, "speak_chunked"):
+        await dispatch.queue_navigate(ctx, direction=-1)
+    assert ctx.current_task is a
+
+
+@pytest.mark.asyncio
+async def test_queue_navigate_on_empty_queue_speaks_empty():
+    ctx = _make_ctx(app_mode="queue")
+    await dispatch.queue_navigate(ctx, direction=+1)
+    ctx.tts.speak.assert_called_with("Queue is empty.")
+    assert ctx.current_task is None
+
+
+@pytest.mark.asyncio
+async def test_queue_navigate_does_not_touch_recent_topics():
+    """Arrow browsing is exploratory — it shouldn't bias the scheduler
+    the way an explicit voice ``next`` or skill engagement does."""
+    ctx = _make_ctx(app_mode="queue")
+    _a, _b, _c = _seed_three(ctx)
+    before = ctx.recent_topics.as_list()
+    with patch.object(modes, "speak_chunked"):
+        await dispatch.queue_navigate(ctx, direction=+1)
+        await dispatch.queue_navigate(ctx, direction=+1)
+    assert ctx.recent_topics.as_list() == before
+
+
 # --- handle_skill (ACT+PTT) ------------------------------------------------
 
 
