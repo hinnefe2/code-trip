@@ -846,6 +846,66 @@ async def test_chord_act_yes_open_subprocess_failure_speaks_error(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_chord_act_yes_slack_uses_osascript_open_location(monkeypatch):
+    """ACT+YES on a slack_msg with a permalink deep-links via osascript.
+
+    ``open -a Slack <url>`` hands the URL to Slack as a document Apple
+    Event and the app just comes to front; ``osascript ... open
+    location`` sends a GURL event that triggers Slack's URL handler so
+    the message actually opens in context.
+    """
+    from code_trip2.tasks import Task
+    opened = _patch_open_subprocess(monkeypatch)
+    monkeypatch.setattr(chords.earcon, "completion", lambda: None)
+    ctx = _ctx()
+    ctx.app_mode = "queue"
+    permalink = (
+        "https://picnichealth.slack.com/archives/C09019R7RK2/p1779911327920139"
+        "?thread_ts=1779906646.864539&cid=C09019R7RK2"
+    )
+    ctx.current_task = Task(
+        kind="slack_msg",
+        topic="team-ai",
+        headline="alice: ping",
+        source={"url": permalink, "channel_id": "C09019R7RK2"},
+    )
+
+    await chords.handle_chord(ctx, "act+yes")
+
+    assert len(opened) == 1
+    argv = opened[0]
+    assert argv[0] == "osascript"
+    # AppleScript is passed via ``-e`` lines and the URL is positional
+    # so there's no string-interpolation hazard with ``&`` / quotes in
+    # the permalink.
+    assert argv[-1] == permalink
+    assert any("open location" in arg for arg in argv)
+    assert any("Slack" in arg for arg in argv)
+
+
+@pytest.mark.asyncio
+async def test_chord_act_yes_linear_goes_to_chrome(monkeypatch):
+    """ACT+YES on a Linear ticket opens its URL in Chrome (regression
+    guard — only slack_msg should use osascript)."""
+    from code_trip2.tasks import Task
+    opened = _patch_open_subprocess(monkeypatch)
+    monkeypatch.setattr(chords.earcon, "completion", lambda: None)
+    ctx = _ctx()
+    ctx.app_mode = "queue"
+    url = "https://linear.app/picnichealth/issue/AI-7/help"
+    ctx.current_task = Task(
+        kind="linear_issue",
+        topic="ai-7",
+        headline="AI-7: help",
+        source={"identifier": "AI-7", "url": url},
+    )
+
+    await chords.handle_chord(ctx, "act+yes")
+
+    assert opened == [["open", "-a", chords._CHROME_APP, url]]
+
+
+@pytest.mark.asyncio
 async def test_tap_unknown_is_noop(monkeypatch):
     ctx = _ctx()
     sent: list[KeyStroke] = []

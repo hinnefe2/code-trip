@@ -120,17 +120,6 @@ async def handle_chord(ctx: "Context", name: str) -> None:
 
 
 _GMAIL_THREAD_URL = "https://mail.google.com/mail/u/0/#all/{thread_id}"
-_SLACK_APP = "Slack"
-
-# Per-kind app target for ACT+YES open-in-app. Slack-hosted permalinks
-# (https://workspace.slack.com/archives/…) get intercepted by the Slack
-# desktop app when handed to ``open -a Slack``, jumping straight to
-# the message in-context. Email + Linear stay in the browser.
-_TASK_OPEN_APPS = {
-    "email_msg": _CHROME_APP,
-    "linear_issue": _CHROME_APP,
-    "slack_msg": _SLACK_APP,
-}
 
 
 def _task_browser_url(task) -> str | None:
@@ -151,14 +140,40 @@ def _task_browser_url(task) -> str | None:
     return None
 
 
+def _open_url_argv(task, url: str) -> list[str]:
+    """Build the subprocess argv that opens ``url`` for ``task``'s kind.
+
+    Slack gets an ``osascript`` ``open location`` invocation because
+    ``open -a Slack <url>`` hands the URL to Slack as a document Apple
+    Event — Slack just brings itself to front without navigating to
+    the message. ``open location`` sends a ``GURL`` event, which is
+    what Slack's URL handler actually listens for, so the permalink
+    deep-links to the specific message in context. The URL goes
+    through AppleScript's ``argv`` instead of being interpolated into
+    the script so there's no quoting / escape hazard.
+
+    Everything else opens in Chrome (Gmail thread URLs, Linear issue
+    URLs).
+    """
+    if task.kind == "slack_msg":
+        return [
+            "osascript",
+            "-e", "on run argv",
+            "-e", 'tell application "Slack" to open location item 1 of argv',
+            "-e", "end run",
+            url,
+        ]
+    return ["open", "-a", _CHROME_APP, url]
+
+
 async def _open_current_task_in_browser(ctx: "Context") -> None:
     """Open the active task's source URL in its natural app.
 
-    Resolves the URL via :func:`_task_browser_url` and looks up the
-    target app in :data:`_TASK_OPEN_APPS` (Slack permalinks go to the
-    Slack desktop app; everything else goes to Chrome). Kinds without
-    a natural URL fall through with a spoken hint so the chord doesn't
-    silently appear broken.
+    Resolves the URL via :func:`_task_browser_url` and dispatches the
+    open command via :func:`_open_url_argv` (Slack permalinks → Slack
+    desktop app via AppleScript; everything else → Chrome). Kinds
+    without a natural URL fall through with a spoken hint so the
+    chord doesn't silently appear broken.
     """
     task = ctx.current_task
     if task is None:
@@ -168,19 +183,19 @@ async def _open_current_task_in_browser(ctx: "Context") -> None:
     if url is None:
         await _speak_error(ctx, f"Can't open {task.kind}.")
         return
-    app = _TASK_OPEN_APPS.get(task.kind, _CHROME_APP)
+    argv = _open_url_argv(task, url)
     try:
         proc = await asyncio.create_subprocess_exec(
-            "open", "-a", app, url,
+            *argv,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
         _, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=5.0)
         if proc.returncode != 0:
             err = (stderr_b or b"").decode(errors="replace").strip()
-            raise RuntimeError(err or f"open exited {proc.returncode}")
+            raise RuntimeError(err or f"{argv[0]} exited {proc.returncode}")
     except (asyncio.TimeoutError, OSError, RuntimeError) as exc:
-        await _speak_error(ctx, f"Could not open in {app}: {exc}")
+        await _speak_error(ctx, f"Could not open task: {exc}")
         return
     try:
         earcon.completion()
