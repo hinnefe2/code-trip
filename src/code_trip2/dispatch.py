@@ -514,11 +514,22 @@ async def _respond_slack(ctx: "Context", task: Task, transcript: str) -> None:
 
 
 async def queue_yes_tap(ctx: "Context") -> None:
-    """YES in queue mode: engage with current task or pull next."""
-    if ctx.current_task is None:
-        await _announce_next(ctx)
+    """YES in queue mode: submit whatever's in the Input widget.
+
+    Acts as the Enter key for the TUI's Input — lets the user paste a
+    PTT transcript, edit it, and submit on their schedule. If the
+    Input is empty (or there is no TUI), this is a no-op: auto-
+    advance takes care of the "I'm ready for the next task" case, and
+    expanding the current task's body is a voice-only command ("go
+    on" / "tell me more" / "expand").
+    """
+    submit = ctx.submit_input
+    if submit is None:
         return
-    await _announce_body(ctx)
+    try:
+        submit()
+    except Exception:
+        logger.exception("queue_yes_tap: submit_input failed")
 
 
 async def queue_no_tap(ctx: "Context") -> None:

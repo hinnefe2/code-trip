@@ -248,6 +248,11 @@ async def main_async(config: Config, *, tui: bool = False) -> None:
     app: CodeTripApp | None = None
     if tui:
         app = CodeTripApp(ctx, supervisor=supervisor, local_stt=local_stt)
+        # Wire just the callable dispatch needs — submit-the-Input. The
+        # macropad YES tap in queue mode calls this via Context. Passing
+        # only the bound method avoids exposing the whole app surface
+        # to dispatch and keeps the import direction one-way.
+        ctx.submit_input = app.submit_input
 
     # Bridge from threaded callbacks (macropad's pynput listener) onto the
     # asyncio loop. The done callback surfaces task exceptions to the log

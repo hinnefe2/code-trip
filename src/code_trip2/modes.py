@@ -26,6 +26,7 @@ import logging
 import re
 from collections import deque
 from dataclasses import dataclass, field
+from typing import Callable
 
 from code_trip2 import earcon, remote, window
 from code_trip2.config import Config
@@ -99,6 +100,12 @@ class Context:
     autohandle_log: "deque[AutohandleLogEntry]" = field(
         default_factory=lambda: deque(maxlen=20)
     )
+    # Submits whatever's in the TUI Input widget, as if Enter were
+    # pressed. Returns True if there was text to submit. None when no
+    # TUI is attached (headless OpenAI-STT mode). Typed by shape
+    # rather than by which class implements it — keeps the type-level
+    # dependency one-way and avoids importing tui.py here.
+    submit_input: Callable[[], bool] | None = None
 
     def __post_init__(self) -> None:
         if not self.active_window:

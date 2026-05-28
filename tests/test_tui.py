@@ -154,7 +154,7 @@ def test_keymap_queue_mode_shows_queue_relevant_keys():
     ctx = _make_ctx(app_mode="queue")
     out = _render(tui._keymap_panel(ctx))
     assert "Macropad" in out
-    assert "accept" in out or "expand" in out
+    assert "submit" in out                 # YES = Enter / submit Input
     assert "skip task" in out
     assert "→ focused" in out
     assert "stop audio" in out
@@ -510,3 +510,91 @@ async def test_app_ptt_release_ignored_when_not_local_stt(monkeypatch):
         # No flag should have been set; verify the input widget wasn't
         # focused/cleared and pending state stays false.
         assert app._pending_skill_mode is False
+
+
+# --- submit_input (macropad YES tap path) ---------------------------------
+
+
+@pytest.mark.asyncio
+async def test_submit_input_dispatches_current_value(monkeypatch):
+    """submit_input() submits whatever's in the Input as if Enter was hit."""
+    ctx = _make_ctx()
+    called: list[tuple[str, str]] = []
+
+    async def fake_handle_voice(c, t):
+        called.append(("voice", t))
+
+    monkeypatch.setattr("code_trip2.dispatch.handle_voice", fake_handle_voice)
+
+    app = tui.CodeTripApp(ctx, supervisor=None, local_stt=True)
+    async with app.run_test() as pilot:
+        input_widget = app.query_one("#voice_input", tui.Input)
+        input_widget.value = "what's next"
+        assert app.submit_input() is True
+        await pilot.pause()
+        await pilot.pause()
+        assert input_widget.value == ""
+    assert called == [("voice", "what's next")]
+
+
+@pytest.mark.asyncio
+async def test_submit_input_empty_is_noop(monkeypatch):
+    """No text in Input → submit_input returns False, no dispatch."""
+    ctx = _make_ctx()
+    called: list[tuple[str, str]] = []
+
+    async def fake_handle_voice(c, t):
+        called.append(("voice", t))
+
+    monkeypatch.setattr("code_trip2.dispatch.handle_voice", fake_handle_voice)
+
+    app = tui.CodeTripApp(ctx, supervisor=None, local_stt=True)
+    async with app.run_test() as pilot:
+        assert app.submit_input() is False
+        await pilot.pause()
+    assert called == []
+
+
+@pytest.mark.asyncio
+async def test_submit_input_after_ptt_uses_skill_mode(monkeypatch):
+    """A PTT release primes skill mode; submit_input dispatches via skill."""
+    ctx = _make_ctx()
+    called: list[tuple[str, str]] = []
+
+    async def fake_handle_voice(c, t):
+        called.append(("voice", t))
+
+    async def fake_handle_skill(c, t):
+        called.append(("skill", t))
+
+    monkeypatch.setattr("code_trip2.dispatch.handle_voice", fake_handle_voice)
+    monkeypatch.setattr("code_trip2.dispatch.handle_skill", fake_handle_skill)
+
+    app = tui.CodeTripApp(ctx, supervisor=None, local_stt=True)
+    async with app.run_test() as pilot:
+        app.post_message(tui.PttReleased(skill_mode=True))
+        await pilot.pause()
+        input_widget = app.query_one("#voice_input", tui.Input)
+        input_widget.value = "archive this email"
+        assert app.submit_input() is True
+        await pilot.pause()
+        await pilot.pause()
+    assert called == [("skill", "archive this email")]
+
+
+@pytest.mark.asyncio
+async def test_ptt_release_does_not_arm_autosubmit():
+    """After PTT release the Input should be focused but text should sit
+    there indefinitely — no timer auto-submits it on a quiet pause."""
+    ctx = _make_ctx()
+    app = tui.CodeTripApp(ctx, supervisor=None, local_stt=True)
+    async with app.run_test() as pilot:
+        app.post_message(tui.PttReleased(skill_mode=False))
+        await pilot.pause()
+        input_widget = app.query_one("#voice_input", tui.Input)
+        input_widget.value = "would have auto-submitted before"
+        # Let several event-loop turns elapse — well past the old
+        # 0.4 s quiet-pause threshold.
+        for _ in range(20):
+            await pilot.pause()
+        assert input_widget.value == "would have auto-submitted before"

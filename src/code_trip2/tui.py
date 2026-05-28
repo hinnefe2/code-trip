@@ -212,7 +212,7 @@ def _keymap_panel(ctx: "Context") -> Panel:
     if ctx.app_mode == "queue":
         bindings: dict[tuple[str | None, str], str] = {
             (None, "TALK"): "hold to talk",
-            (None, "YES"): "accept / expand",
+            (None, "YES"): "submit (Enter)",
             (None, "NO"): "skip task",
             (None, "NAV"): "→ focused",
             (None, "ACT"): "stop audio",
@@ -364,17 +364,6 @@ class PttReleased(Message):
 # --- the app --------------------------------------------------------------
 
 
-# Auto-submit window after the last input change with a PTT release pending.
-# Long enough for a burst-paste (Superwhisper) to finish; short enough not
-# to feel like a delay before the skill kicks off. Matches the value used
-# by the pre-Textual stdin reader.
-_INPUT_QUIET_S = 0.4
-
-# Maximum time to wait for a paste to arrive after PTT release before the
-# autosubmit timer gives up. Prevents a leftover "pending skill mode" flag
-# from consuming the next unrelated keystroke.
-_INPUT_AUTOSUBMIT_TIMEOUT_S = 5.0
-
 # Periodic refresh of the dynamic panels (current task, queue, topics,
 # producers). The orchestrator pushes via message in a few spots but most
 # state mutates without a TUI hook; a poll at 2 Hz keeps it close enough.
@@ -429,10 +418,11 @@ class CodeTripApp(App):
         self.ctx = ctx
         self.supervisor = supervisor
         self.local_stt = local_stt
+        # Cleared on each PTT release; submit_input / on_input_submitted
+        # read it to decide between handle_voice and handle_skill. Stays
+        # set across edits so the user can tweak the pasted transcript
+        # before submitting.
         self._pending_skill_mode = False
-        self._last_input_change = 0.0
-        self._autosubmit_handle = None
-        self._autosubmit_deadline = 0.0
 
     def compose(self) -> ComposeResult:
         yield Static(_header(self.ctx), id="header")
@@ -470,7 +460,13 @@ class CodeTripApp(App):
     # --- macropad bridge --------------------------------------------------
 
     def on_ptt_released(self, message: PttReleased) -> None:
-        """Wipe the input, arm autosubmit for the upcoming Superwhisper paste."""
+        """Wipe + focus the Input so the pasted transcript lands cleanly.
+
+        Auto-submit is intentionally absent — the user wants to read /
+        edit / approve the pasted transcript before it dispatches. They
+        submit it manually with Enter (typed) or the macropad YES key
+        (which calls :meth:`submit_input`).
+        """
         if not self.local_stt:
             return
         self._pending_skill_mode = message.skill_mode
@@ -480,54 +476,39 @@ class CodeTripApp(App):
             return
         input_widget.value = ""
         input_widget.focus()
-        self._last_input_change = time.monotonic()
-        self._autosubmit_deadline = self._last_input_change + _INPUT_AUTOSUBMIT_TIMEOUT_S
-        self._cancel_autosubmit_timer()
-        # Poll on a short interval so we can detect the quiet-pause after
-        # the paste burst lands. The handler self-cancels when it submits
-        # or hits the timeout.
-        self._autosubmit_handle = self.set_interval(0.1, self._check_autosubmit)
-        logger.info("on_ptt_released — autosubmit armed (skill_mode=%s)", message.skill_mode)
-
-    def on_input_changed(self, event: Input.Changed) -> None:
-        if event.input.id != "voice_input":
-            return
-        self._last_input_change = time.monotonic()
+        logger.info(
+            "on_ptt_released — input cleared/focused (skill_mode=%s)",
+            message.skill_mode,
+        )
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id != "voice_input":
             return
         text = event.value.strip()
         event.input.value = ""
-        self._cancel_autosubmit_timer()
         if not text:
             self._pending_skill_mode = False
             return
         self._dispatch_transcript(text)
 
-    def _check_autosubmit(self) -> None:
-        now = time.monotonic()
+    def submit_input(self) -> bool:
+        """Submit the Input widget's current value as if Enter was pressed.
+
+        Returns ``True`` if there was text to submit (so the caller can
+        decide whether to fall back to another action), ``False`` when
+        the Input was empty / missing. Called by the macropad YES tap
+        in queue mode via ``dispatch.queue_yes_tap``.
+        """
         try:
             input_widget = self.query_one("#voice_input", Input)
         except Exception:
-            self._cancel_autosubmit_timer()
-            return
-        value = input_widget.value.strip()
-        # Time out so a stale PTT-release flag can't latch onto an unrelated
-        # later keystroke. Drop the pending skill_mode too.
-        if now > self._autosubmit_deadline:
-            self._cancel_autosubmit_timer()
-            self._pending_skill_mode = False
-            return
-        if value and (now - self._last_input_change) > _INPUT_QUIET_S:
-            input_widget.value = ""
-            self._cancel_autosubmit_timer()
-            self._dispatch_transcript(value)
-
-    def _cancel_autosubmit_timer(self) -> None:
-        if self._autosubmit_handle is not None:
-            self._autosubmit_handle.stop()
-            self._autosubmit_handle = None
+            return False
+        text = (input_widget.value or "").strip()
+        if not text:
+            return False
+        input_widget.value = ""
+        self._dispatch_transcript(text)
+        return True
 
     def _dispatch_transcript(self, text: str) -> None:
         skill = self._pending_skill_mode

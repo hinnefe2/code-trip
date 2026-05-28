@@ -141,22 +141,30 @@ async def test_queue_voice_add_manual_creates_note_task():
 
 
 @pytest.mark.asyncio
-async def test_queue_yes_tap_with_no_task_pulls_next():
+async def test_queue_yes_tap_calls_submit_input():
+    """YES in queue mode invokes ctx.submit_input."""
     ctx = _make_ctx(app_mode="queue")
-    t = ctx.queue.add(Task(kind="note", headline="hi"))
-    with patch.object(modes, "speak_chunked"):
-        await dispatch.queue_yes_tap(ctx)
-    assert ctx.current_task is t
+    submit = MagicMock(return_value=True)
+    ctx.submit_input = submit
+    await dispatch.queue_yes_tap(ctx)
+    submit.assert_called_once_with()
 
 
 @pytest.mark.asyncio
-async def test_queue_yes_tap_with_active_task_expands_body():
+async def test_queue_yes_tap_without_submit_input_is_noop():
+    """No TUI (e.g. headless OpenAI-STT mode) — YES tap is a no-op."""
     ctx = _make_ctx(app_mode="queue")
-    t = ctx.queue.add(Task(kind="note", headline="hi", body="more details here"))
-    ctx.current_task = t
-    with patch.object(modes, "speak_chunked") as mocked:
-        await dispatch.queue_yes_tap(ctx)
-    mocked.assert_called_with(ctx, "more details here")
+    ctx.submit_input = None
+    await dispatch.queue_yes_tap(ctx)  # no raise
+
+
+@pytest.mark.asyncio
+async def test_queue_yes_tap_swallows_submit_exceptions():
+    """A submit_input that raises shouldn't crash the chord handler."""
+    ctx = _make_ctx(app_mode="queue")
+    submit = MagicMock(side_effect=RuntimeError("widget gone"))
+    ctx.submit_input = submit
+    await dispatch.queue_yes_tap(ctx)  # no raise
 
 
 @pytest.mark.asyncio
