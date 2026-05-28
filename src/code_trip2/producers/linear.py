@@ -101,29 +101,21 @@ class LinearProducer:
 
     async def _poll_once(self) -> None:
         wide_poll = self._first_poll
-        args: dict = {
-            "assignee": "me",
-            "limit": int(self._config.linear_max_results),
-            "includeArchived": False,
-        }
-        if not wide_poll:
-            last = self._state.last_updated_at()
-            if last:
-                args["updatedAt"] = last
+        allowed = frozenset(self._config.linear_state_types)
 
         self.is_polling = True
         try:
-            result = await self._mcp.call_tool("list_issues", args)
-        except ClaudeMCPError as exc:
-            logger.warning("LinearProducer: list call failed: %s", exc)
-            # Don't burn the first-poll wide window on a transient
-            # failure — retry on the next tick.
-            return
+            if wide_poll:
+                issues = await self._wide_pull(allowed)
+            else:
+                issues = await self._incremental_pull()
         finally:
             self.is_polling = False
-
-        issues = self._extract_issues(result)
-        allowed = frozenset(self._config.linear_state_types)
+        if issues is None:
+            # Transient MCP failure already logged inside the pull
+            # helper. Don't burn the first-poll wide window — retry
+            # next tick.
+            return
         emitted = 0
         skipped = 0
         max_ts_seen = self._state.last_updated_at() or ""
@@ -164,6 +156,64 @@ class LinearProducer:
 
         if len(self._recent_keys) > 500:
             self._recent_keys = set(sorted(self._recent_keys)[-250:])
+
+    async def _wide_pull(self, allowed: frozenset[str]) -> list[dict] | None:
+        """Initial sync: one MCP call per state in the allow-list.
+
+        Pushing the state filter server-side keeps each response small
+        (only matching issues come back) — vital because ``list_issues``
+        defaults to ``orderBy: updatedAt`` and an unfiltered call gets
+        dominated by recently-completed work, which both bloats the
+        response past ``claude --print``'s per-tool token cap and
+        pages active issues off the end.
+
+        Failures on a single state are logged-and-skipped: the others
+        still populate.
+        """
+        out: list[dict] = []
+        any_call_succeeded = False
+        for state_type in allowed:
+            args = {
+                "assignee": "me",
+                "state": state_type,
+                "limit": int(self._config.linear_max_results),
+                "includeArchived": False,
+            }
+            try:
+                result = await self._mcp.call_tool("list_issues", args)
+            except ClaudeMCPError as exc:
+                logger.warning(
+                    "LinearProducer: state=%s call failed: %s", state_type, exc,
+                )
+                continue
+            any_call_succeeded = True
+            out.extend(self._extract_issues(result))
+        if not any_call_succeeded:
+            return None
+        return out
+
+    async def _incremental_pull(self) -> list[dict] | None:
+        """Single MCP call with ``updatedAt`` floor.
+
+        Response size is bounded by how much changed since the cursor
+        — small in the common case. No server-side state filter; the
+        client-side allow-list weeds out completions / cancellations
+        that happen during the window.
+        """
+        args: dict = {
+            "assignee": "me",
+            "limit": int(self._config.linear_max_results),
+            "includeArchived": False,
+        }
+        last = self._state.last_updated_at()
+        if last:
+            args["updatedAt"] = last
+        try:
+            result = await self._mcp.call_tool("list_issues", args)
+        except ClaudeMCPError as exc:
+            logger.warning("LinearProducer: incremental call failed: %s", exc)
+            return None
+        return self._extract_issues(result)
 
     # ---- response shape -------------------------------------------------
 

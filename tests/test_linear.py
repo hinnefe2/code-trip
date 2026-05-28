@@ -79,29 +79,68 @@ async def test_producer_skips_when_mcp_unavailable(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_producer_wide_first_poll_omits_updated_at(tmp_path: Path):
-    """First poll of a session does a fresh pull with no ``updatedAt`` floor."""
-    p, _q, mcp, state = _producer(tmp_path)
+async def test_producer_wide_first_poll_calls_per_state_type(tmp_path: Path):
+    """Wide poll pushes the state filter server-side — one call per allowed
+    state, no ``updatedAt`` floor. Avoids the response bloat that would
+    otherwise come from unfiltered ``orderBy: updatedAt`` queries."""
+    p, _q, mcp, state = _producer(
+        tmp_path, state_types=("triage", "unstarted", "started"),
+    )
     state.set_last_updated_at("2026-05-01T00:00:00.000Z")  # would normally constrain
     mcp.call_tool.return_value = {"issues": []}
     await p._poll_once()
-    call = mcp.call_tool.call_args
-    assert call.args[0] == "list_issues"
-    args = call.args[1]
-    assert "updatedAt" not in args
-    assert args.get("assignee") == "me"
-    assert args.get("includeArchived") is False
+    assert mcp.call_tool.call_count == 3
+    states_called = sorted(c.args[1]["state"] for c in mcp.call_tool.call_args_list)
+    assert states_called == ["started", "triage", "unstarted"]
+    for c in mcp.call_tool.call_args_list:
+        assert c.args[0] == "list_issues"
+        args = c.args[1]
+        assert "updatedAt" not in args
+        assert args.get("assignee") == "me"
+        assert args.get("includeArchived") is False
 
 
 @pytest.mark.asyncio
-async def test_producer_incremental_poll_uses_updated_at(tmp_path: Path):
+async def test_producer_incremental_poll_single_call_with_updated_at(tmp_path: Path):
+    """Incremental poll is a single unfiltered call with the ``updatedAt``
+    cursor — the response window is small (only what changed since the
+    cursor) so we can afford to filter the few state mismatches client-side."""
     p, _q, mcp, state = _producer(tmp_path)
     state.set_last_updated_at("2026-05-28T10:00:00.000Z")
     p._first_poll = False  # simulate not-the-first-poll-of-the-session
     mcp.call_tool.return_value = {"issues": []}
     await p._poll_once()
+    assert mcp.call_tool.call_count == 1
     args = mcp.call_tool.call_args.args[1]
     assert args["updatedAt"] == "2026-05-28T10:00:00.000Z"
+    assert "state" not in args
+
+
+@pytest.mark.asyncio
+async def test_producer_wide_pull_keeps_running_when_one_state_fails(tmp_path: Path):
+    """A transient failure on one state doesn't void the whole wide poll;
+    the surviving states still populate."""
+    p, q, mcp, _state = _producer(
+        tmp_path, state_types=("unstarted", "started"),
+    )
+
+    async def fake_call(_tool, args):
+        if args["state"] == "unstarted":
+            raise ClaudeMCPError("network")
+        return {
+            "issues": [{
+                "id": "AI-7",
+                "title": "Active",
+                "statusType": "started",
+                "url": "u",
+                "updatedAt": "2026-05-28T10:00:00.000Z",
+            }]
+        }
+
+    mcp.call_tool.side_effect = fake_call
+    await p._poll_once()
+    [task] = q.all()
+    assert task.source["identifier"] == "AI-7"
 
 
 @pytest.mark.asyncio
@@ -115,7 +154,7 @@ async def test_producer_first_poll_flag_flips_after_one_call(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_producer_emits_task_from_structured_issues(tmp_path: Path):
-    p, q, mcp, state = _producer(tmp_path)
+    p, q, mcp, state = _producer(tmp_path, state_types=("started",))
     mcp.call_tool.return_value = {
         "issues": [
             {
@@ -146,8 +185,11 @@ async def test_producer_emits_task_from_structured_issues(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_producer_filters_out_disallowed_state_types(tmp_path: Path):
-    """statusType outside the allow-list never becomes a task."""
+    """statusType outside the allow-list never becomes a task. Belt-and-
+    suspenders for the incremental path, which doesn't push the state
+    filter server-side."""
     p, q, mcp, _state = _producer(tmp_path, state_types=("started",))
+    p._first_poll = False  # incremental path: no server-side state filter
     mcp.call_tool.return_value = {
         "issues": [
             {
@@ -183,6 +225,7 @@ async def test_producer_filters_out_disallowed_state_types(tmp_path: Path):
 async def test_producer_cursor_advances_past_filtered_issues(tmp_path: Path):
     """Filtered-out issues still bump the cursor so we don't keep re-pulling them."""
     p, _q, mcp, state = _producer(tmp_path, state_types=("started",))
+    p._first_poll = False  # incremental path: cursor advances even past filtered
     mcp.call_tool.return_value = {
         "issues": [
             {
@@ -201,7 +244,7 @@ async def test_producer_cursor_advances_past_filtered_issues(tmp_path: Path):
 @pytest.mark.asyncio
 async def test_producer_collapses_repeat_sightings_into_single_task(tmp_path: Path):
     """Seeing the same identifier on the next poll updates the existing task."""
-    p, q, mcp, _state = _producer(tmp_path)
+    p, q, mcp, _state = _producer(tmp_path, state_types=("started",))
     mcp.call_tool.return_value = {
         "issues": [
             {
@@ -238,7 +281,7 @@ async def test_producer_collapses_repeat_sightings_into_single_task(tmp_path: Pa
 
 @pytest.mark.asyncio
 async def test_producer_handles_empty_results(tmp_path: Path):
-    p, q, mcp, _state = _producer(tmp_path)
+    p, q, mcp, _state = _producer(tmp_path, state_types=("started",))
     mcp.call_tool.return_value = {"issues": []}
     await p._poll_once()
     assert q.all() == []
@@ -246,7 +289,7 @@ async def test_producer_handles_empty_results(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_producer_resilient_to_mcp_errors(tmp_path: Path):
-    p, q, mcp, _state = _producer(tmp_path)
+    p, q, mcp, _state = _producer(tmp_path, state_types=("started",))
     mcp.call_tool.side_effect = ClaudeMCPError("network")
     await p._poll_once()  # must not raise
     assert q.all() == []
@@ -257,7 +300,7 @@ async def test_producer_resilient_to_mcp_errors(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_producer_is_polling_true_while_call_in_flight(tmp_path: Path):
-    p, _q, mcp, _state = _producer(tmp_path)
+    p, _q, mcp, _state = _producer(tmp_path, state_types=("started",))
     observed: list[bool] = []
 
     async def slow_call(*_a, **_kw):
