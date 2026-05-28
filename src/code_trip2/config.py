@@ -67,9 +67,14 @@ class Config:
     # an action-needed view (excludes Promotions/Updates/Social/Forums tabs).
     email_search_query: str = "in:inbox category:primary -from:me is:unread"
     email_max_results: int = 20
-    # linear (MCP — server choice TBD, still stubbed)
-    linear_mcp_command: str = ""
-    linear_mcp_args: tuple[str, ...] = ()
+    # linear (via the claude.ai Linear MCP — auth piggy-backs on claude CLI)
+    linear_poll_interval: float = 180.0
+    # Issue ``statusType`` values eligible for the queue. Linear's enum
+    # is ``triage`` / ``backlog`` / ``unstarted`` / ``started`` /
+    # ``completed`` / ``canceled``; default is "anything actionable but
+    # not yet done."
+    linear_state_types: tuple[str, ...] = ("triage", "unstarted", "started")
+    linear_max_results: int = 50
     # autohandle: skill-driven silent handling of producer tasks. When
     # enabled, every task a producer emits is screened against the
     # auto-handle-eligible skills in ``.claude/skills/`` before it
@@ -179,10 +184,14 @@ def load_config(path: Path | str) -> Config:
         kw["email_max_results"] = int(email_cfg["max_results"])
 
     linear_cfg = data.get("linear", {})
-    if "mcp_command" in linear_cfg:
-        kw["linear_mcp_command"] = linear_cfg["mcp_command"]
-    if "mcp_args" in linear_cfg:
-        kw["linear_mcp_args"] = tuple(linear_cfg["mcp_args"])
+    if "poll_interval" in linear_cfg:
+        kw["linear_poll_interval"] = float(linear_cfg["poll_interval"])
+    if "state_types" in linear_cfg:
+        kw["linear_state_types"] = tuple(
+            str(s) for s in linear_cfg["state_types"]
+        )
+    if "max_results" in linear_cfg:
+        kw["linear_max_results"] = int(linear_cfg["max_results"])
 
     autohandle_cfg = data.get("autohandle", {})
     if "enabled" in autohandle_cfg:

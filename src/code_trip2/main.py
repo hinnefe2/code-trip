@@ -16,6 +16,7 @@ from code_trip2 import earcon
 from code_trip2.chords import handle_chord, handle_tap
 from code_trip2.config import Config, load_config
 from code_trip2.dispatch import QueueConsumer, handle_skill, handle_voice
+from code_trip2.linear_state import LinearState
 from code_trip2.macropad import Macropad, resolve_key
 from code_trip2.modes import Context, stop_playback
 from code_trip2.producers import ProducerSupervisor
@@ -94,21 +95,23 @@ async def main_async(config: Config, *, tui: bool = False) -> None:
     # Replay last 24h of queue events so deferred / snoozed work survives a
     # restart. Log records the replay-load so it shows up in offline analysis.
     replayed = queue_log.replay()
-    # Drop ``email_msg`` tasks from the replay — EmailProducer's first
-    # poll does a wide pull from the current inbox, which IS the source
-    # of truth for what should be visible. Anything the user already
-    # archived in Gmail won't come back; anything left in the inbox
-    # will resurface as a fresh task. No need to remember dismissed-
+    # Drop producer-sourced tasks from the replay where the producer
+    # itself is the source of truth. EmailProducer's first poll does a
+    # wide pull from the current inbox; LinearProducer's first poll
+    # does a wide pull from Linear. Anything the user already
+    # archived / closed won't come back; anything still active
+    # resurfaces as a fresh task. No need to remember dismissed-
     # without-archive state across restarts.
-    dropped_email = sum(1 for t in replayed if t.kind == "email_msg")
-    replayed = [t for t in replayed if t.kind != "email_msg"]
+    _source_of_truth_kinds = {"email_msg", "linear_issue"}
+    dropped_sot = sum(1 for t in replayed if t.kind in _source_of_truth_kinds)
+    replayed = [t for t in replayed if t.kind not in _source_of_truth_kinds]
     if replayed:
         queue.load(replayed)
         logger.info("Replayed %d tasks from queue log", len(replayed))
-    if dropped_email:
+    if dropped_sot:
         logger.info(
-            "Dropped %d replayed email_msg tasks; first poll will refresh from inbox",
-            dropped_email,
+            "Dropped %d replayed producer-sourced tasks; first poll will refresh",
+            dropped_sot,
         )
 
     tui_host_app = detect_tui_host_app() if tui else None
@@ -126,6 +129,12 @@ async def main_async(config: Config, *, tui: bool = False) -> None:
     if not email_mcp.enabled:
         logger.info(
             "Gmail MCP via claude CLI not available; Email producer will "
+            "stay idle. Install claude CLI to enable."
+        )
+    linear_mcp = ClaudeMCPClient(server_id="claude_ai_Linear")
+    if not linear_mcp.enabled:
+        logger.info(
+            "Linear MCP via claude CLI not available; Linear producer will "
             "stay idle. Install claude CLI to enable."
         )
     # Free-form skill invocation (ACT+PTT) and auto-handle screener.
@@ -162,6 +171,7 @@ async def main_async(config: Config, *, tui: bool = False) -> None:
         tui_host_app=tui_host_app,
         slack_mcp=slack_mcp,
         email_mcp=email_mcp,
+        linear_mcp=linear_mcp,
         agent_mcp=agent_mcp,
         agent_allowed_tools=agent_allowed_tools,
         app_mode=config.startup_mode if config.startup_mode in ("queue", "focused") else "focused",
@@ -235,7 +245,10 @@ async def main_async(config: Config, *, tui: bool = False) -> None:
         config=config, queue=queue, mcp=email_mcp,
         state=EmailState(), intake=submit_to_intake,
     ))
-    supervisor.add(LinearProducer(config=config, queue=queue))
+    supervisor.add(LinearProducer(
+        config=config, queue=queue, mcp=linear_mcp,
+        state=LinearState(), intake=submit_to_intake,
+    ))
     supervisor.add(ManualProducer())
 
     consumer = QueueConsumer(ctx)

@@ -85,6 +85,9 @@ class Context:
     # ClaudeMCPClient pointing at the claude.ai Gmail MCP. Used by
     # dispatch._respond_email to draft a reply to an email_msg task.
     email_mcp: object | None = None
+    # ClaudeMCPClient pointing at the claude.ai Linear MCP. Used by
+    # dispatch._respond_linear to post a comment on a linear_issue task.
+    linear_mcp: object | None = None
     # ClaudeMCPClient used for free-form skill invocation (ACT+PTT).
     # No fixed server_id — claude.ai's skill discovery loads the
     # matching skill from ``.claude/skills/`` and uses whatever MCP

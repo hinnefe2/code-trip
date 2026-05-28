@@ -60,6 +60,16 @@ search_query = "in:inbox category:primary -from:me is:unread"
 # Max threads per poll.
 max_results = 20
 
+[linear]
+# Polling cadence for the claude.ai Linear MCP (seconds).
+poll_interval = 180.0
+# Issue ``statusType`` values eligible for the queue. Linear's enum is
+# ``triage`` / ``backlog`` / ``unstarted`` / ``started`` / ``completed``
+# / ``canceled``. Default surfaces anything actionable but not yet done.
+state_types = ["triage", "unstarted", "started"]
+# Max issues per poll (also the ``list_issues`` ``limit`` argument).
+max_results = 50
+
 [autohandle]
 # Let auto-handle-eligible skills (those declaring ``auto-handle: true``
 # in their SKILL.md frontmatter) silently complete matching tasks

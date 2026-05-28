@@ -13,7 +13,7 @@ Concrete producers live in sibling modules:
 - :mod:`code_trip2.producers.manual`  — voice-triggered manual adds
 - :mod:`code_trip2.producers.slack`   — Slack mention search + watched channels via claude.ai MCP
 - :mod:`code_trip2.producers.email`   — Gmail inbox poller via claude.ai MCP
-- :mod:`code_trip2.producers.linear`  — Linear MCP (stub)
+- :mod:`code_trip2.producers.linear`  — Linear issue poller via claude.ai MCP
 """
 
 from __future__ import annotations

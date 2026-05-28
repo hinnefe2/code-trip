@@ -344,6 +344,9 @@ def _kind_label(task: Task) -> str:
     if task.kind == "email_msg":
         sender = task.source.get("sender_name") or task.source.get("sender_email") or ""
         return f"Email from {sender}" if sender else "Email"
+    if task.kind == "linear_issue":
+        identifier = task.source.get("identifier") or ""
+        return f"Linear {identifier}" if identifier else "Linear issue"
     if task.kind == "note":
         return "Note"
     if task.kind == "web":
@@ -364,6 +367,9 @@ async def _dispatch_task_response(ctx: "Context", task: Task, transcript: str) -
         return
     if task.kind == "email_msg":
         await _respond_email(ctx, task, transcript)
+        return
+    if task.kind == "linear_issue":
+        await _respond_linear(ctx, task, transcript)
         return
     await _speak(ctx, "No response action for this task.")
 
@@ -472,6 +478,44 @@ async def _archive_email(ctx: "Context", task: Task) -> None:
         action="archive",
     )
     await _speak(ctx, "Archived.")
+
+
+async def _respond_linear(ctx: "Context", task: Task, transcript: str) -> None:
+    """Voice response on a Linear task: post the transcript as a comment.
+
+    The claude.ai Linear MCP's ``save_comment`` tool creates a new
+    top-level comment on the issue when given ``issueId`` and ``body``.
+    On success the task is marked done; on the next wide poll the
+    producer re-surfaces the issue only if it's still in an active
+    state.
+    """
+    mcp = ctx.linear_mcp
+    if mcp is None:
+        await _speak(ctx, "Linear MCP is not configured.")
+        return
+    identifier = (task.source or {}).get("identifier") or ""
+    if not identifier:
+        await _speak(ctx, "Missing issue id for this task.")
+        return
+    try:
+        await mcp.call_tool(
+            "save_comment",
+            {"issueId": identifier, "body": transcript},
+        )
+    except Exception as exc:
+        logger.exception("Linear comment failed")
+        await _speak(ctx, f"Could not post comment: {exc}")
+        return
+    ctx.queue.mark_done(task.id)
+    ctx.current_task = None
+    ctx.log.event(
+        "queue_turn",
+        task_id=task.id,
+        kind=task.kind,
+        topic=task.topic,
+        sent=transcript,
+    )
+    await _speak(ctx, "Commented.")
 
 
 async def _respond_slack(ctx: "Context", task: Task, transcript: str) -> None:

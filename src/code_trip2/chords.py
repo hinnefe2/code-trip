@@ -122,25 +122,38 @@ async def handle_chord(ctx: "Context", name: str) -> None:
 _GMAIL_THREAD_URL = "https://mail.google.com/mail/u/0/#all/{thread_id}"
 
 
+def _task_browser_url(task) -> str | None:
+    """URL to open for this task, or ``None`` when there's no natural landing.
+
+    ``email_msg`` builds a Gmail thread URL; ``linear_issue`` uses the
+    URL Linear hands back in the MCP response (e.g.
+    ``https://linear.app/<workspace>/issue/AI-1389/<slug>``).
+    """
+    src = task.source or {}
+    if task.kind == "email_msg":
+        thread_id = src.get("thread_id") or ""
+        return _GMAIL_THREAD_URL.format(thread_id=thread_id) if thread_id else None
+    if task.kind == "linear_issue":
+        url = src.get("url") or ""
+        return url or None
+    return None
+
+
 async def _open_current_task_in_browser(ctx: "Context") -> None:
     """Open the active task's source URL in Chrome.
 
-    Only ``email_msg`` is wired up today — the URL is the Gmail thread
-    view for the task's ``thread_id``. Other kinds fall through with a
+    Resolves the URL via :func:`_task_browser_url` (email Gmail thread,
+    Linear issue URL). Kinds without a natural URL fall through with a
     spoken hint so the chord doesn't silently appear broken.
     """
     task = ctx.current_task
     if task is None:
         await _speak_error(ctx, "Nothing active.")
         return
-    if task.kind != "email_msg":
+    url = _task_browser_url(task)
+    if url is None:
         await _speak_error(ctx, f"Can't open {task.kind} in browser.")
         return
-    thread_id = (task.source or {}).get("thread_id") or ""
-    if not thread_id:
-        await _speak_error(ctx, "No thread id on this email.")
-        return
-    url = _GMAIL_THREAD_URL.format(thread_id=thread_id)
     try:
         proc = await asyncio.create_subprocess_exec(
             "open", "-a", _CHROME_APP, url,
