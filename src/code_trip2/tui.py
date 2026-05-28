@@ -163,8 +163,17 @@ def _queue_table(ctx: "Context") -> Panel:
     table.add_column("age", style="white", width=5)
     table.add_column("headline", overflow="ellipsis")
     now = time.time()
+    cursor_id = ctx.current_task.id if ctx.current_task is not None else None
     for i, (t, _score) in enumerate(ranked[:10]):
-        marker = "▶" if i == 0 else " "
+        # The ▶ marker follows the cursor (not the top-ranked row) so
+        # arrow-key navigation moves visibly without reshuffling the
+        # queue. Falls back to the top row when there's no cursor —
+        # matches the auto-announce target.
+        if cursor_id is not None:
+            is_marked = t.id == cursor_id
+        else:
+            is_marked = i == 0
+        marker = "▶" if is_marked else " "
         table.add_row(
             Text(marker, style="bold green"),
             t.kind,

@@ -222,17 +222,19 @@ def _seed_three(ctx) -> tuple[Task, Task, Task]:
 
 
 @pytest.mark.asyncio
-async def test_queue_navigate_down_from_idle_activates_top_task():
+async def test_queue_navigate_down_from_idle_points_cursor_at_top():
     ctx = _make_ctx(app_mode="queue")
     a, _b, _c = _seed_three(ctx)
     with patch.object(modes, "speak_chunked"):
         await dispatch.queue_navigate(ctx, direction=+1)
     assert ctx.current_task is a
-    assert ctx.queue.get(a.id).state == "active"
+    # Cursor doesn't change task state — the queue stays static.
+    assert ctx.queue.get(a.id).state == "pending"
+    assert len(ctx.queue.pending()) == 3
 
 
 @pytest.mark.asyncio
-async def test_queue_navigate_up_from_idle_activates_bottom_task():
+async def test_queue_navigate_up_from_idle_points_cursor_at_bottom():
     ctx = _make_ctx(app_mode="queue")
     _a, _b, c = _seed_three(ctx)
     with patch.object(modes, "speak_chunked"):
@@ -241,17 +243,18 @@ async def test_queue_navigate_up_from_idle_activates_bottom_task():
 
 
 @pytest.mark.asyncio
-async def test_queue_navigate_down_demotes_current_and_activates_next():
+async def test_queue_navigate_down_moves_cursor_without_disturbing_queue():
     ctx = _make_ctx(app_mode="queue")
     a, b, _c = _seed_three(ctx)
     ctx.current_task = a
-    ctx.queue.mark_active(a.id)
     with patch.object(modes, "speak_chunked"):
         await dispatch.queue_navigate(ctx, direction=+1)
     assert ctx.current_task is b
+    # Previous cursor task stays pending in the queue (no defer, no
+    # state change) so the user can arrow back to it.
     assert ctx.queue.get(a.id).state == "pending"
-    # No ready_at bump — browsing isn't skipping.
     assert ctx.queue.get(a.id).ready_at == 0
+    assert {t.id for t in ctx.queue.pending()} == {a.id, b.id, _c.id}
 
 
 @pytest.mark.asyncio
@@ -259,7 +262,6 @@ async def test_queue_navigate_up_walks_backward():
     ctx = _make_ctx(app_mode="queue")
     a, b, _c = _seed_three(ctx)
     ctx.current_task = b
-    ctx.queue.mark_active(b.id)
     with patch.object(modes, "speak_chunked"):
         await dispatch.queue_navigate(ctx, direction=-1)
     assert ctx.current_task is a
@@ -270,7 +272,6 @@ async def test_queue_navigate_clamps_at_end():
     ctx = _make_ctx(app_mode="queue")
     _a, _b, c = _seed_three(ctx)
     ctx.current_task = c
-    ctx.queue.mark_active(c.id)
     with patch.object(modes, "speak_chunked"):
         await dispatch.queue_navigate(ctx, direction=+1)
     assert ctx.current_task is c  # clamped, not wrapped
@@ -281,7 +282,6 @@ async def test_queue_navigate_clamps_at_start():
     ctx = _make_ctx(app_mode="queue")
     a, _b, _c = _seed_three(ctx)
     ctx.current_task = a
-    ctx.queue.mark_active(a.id)
     with patch.object(modes, "speak_chunked"):
         await dispatch.queue_navigate(ctx, direction=-1)
     assert ctx.current_task is a

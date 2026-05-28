@@ -141,6 +141,31 @@ def test_queue_table_populated_shows_pending_count_and_top():
     assert "alice pinged" in out
 
 
+def test_queue_table_marker_follows_cursor():
+    """The ▶ marker tracks ctx.current_task so arrow-key navigation moves
+    visibly without reshuffling the queue."""
+    ctx = _make_ctx()
+    top = ctx.queue.add(
+        Task(kind="claude_reply", topic="t1", headline="top item", created_at=1.0)
+    )
+    second = ctx.queue.add(
+        Task(kind="slack_msg", topic="t2", headline="second item", created_at=100.0)
+    )
+    # No cursor → marker on top row (matches auto-announce target).
+    out = _render(tui._queue_table(ctx))
+    top_line = next(line for line in out.splitlines() if "top item" in line)
+    second_line = next(line for line in out.splitlines() if "second item" in line)
+    assert "▶" in top_line
+    assert "▶" not in second_line
+    # Cursor on the second task → marker moves to it; top stays in the list.
+    ctx.current_task = second
+    out = _render(tui._queue_table(ctx))
+    top_line = next(line for line in out.splitlines() if "top item" in line)
+    second_line = next(line for line in out.splitlines() if "second item" in line)
+    assert "▶" in second_line
+    assert "▶" not in top_line
+
+
 def test_topics_panel_orders_most_recent_first():
     ctx = _make_ctx()
     import time as _t

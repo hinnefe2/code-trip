@@ -28,7 +28,7 @@ import re
 import time
 from typing import TYPE_CHECKING
 
-from code_trip2 import earcon, modes, remote, tasks as tasks_mod
+from code_trip2 import earcon, modes, remote
 from code_trip2._async_utils import event_or_timeout
 from code_trip2.tasks import Task
 
@@ -224,14 +224,23 @@ async def _handle_queue_voice(ctx: "Context", t: str) -> None:
 
 
 async def _announce_next(ctx: "Context") -> Task | None:
-    """Pull the highest-scoring task and announce its headline."""
+    """Set the cursor to the highest-scoring task and announce it.
+
+    Voice "next" keeps its old semantic of "skip what I'm on, give me
+    the next one": when there's already a cursor task, defer it first
+    so it drops out of the ranking. The cursor itself is just a
+    pointer — the task stays ``pending`` (visible in the queue list)
+    until an engagement (PTT / skill / dismiss / snooze) actually
+    removes it.
+    """
     if ctx.current_task is not None:
-        # Treat 'next' with an active task as "skip this one".
+        # Treat 'next' with a cursored task as "skip this one".
         await _skip_current(ctx)
-    t = ctx.queue.pull(now=time.time(), recent=ctx.recent_topics)
-    if t is None:
+    ranked = ctx.queue.ranked(now=time.time(), recent=ctx.recent_topics)
+    if not ranked:
         await _speak(ctx, "Queue is empty.")
         return None
+    t = ranked[0][0]
     if ctx.queue_log is not None:
         ctx.queue_log.record("pull", t)
     ctx.current_task = t
@@ -585,44 +594,38 @@ async def queue_no_tap(ctx: "Context") -> None:
 
 
 async def queue_navigate(ctx: "Context", *, direction: int) -> None:
-    """Move the active-task cursor through the ranked queue.
+    """Move the cursor through the ranked queue.
 
     ``direction`` is ``-1`` (up / previous) or ``+1`` (down / next).
-    Demotes any currently-active task back to ``pending`` *without*
-    deferring it — the user is browsing, not skipping. Then activates
-    the neighbor at ``cur_idx + direction`` in the re-ranked order.
-    Clamps at the boundaries instead of wrapping.
+    The cursor is just a pointer — no task state changes — so the
+    queue list stays static and the cursor task remains visible in
+    its rightful ranked position. Clamps at the boundaries instead
+    of wrapping.
 
     Doesn't touch ``recent_topics`` — arrow navigation is exploratory,
     so it shouldn't bias the scheduler the way an explicit "next" or
     a skill engagement does.
     """
     modes.stop_playback(ctx)
-    cur = ctx.current_task
-    # Demote first so the snapshot we rank against includes the
-    # previously-active task at its rightful position.
-    if cur is not None and cur.state == tasks_mod.STATE_ACTIVE:
-        ctx.queue.set_state(cur.id, tasks_mod.STATE_PENDING)
     ranked = ctx.queue.ranked(now=time.time(), recent=ctx.recent_topics)
     if not ranked:
         ctx.current_task = None
         await _speak(ctx, "Queue is empty.")
         return
     pending_ids = [t.id for t, _ in ranked]
+    cur = ctx.current_task
     if cur is None:
         new_idx = 0 if direction > 0 else len(pending_ids) - 1
     else:
         try:
             cur_idx = pending_ids.index(cur.id)
         except ValueError:
-            cur_idx = 0
+            # Cursor task was removed from pending (e.g. just engaged
+            # with). Treat as fresh — top for down, bottom for up.
+            cur_idx = -1 if direction > 0 else len(pending_ids)
         new_idx = max(0, min(len(pending_ids) - 1, cur_idx + direction))
-    new_task = ctx.queue.get(pending_ids[new_idx])
-    if new_task is None:
-        return
-    ctx.queue.mark_active(new_task.id)
-    ctx.current_task = new_task
-    _announce_headline(ctx, new_task)
+    ctx.current_task = ctx.queue.get(pending_ids[new_idx])
+    _announce_headline(ctx, ctx.current_task)
 
 
 async def dismiss_current_task(ctx: "Context") -> None:
