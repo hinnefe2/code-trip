@@ -108,8 +108,56 @@ async def handle_chord(ctx: "Context", name: str) -> None:
             await dispatch.dismiss_current_task(ctx)
         else:
             await _send_stroke(ctx, _ACT_NO_CLEAR_LINE)
+    elif name == "act+yes":
+        # ACT+YES in queue mode opens the active task in a browser
+        # when the task has an obvious URL (email_msg → Gmail thread).
+        # No-op in focused mode and for task kinds without a natural
+        # browser landing.
+        if ctx.app_mode == dispatch.MODE_QUEUE:
+            await _open_current_task_in_browser(ctx)
     else:
         logger.warning("Unknown chord: %s", name)
+
+
+_GMAIL_THREAD_URL = "https://mail.google.com/mail/u/0/#all/{thread_id}"
+
+
+async def _open_current_task_in_browser(ctx: "Context") -> None:
+    """Open the active task's source URL in Chrome.
+
+    Only ``email_msg`` is wired up today — the URL is the Gmail thread
+    view for the task's ``thread_id``. Other kinds fall through with a
+    spoken hint so the chord doesn't silently appear broken.
+    """
+    task = ctx.current_task
+    if task is None:
+        await _speak_error(ctx, "Nothing active.")
+        return
+    if task.kind != "email_msg":
+        await _speak_error(ctx, f"Can't open {task.kind} in browser.")
+        return
+    thread_id = (task.source or {}).get("thread_id") or ""
+    if not thread_id:
+        await _speak_error(ctx, "No thread id on this email.")
+        return
+    url = _GMAIL_THREAD_URL.format(thread_id=thread_id)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "open", "-a", _CHROME_APP, url,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+        if proc.returncode != 0:
+            err = (stderr_b or b"").decode(errors="replace").strip()
+            raise RuntimeError(err or f"open exited {proc.returncode}")
+    except (asyncio.TimeoutError, OSError, RuntimeError) as exc:
+        await _speak_error(ctx, f"Could not open email: {exc}")
+        return
+    try:
+        earcon.completion()
+    except earcon.EarconError:
+        pass
 
 
 async def _send_stroke(ctx: "Context", stroke: KeyStroke) -> None:

@@ -221,6 +221,7 @@ def _keymap_panel(ctx: "Context") -> Panel:
             ("NAV", "NO"): "prev",
             ("NAV", "ACT"): "cycle app",
             ("ACT", "TALK"): "skill mode",
+            ("ACT", "YES"): "open in browser",
             ("ACT", "NO"): "dismiss task",
         }
     else:

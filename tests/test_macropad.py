@@ -244,11 +244,13 @@ def test_ptt_alone_does_not_set_skill_mode(monkeypatch):
 
 
 
-def test_act_plus_yes_is_noop(monkeypatch):
+def test_act_plus_yes_fires_chord(monkeypatch):
+    """ACT+YES routes through handle_chord — chords.py decides what to do
+    per mode / active-task kind (e.g. open an email in the browser)."""
     pad, rec, *_ = _make(monkeypatch)
     pad._on_press(keyboard.Key.f14)  # ACT
-    pad._on_press(keyboard.Key.f15)  # YES under ACT (no mapping)
-    assert rec.chords == []
+    pad._on_press(keyboard.Key.f15)  # YES under ACT
+    assert rec.chords == ["act+yes"]
     assert rec.taps == []
 
 
@@ -728,6 +730,119 @@ async def test_chord_act_no_in_queue_mode_dismisses_task(monkeypatch):
 
     assert dismissed == [ctx]
     assert sent == []  # no Ctrl+U leaking into the focused app
+
+
+# --- act+yes (open in browser) -------------------------------------------
+
+
+def _email_task(thread_id: str = "T123ABC"):
+    from code_trip2.tasks import Task
+    return Task(
+        kind="email_msg",
+        topic="alice",
+        headline="Alice: hello",
+        body="hello there",
+        source={"thread_id": thread_id, "sender_email": "alice@example.com"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_chord_act_yes_queue_mode_opens_gmail_thread(monkeypatch):
+    """ACT+YES on an email_msg active task opens the Gmail thread URL."""
+    opened = _patch_open_subprocess(monkeypatch)
+    monkeypatch.setattr(chords.earcon, "completion", lambda: None)
+    ctx = _ctx()
+    ctx.app_mode = "queue"
+    ctx.current_task = _email_task(thread_id="THR456")
+
+    await chords.handle_chord(ctx, "act+yes")
+
+    assert len(opened) == 1
+    cmd = opened[0]
+    assert cmd[0] == "open"
+    assert cmd[1] == "-a"
+    assert cmd[2] == chords._CHROME_APP
+    assert cmd[3] == "https://mail.google.com/mail/u/0/#all/THR456"
+
+
+@pytest.mark.asyncio
+async def test_chord_act_yes_no_active_task_speaks_error(monkeypatch):
+    opened = _patch_open_subprocess(monkeypatch)
+    monkeypatch.setattr(chords.earcon, "error", lambda: None)
+    ctx = _ctx()
+    ctx.app_mode = "queue"
+    ctx.current_task = None
+
+    await chords.handle_chord(ctx, "act+yes")
+
+    assert opened == []
+    ctx.tts.speak.assert_called_once()
+    assert "nothing active" in ctx.tts.speak.call_args.args[0].lower()
+
+
+@pytest.mark.asyncio
+async def test_chord_act_yes_non_email_task_speaks_error(monkeypatch):
+    """ACT+YES is email-only today — other kinds get a spoken hint, not silence."""
+    from code_trip2.tasks import Task
+    opened = _patch_open_subprocess(monkeypatch)
+    monkeypatch.setattr(chords.earcon, "error", lambda: None)
+    ctx = _ctx()
+    ctx.app_mode = "queue"
+    ctx.current_task = Task(kind="slack_msg", topic="general", headline="hi")
+
+    await chords.handle_chord(ctx, "act+yes")
+
+    assert opened == []
+    ctx.tts.speak.assert_called_once()
+    assert "slack_msg" in ctx.tts.speak.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_chord_act_yes_missing_thread_id_speaks_error(monkeypatch):
+    opened = _patch_open_subprocess(monkeypatch)
+    monkeypatch.setattr(chords.earcon, "error", lambda: None)
+    ctx = _ctx()
+    ctx.app_mode = "queue"
+    ctx.current_task = _email_task(thread_id="")
+
+    await chords.handle_chord(ctx, "act+yes")
+
+    assert opened == []
+    ctx.tts.speak.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_chord_act_yes_in_focused_mode_is_noop(monkeypatch):
+    """Focused mode has no active-task concept — chord is silently inert."""
+    opened = _patch_open_subprocess(monkeypatch)
+    ctx = _ctx()
+    ctx.app_mode = "focused"
+    ctx.current_task = _email_task()
+
+    await chords.handle_chord(ctx, "act+yes")
+
+    assert opened == []
+    ctx.tts.speak.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_chord_act_yes_open_subprocess_failure_speaks_error(monkeypatch):
+    """A nonzero exit from ``open`` surfaces as a spoken error, no crash."""
+    monkeypatch.setattr(chords.earcon, "error", lambda: None)
+
+    async def fail_exec(*cmd, **kw):
+        proc = MagicMock()
+        proc.communicate = AsyncMock(return_value=(b"", b"Chrome not found"))
+        proc.returncode = 1
+        return proc
+
+    monkeypatch.setattr(chords.asyncio, "create_subprocess_exec", fail_exec)
+    ctx = _ctx()
+    ctx.app_mode = "queue"
+    ctx.current_task = _email_task()
+
+    await chords.handle_chord(ctx, "act+yes")
+    ctx.tts.speak.assert_called_once()
 
 
 @pytest.mark.asyncio

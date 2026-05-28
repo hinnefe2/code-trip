@@ -194,10 +194,8 @@ class Macropad:
                     self._start_recording()
         elif name in ("yes", "no", "act") and nav_modifier:
             self._fire_chord(f"nav+{name}")
-        elif name == "no" and act_modifier:
-            self._fire_chord("act+no")
         elif name in ("yes", "no") and act_modifier:
-            pass  # ACT held but no matching chord; swallow to avoid stray tap
+            self._fire_chord(f"act+{name}")
         elif name in ("yes", "no") and self.on_tap is not None:
             self._fire_tap(name)
 
