@@ -77,7 +77,8 @@ async def main_async(config: Config, *, tui: bool = False, silent: bool = False)
     tts: TTSClient | SilentTTSClient
     if silent:
         tts = SilentTTSClient()
-        logger.info("Silent mode: TTS disabled (earcons still play).")
+        earcon.set_silent(True)
+        logger.info("Silent mode: TTS + earcons disabled.")
     else:
         tts = TTSClient(
             api_key=config.api_key,
@@ -445,7 +446,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--silent",
         action="store_true",
-        help="Disable TTS spoken output (earcons still play).",
+        help="Disable all audio output (TTS speech + earcon beeps).",
     )
     args = parser.parse_args(argv)
 

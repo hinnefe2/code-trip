@@ -233,3 +233,38 @@ async def test_silent_tts_client_speak_is_noop():
     assert await c.speak("hello world") is None
     assert c.is_playing() is False
     c.stop()  # must not raise
+
+
+# --- earcon mute (covered here because the legacy test_earcon.py
+# still imports from the defunct ``code_trip`` package) -----------------
+
+
+def test_earcon_set_silent_short_circuits_play(monkeypatch):
+    """``set_silent(True)`` makes every earcon a no-op, including the
+    ``Thinking`` background loop, so ``--silent`` actually silences
+    every audio path — not just TTS."""
+    from code_trip2 import earcon
+
+    fake_sd = MagicMock()
+    monkeypatch.setattr(earcon, "sd", fake_sd)
+    # Sanity: when not silent, _play hits sounddevice.
+    earcon.set_silent(False)
+    try:
+        earcon.completion()
+        assert fake_sd.play.called
+        fake_sd.play.reset_mock()
+        # When silent, no audio call.
+        earcon.set_silent(True)
+        earcon.completion()
+        earcon.error()
+        earcon.mode_chime("queue")
+        earcon.new_task()
+        earcon.thinking()
+        fake_sd.play.assert_not_called()
+        # And the Thinking class declines to spawn its background thread.
+        t = earcon.Thinking(interval=0.01)
+        t.start()
+        assert t._thread is None
+        t.stop()  # idempotent
+    finally:
+        earcon.set_silent(False)

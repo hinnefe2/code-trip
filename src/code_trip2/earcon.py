@@ -18,6 +18,23 @@ class EarconError(Exception):
 
 _SR = 44_100
 
+# Module-level mute. ``main.py`` flips this on for ``--silent``; every
+# play call early-returns and ``Thinking`` declines to spawn its
+# background tone thread. Module global rather than a per-callsite
+# flag because earcons fire from many places (chords, dispatch,
+# modes) — gating them all by parameter would be invasive.
+_silent = False
+
+
+def set_silent(value: bool) -> None:
+    """Mute (or unmute) all earcon playback. Process-wide."""
+    global _silent
+    _silent = bool(value)
+
+
+def is_silent() -> bool:
+    return _silent
+
 
 def _tone(freq: float, duration: float, amplitude: float = 0.2) -> np.ndarray:
     t = np.linspace(0, duration, int(_SR * duration), endpoint=False)
@@ -32,6 +49,8 @@ def _tone(freq: float, duration: float, amplitude: float = 0.2) -> np.ndarray:
 
 
 def _play(samples: np.ndarray) -> None:
+    if _silent:
+        return
     try:
         sd.play(samples, samplerate=_SR)
         sd.wait()
@@ -84,6 +103,11 @@ class Thinking:
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
+        if _silent:
+            # Don't bother spawning the periodic-beep thread when
+            # earcons are muted — it would just wake up every interval
+            # to call a no-op _play.
+            return
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
