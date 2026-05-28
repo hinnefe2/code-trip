@@ -39,17 +39,17 @@ from code_trip2.slack_state import SlackState
 from code_trip2.stt_client import STTClient, STTClientError
 from code_trip2.summarizer import Summarizer
 from code_trip2.tasks import Task, TaskQueue
-from code_trip2.tts_client import TTSClient
+from code_trip2.tts_client import SilentTTSClient, TTSClient
 from code_trip2.tui import CodeTripApp, detect_tui_host_app
 
 logger = logging.getLogger(__name__)
 
 
-def run(config: Config, *, tui: bool = False) -> None:
-    asyncio.run(main_async(config, tui=tui))
+def run(config: Config, *, tui: bool = False, silent: bool = False) -> None:
+    asyncio.run(main_async(config, tui=tui, silent=silent))
 
 
-async def main_async(config: Config, *, tui: bool = False) -> None:
+async def main_async(config: Config, *, tui: bool = False, silent: bool = False) -> None:
     if config.stt_provider != "openai" and not tui:
         raise SystemExit(
             "Local STT mode (stt_provider != 'openai') requires --tui — "
@@ -74,12 +74,17 @@ async def main_async(config: Config, *, tui: bool = False) -> None:
         stt = STTClient(api_key=config.api_key, model=config.stt_model)
     else:
         logger.info("STT provider=%s; bypassing OpenAI STT.", config.stt_provider)
-    tts = TTSClient(
-        api_key=config.api_key,
-        model=config.tts_model,
-        voice=config.tts_voice,
-        speed=config.tts_speed,
-    )
+    tts: TTSClient | SilentTTSClient
+    if silent:
+        tts = SilentTTSClient()
+        logger.info("Silent mode: TTS disabled (earcons still play).")
+    else:
+        tts = TTSClient(
+            api_key=config.api_key,
+            model=config.tts_model,
+            voice=config.tts_voice,
+            speed=config.tts_speed,
+        )
     thinking = earcon.Thinking()
     summarizer = Summarizer(
         api_key=config.api_key,
@@ -437,6 +442,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Show a live status dashboard. Suppresses Python logging output.",
     )
+    parser.add_argument(
+        "--silent",
+        action="store_true",
+        help="Disable TTS spoken output (earcons still play).",
+    )
     args = parser.parse_args(argv)
 
     if args.tui:
@@ -475,7 +485,7 @@ def main(argv: list[str] | None = None) -> int:
         pass
 
     config = load_config(args.config)
-    run(config, tui=args.tui)
+    run(config, tui=args.tui, silent=args.silent)
     return 0
 
 

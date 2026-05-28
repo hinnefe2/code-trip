@@ -64,6 +64,29 @@ class TTSClientError(Exception):
     """Raised when a text-to-speech operation fails."""
 
 
+# --- SilentTTSClient ------------------------------------------------------
+
+
+class SilentTTSClient:
+    """No-op stand-in for :class:`TTSClient`.
+
+    Wired in by ``--silent`` so the orchestrator runs without spoken
+    audio. Matches the duck-typed shape ``modes`` and ``dispatch``
+    rely on (``speak``, ``stop``, ``is_playing``); ``speak`` returns
+    immediately so chunked-playback loops drain in a single tick and
+    queue-mode auto-announce behaves as if speech just finished.
+    """
+
+    async def speak(self, text: str) -> None:
+        return
+
+    def stop(self) -> None:
+        return
+
+    def is_playing(self) -> bool:
+        return False
+
+
 # --- TTSClient ------------------------------------------------------------
 
 

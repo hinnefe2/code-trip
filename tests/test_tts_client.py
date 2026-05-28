@@ -15,6 +15,7 @@ from code_trip2.tts_client import (
     _FADE_MS,
     _SILENCE_PAD_MS,
     _WRITE_BLOCK_FRAMES,
+    SilentTTSClient,
     TTSClient,
     _decode_wav,
     _shape_samples,
@@ -220,3 +221,15 @@ def test_stop_does_not_close_stream():
     c.stop()
     c._stream.close.assert_not_called()
     assert c._stream is not None
+
+
+# --- SilentTTSClient ------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_silent_tts_client_speak_is_noop():
+    c = SilentTTSClient()
+    # No API key, no audio device — just returns instantly.
+    assert await c.speak("hello world") is None
+    assert c.is_playing() is False
+    c.stop()  # must not raise
