@@ -126,6 +126,29 @@ def _header(ctx: "Context") -> Panel:
     return Panel(line, title="code-trip", border_style="bright_black")
 
 
+# Roughly 4x what the panel showed in single-line-preview mode. Hard
+# cap so a long-bodied task (Linear ticket descriptions, email
+# threads) can't push the Queue panel below it off-screen.
+_CURRENT_TASK_BODY_MAX_LINES = 16
+
+
+def _clip_body(body: str, max_lines: int) -> tuple[str, bool]:
+    """Cap ``body`` at ``max_lines`` lines, preserving newlines.
+
+    Returns ``(clipped, truncated)``. Long single lines are NOT
+    hard-wrapped here — Rich's Text renders them with soft-wrap, which
+    can make the visual height exceed ``max_lines``. That's a tradeoff
+    in favor of structure preservation; markdown bodies usually have
+    reasonable line lengths.
+    """
+    if not body:
+        return "", False
+    lines = body.splitlines()
+    if len(lines) <= max_lines:
+        return body.rstrip(), False
+    return "\n".join(lines[:max_lines]).rstrip(), True
+
+
 def _current_task_panel(ctx: "Context") -> Panel:
     t = ctx.current_task
     if t is None:
@@ -139,11 +162,15 @@ def _current_task_panel(ctx: "Context") -> Panel:
         Text(f"  {_format_age(now - t.created_at)} old", style="dim"),
     )
     headline = Text(t.headline or "(no headline)", style="white")
-    body_preview = Text("")
+    parts = [head, headline]
     if t.body:
-        body_preview = Text(_truncate(t.body, 160), style="dim")
+        clipped, truncated = _clip_body(t.body, _CURRENT_TASK_BODY_MAX_LINES)
+        if clipped:
+            parts.append(Text(clipped, style="dim"))
+        if truncated:
+            parts.append(Text("… (truncated — body shown above)", style="dim italic"))
     return Panel(
-        Group(head, headline, body_preview),
+        Group(*parts),
         title="Current task",
         border_style="magenta",
     )

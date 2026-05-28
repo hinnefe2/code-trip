@@ -123,6 +123,58 @@ def test_current_task_panel_with_active_task():
     assert "replied to: run the tests" in out
 
 
+def test_current_task_panel_preserves_multiline_body():
+    """Body lines that fit under the cap render with their newlines
+    intact — markdown structure stays readable instead of collapsing
+    to one line like the old single-line preview did."""
+    ctx = _make_ctx()
+    ctx.current_task = Task(
+        kind="linear_issue",
+        topic="ai-7",
+        headline="AI-7: a thing",
+        body="Line one\nLine two\nLine three",
+    )
+    out = _render(tui._current_task_panel(ctx))
+    assert "Line one" in out
+    assert "Line two" in out
+    assert "Line three" in out
+    assert "truncated" not in out.lower()
+
+
+def test_current_task_panel_caps_body_and_marks_truncation():
+    ctx = _make_ctx()
+    long_body = "\n".join(f"line {i}" for i in range(40))
+    ctx.current_task = Task(
+        kind="linear_issue",
+        topic="ai-7",
+        headline="AI-7: long",
+        body=long_body,
+    )
+    out = _render(tui._current_task_panel(ctx))
+    # First N lines included; later ones are not.
+    assert "line 0" in out
+    assert f"line {tui._CURRENT_TASK_BODY_MAX_LINES - 1}" in out
+    assert f"line {tui._CURRENT_TASK_BODY_MAX_LINES}" not in out
+    assert "truncated" in out.lower()
+
+
+def test_clip_body_short_body_passes_through():
+    clipped, truncated = tui._clip_body("a\nb\nc", max_lines=10)
+    assert clipped == "a\nb\nc"
+    assert truncated is False
+
+
+def test_clip_body_caps_at_max_lines():
+    body = "\n".join(str(i) for i in range(20))
+    clipped, truncated = tui._clip_body(body, max_lines=5)
+    assert clipped.splitlines() == ["0", "1", "2", "3", "4"]
+    assert truncated is True
+
+
+def test_clip_body_empty_returns_empty():
+    assert tui._clip_body("", max_lines=10) == ("", False)
+
+
 def test_queue_table_empty():
     ctx = _make_ctx()
     out = _render(tui._queue_table(ctx))
