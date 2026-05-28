@@ -329,6 +329,13 @@ class ClaudeMCPClient:
         text = text.strip()
         if not text:
             return {}
+        # Large tool results get diverted by claude --print to a file
+        # on disk; the tool_result content is then just a notice with
+        # the file path. Read the file ourselves so producers don't
+        # silently see "no results" when the real payload is huge.
+        recovered = self._recover_from_dumped_file(text)
+        if recovered is not None:
+            return recovered
         # Direct JSON object/array.
         try:
             parsed = json.loads(text)
@@ -349,3 +356,61 @@ class ClaudeMCPClient:
                 pass
         # Last resort: return as opaque text.
         return {"_raw": text}
+
+    # Sentinel claude --print emits when a tool result exceeds its
+    # per-tool token cap. The file is a JSON array of content blocks
+    # (``[{"type": "text", "text": "<actual payload>"}]``); the
+    # ``text`` field carries the real tool result as a JSON string.
+    _DUMPED_PATH_RE = re.compile(r"Output has been saved to (\S+\.txt)")
+
+    def _recover_from_dumped_file(self, text: str) -> dict[str, Any] | None:
+        """Read a dumped tool-result file when claude --print diverted it.
+
+        Returns the parsed payload, or ``None`` when the text doesn't
+        carry a dump-path sentinel (caller should fall back to its
+        normal parse path). Errors reading or parsing the file also
+        return ``None`` so the caller's default ``{"_raw": ...}``
+        still wins as a last resort.
+        """
+        m = self._DUMPED_PATH_RE.search(text)
+        if not m:
+            return None
+        path = m.group(1)
+        logger.info("claude --print diverted tool result to %s; reading", path)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = f.read()
+        except OSError as exc:
+            logger.warning("Could not read diverted tool-result file %s: %s", path, exc)
+            return None
+        # The file is the standard MCP content-block list. Pull the
+        # text out of each block and join — usually there's just one.
+        try:
+            blocks = json.loads(raw)
+        except json.JSONDecodeError:
+            logger.warning("Diverted file %s is not JSON; treating as opaque", path)
+            return {"_raw": raw}
+        parts: list[str] = []
+        if isinstance(blocks, list):
+            for b in blocks:
+                if isinstance(b, dict) and b.get("type") == "text":
+                    parts.append(str(b.get("text", "")))
+                elif isinstance(b, str):
+                    parts.append(b)
+        elif isinstance(blocks, dict):
+            return blocks
+        joined = "\n".join(p for p in parts if p)
+        if not joined:
+            return None
+        # Recurse on the recovered payload, but strip our sentinel-
+        # detection out of the recursion so a degenerate file that
+        # itself contains the sentinel can't loop forever.
+        try:
+            parsed = json.loads(joined)
+        except json.JSONDecodeError:
+            return {"_raw": joined}
+        if isinstance(parsed, dict):
+            return parsed
+        if isinstance(parsed, list):
+            return {"items": parsed}
+        return {"_raw": joined}

@@ -127,6 +127,27 @@ async def test_claude_mcp_call_tool_handles_string_tool_result_content(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_claude_mcp_call_tool_recovers_from_dumped_file(monkeypatch, tmp_path):
+    """Large tool results get diverted to a file by claude --print; the
+    parser should follow the sentinel and read the real payload."""
+    # Write the on-disk file the way claude --print writes it: an outer
+    # JSON array of content blocks whose ``text`` field carries the
+    # actual tool result as a JSON string.
+    dump_path = tmp_path / "mcp-dump.txt"
+    payload = {"issues": [{"id": "AI-1", "title": "Big"}]}
+    dump_path.write_text(json.dumps([{"type": "text", "text": json.dumps(payload)}]))
+    notice = (
+        f"Error: result (90000 characters) exceeds maximum allowed tokens. "
+        f"Output has been saved to {dump_path}.\n"
+        f"Format: JSON array with schema: [{{type: string, text: string}}]\n"
+    )
+    c = _mk_client()
+    _patch_exec(monkeypatch, stdout=_stream_event(notice))
+    result = await c.call_tool("mcp__claude_ai_Linear__list_issues", {"assignee": "me"})
+    assert result == payload
+
+
+@pytest.mark.asyncio
 async def test_claude_mcp_call_tool_raises_when_no_tool_result(monkeypatch):
     c = _mk_client()
     _patch_exec(monkeypatch, stdout='{"type": "system"}\n{"type": "result"}\n')
