@@ -517,6 +517,12 @@ async def test_producer_poll_emits_tasks_from_detailed_markdown(tmp_path: Path):
     assert t1.source["thread_ts"] == "1716000001.000000"
     t2 = by_ts["1716000002.000000"]
     assert t2.source["thread_ts"] == "1716000000.500000"  # extracted from permalink
+    # Full permalink captured so ACT+YES can hand it to the Slack desktop app.
+    assert t1.source["url"] == (
+        "https://x.slack.com/archives/CRAND/p1716000001000000"
+        "?thread_ts=1716000001.000000&cid=CRAND"
+    )
+    assert t2.source["url"].startswith("https://x.slack.com/archives/CENG/")
     assert state.last_search_ts() == "1716000002.000000"
 
 

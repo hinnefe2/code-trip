@@ -101,6 +101,10 @@ _CHANNEL_RE = re.compile(r"^Channel:\s+#(\S+)\s+\(ID:\s+(\w+)\)\s*$")
 _FROM_RE = re.compile(r"^From:\s+(.+?)\s+\(ID:\s+(\w+)\)(?:\s+\[(BOT)\])?\s*$")
 _TS_RE = re.compile(r"^Message_ts:\s+(\d+\.\d+)\s*$")
 _THREAD_TS_RE = re.compile(r"thread_ts=(\d+\.\d+)")
+# Permalink markdown line: ``Permalink: [link](https://workspace.slack.com/archives/C…/p…?…)``.
+# Captures the URL inside the markdown link parens so ACT+YES can hand it
+# to ``open -a Slack`` and jump straight to the message.
+_PERMALINK_URL_RE = re.compile(r"\((https?://[^)\s]+)\)")
 
 if TYPE_CHECKING:
     pass
@@ -521,6 +525,9 @@ class SlackProducer:
             if stripped.startswith("Permalink:"):
                 t = _THREAD_TS_RE.search(stripped)
                 msg["thread_ts"] = t.group(1) if t else msg.get("ts", "")
+                u = _PERMALINK_URL_RE.search(stripped)
+                if u:
+                    msg["permalink"] = u.group(1)
                 continue
             if stripped.startswith("Text:"):
                 in_text = True
@@ -555,6 +562,9 @@ class SlackProducer:
             "thread_ts": thread_ts,
             "sender_id": sender_id,
             "sender_name": sender_name,
+            # Workspace-qualified permalink. Used by the ACT+YES chord
+            # to jump straight to the message in the Slack desktop app.
+            "url": msg.get("permalink") or "",
         }
 
         # Collapse multiple messages in the same thread into a single

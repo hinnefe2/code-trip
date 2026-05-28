@@ -477,6 +477,21 @@ def test_task_browser_url_email_still_builds_gmail_url():
     assert "mail.google.com" in url
 
 
+def test_task_browser_url_slack_uses_permalink():
+    task = Task(
+        kind="slack_msg",
+        source={"url": "https://picnichealth.slack.com/archives/C09/p1779911327920139"},
+    )
+    assert chords._task_browser_url(task) == (
+        "https://picnichealth.slack.com/archives/C09/p1779911327920139"
+    )
+
+
+def test_task_browser_url_slack_without_url_returns_none():
+    task = Task(kind="slack_msg", source={"channel_id": "C09"})
+    assert chords._task_browser_url(task) is None
+
+
 def test_task_browser_url_unknown_kind_returns_none():
-    task = Task(kind="slack_msg", source={})
+    task = Task(kind="claude_reply", source={})
     assert chords._task_browser_url(task) is None
