@@ -140,40 +140,17 @@ def _task_browser_url(task) -> str | None:
     return None
 
 
-def _open_url_argv(task, url: str) -> list[str]:
-    """Build the subprocess argv that opens ``url`` for ``task``'s kind.
-
-    Slack gets an ``osascript`` ``open location`` invocation because
-    ``open -a Slack <url>`` hands the URL to Slack as a document Apple
-    Event — Slack just brings itself to front without navigating to
-    the message. ``open location`` sends a ``GURL`` event, which is
-    what Slack's URL handler actually listens for, so the permalink
-    deep-links to the specific message in context. The URL goes
-    through AppleScript's ``argv`` instead of being interpolated into
-    the script so there's no quoting / escape hazard.
-
-    Everything else opens in Chrome (Gmail thread URLs, Linear issue
-    URLs).
-    """
-    if task.kind == "slack_msg":
-        return [
-            "osascript",
-            "-e", "on run argv",
-            "-e", 'tell application "Slack" to open location item 1 of argv',
-            "-e", "end run",
-            url,
-        ]
-    return ["open", "-a", _CHROME_APP, url]
-
-
 async def _open_current_task_in_browser(ctx: "Context") -> None:
-    """Open the active task's source URL in its natural app.
+    """Open the active task's source URL in Chrome.
 
-    Resolves the URL via :func:`_task_browser_url` and dispatches the
-    open command via :func:`_open_url_argv` (Slack permalinks → Slack
-    desktop app via AppleScript; everything else → Chrome). Kinds
-    without a natural URL fall through with a spoken hint so the
-    chord doesn't silently appear broken.
+    All kinds go through Chrome — even ``slack_msg``. Direct app
+    handoffs (``open -a Slack <url>`` and ``osascript open location``)
+    were tried and neither reliably navigated to the specific message
+    after a Slack restart; the URL just brought Slack to front.
+    Opening the slack.com permalink in Chrome triggers Slack's
+    Universal Link / "Open in Slack" flow, which deep-links correctly
+    every time. The roundtrip through the browser is indirect but
+    actually works.
     """
     task = ctx.current_task
     if task is None:
@@ -183,17 +160,16 @@ async def _open_current_task_in_browser(ctx: "Context") -> None:
     if url is None:
         await _speak_error(ctx, f"Can't open {task.kind}.")
         return
-    argv = _open_url_argv(task, url)
     try:
         proc = await asyncio.create_subprocess_exec(
-            *argv,
+            "open", "-a", _CHROME_APP, url,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
         _, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=5.0)
         if proc.returncode != 0:
             err = (stderr_b or b"").decode(errors="replace").strip()
-            raise RuntimeError(err or f"{argv[0]} exited {proc.returncode}")
+            raise RuntimeError(err or f"open exited {proc.returncode}")
     except (asyncio.TimeoutError, OSError, RuntimeError) as exc:
         await _speak_error(ctx, f"Could not open task: {exc}")
         return

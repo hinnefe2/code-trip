@@ -846,13 +846,14 @@ async def test_chord_act_yes_open_subprocess_failure_speaks_error(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_chord_act_yes_slack_uses_osascript_open_location(monkeypatch):
-    """ACT+YES on a slack_msg with a permalink deep-links via osascript.
+async def test_chord_act_yes_slack_opens_permalink_in_chrome(monkeypatch):
+    """ACT+YES on a slack_msg opens its permalink in Chrome.
 
-    ``open -a Slack <url>`` hands the URL to Slack as a document Apple
-    Event and the app just comes to front; ``osascript ... open
-    location`` sends a GURL event that triggers Slack's URL handler so
-    the message actually opens in context.
+    Direct app handoffs (``open -a Slack <url>`` and ``osascript open
+    location``) didn't reliably deep-link to the specific message —
+    Slack would just come to front. Opening the slack.com permalink
+    in Chrome triggers Slack's Universal Link flow which navigates to
+    the message correctly.
     """
     from code_trip2.tasks import Task
     opened = _patch_open_subprocess(monkeypatch)
@@ -872,15 +873,7 @@ async def test_chord_act_yes_slack_uses_osascript_open_location(monkeypatch):
 
     await chords.handle_chord(ctx, "act+yes")
 
-    assert len(opened) == 1
-    argv = opened[0]
-    assert argv[0] == "osascript"
-    # AppleScript is passed via ``-e`` lines and the URL is positional
-    # so there's no string-interpolation hazard with ``&`` / quotes in
-    # the permalink.
-    assert argv[-1] == permalink
-    assert any("open location" in arg for arg in argv)
-    assert any("Slack" in arg for arg in argv)
+    assert opened == [["open", "-a", chords._CHROME_APP, permalink]]
 
 
 @pytest.mark.asyncio
