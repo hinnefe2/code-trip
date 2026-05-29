@@ -218,15 +218,6 @@ def test_queue_table_marker_follows_cursor():
     assert "▶" not in top_line
 
 
-def test_topics_panel_orders_most_recent_first():
-    ctx = _make_ctx()
-    import time as _t
-    ctx.recent_topics.touch("ticket-1", now=_t.time() - 60)
-    ctx.recent_topics.touch("ticket-2", now=_t.time() - 5)
-    out = _render(tui._topics_panel(ctx))
-    assert out.find("ticket-2") < out.find("ticket-1")
-
-
 def test_keymap_queue_mode_shows_queue_relevant_keys():
     ctx = _make_ctx(app_mode="queue")
     out = _render(tui._keymap_panel(ctx))

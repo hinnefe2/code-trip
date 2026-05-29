@@ -214,21 +214,6 @@ def _queue_table(ctx: "Context") -> Panel:
     return Panel(table, title=title, border_style="green")
 
 
-def _topics_panel(ctx: "Context") -> Panel:
-    items = ctx.recent_topics.as_list()
-    if not items:
-        body = Text("(no recent topics)", style="dim italic")
-    else:
-        now = time.time()
-        # Reversed so most-recent is on the left.
-        parts: list[Text] = []
-        for topic, when in reversed(items):
-            parts.append(Text(topic, style="cyan"))
-            parts.append(Text(f" ({_format_age(now - when)})  ", style="dim"))
-        body = Text.assemble(*parts)
-    return Panel(body, title="Recent topics", border_style="bright_black")
-
-
 def _keymap_panel(ctx: "Context") -> Panel:
     """Mode-aware macropad reference, rendered as a grid.
 
@@ -424,7 +409,7 @@ class CodeTripApp(App):
         height: 1fr;
     }
     #left {
-        width: 2fr;
+        width: 1fr;
     }
     #right {
         width: 1fr;
@@ -471,9 +456,9 @@ class CodeTripApp(App):
         with Horizontal(id="body"):
             with Vertical(id="left"):
                 yield Static(_current_task_panel(self.ctx), id="current_task")
+            with Vertical(id="right"):
                 yield Static(_queue_table(self.ctx), id="queue")
                 yield Static(_autohandle_panel(self.ctx), id="autohandle")
-            yield Static(_topics_panel(self.ctx), id="right")
         input_widget = Input(
             placeholder="type or wait for paste — Enter submits, Esc clears",
             id="voice_input",
@@ -493,7 +478,6 @@ class CodeTripApp(App):
             self.query_one("#current_task", Static).update(_current_task_panel(self.ctx))
             self.query_one("#queue", Static).update(_queue_table(self.ctx))
             self.query_one("#autohandle", Static).update(_autohandle_panel(self.ctx))
-            self.query_one("#right", Static).update(_topics_panel(self.ctx))
             self.query_one("#keymap", Static).update(_keymap_panel(self.ctx))
             self.query_one("#producers", Static).update(_producers_panel(self.supervisor))
         except Exception:
