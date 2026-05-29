@@ -24,7 +24,7 @@ You're being invoked on an email task that looks like a GitHub notification repo
    - A human review comment, a human reply, a human approval / change request with commentary, a human @-mention of the user — anything beyond a bare "Closed/Merged #N" auto-message. Return: `Not archived — this involves human activity.`
    - A CI failure, a failed workflow run, a failed status check, a failed deploy, or any other error signal — the user wants to see CI failures even though they're bot-emitted. Return: `Not archived — this reports a CI failure.`
 
-2. **Archive the email.** Use `mcp__claude_ai_Gmail__unlabel_thread` with the email's `thread_id` (from the task source) and `labelIds=["INBOX"]`.
+2. **Archive the email.** Use `mcp__claude_ai_Gmail__unlabel_thread` with `threadId=<the email's thread_id from the task source>` and `labelIds=["INBOX"]`. The tool's required argument is **`threadId` (camelCase)** — the task source's field is `thread_id` (snake_case), so rename when passing. Passing `thread_id` makes the MCP reject with a misleading "Invalid label" error.
 
 Don't ask for confirmation. When archived, return ONE sentence: `Archived GitHub bot notification: <brief subject>.`
 

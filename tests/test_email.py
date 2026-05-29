@@ -506,7 +506,7 @@ async def test_respond_email_archive_intent_calls_unlabel_thread(transcript: str
     mcp.call_tool.assert_called_once()
     call = mcp.call_tool.call_args
     assert call.args[0] == "unlabel_thread"
-    assert call.args[1] == {"thread_id": "T1", "labelIds": ["INBOX"]}
+    assert call.args[1] == {"threadId": "T1", "labelIds": ["INBOX"]}
     assert ctx.queue.get(task.id).state == "done"
     assert ctx.current_task is None
 

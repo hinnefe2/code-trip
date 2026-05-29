@@ -26,7 +26,7 @@ You're being invoked on an email task that looks like a mass marketing or produc
 
    In any stop case, return one sentence describing why and skip the archive.
 
-2. **Archive the email.** Use `mcp__claude_ai_Gmail__unlabel_thread` with the email's `thread_id` (from the task source) and `labelIds=["INBOX"]`.
+2. **Archive the email.** Use `mcp__claude_ai_Gmail__unlabel_thread` with `threadId=<the email's thread_id from the task source>` and `labelIds=["INBOX"]`. The tool's required argument is **`threadId` (camelCase)** — the task source's field is `thread_id` (snake_case), so rename when passing. Passing `thread_id` makes the MCP reject with a misleading "Invalid label" error.
 
 Don't ask for confirmation. When archived, return ONE sentence: `Archived vendor update from <sender>: <brief subject>.`
 

@@ -471,7 +471,10 @@ async def _archive_email(ctx: "Context", task: Task) -> None:
     try:
         await mcp.call_tool(
             "unlabel_thread",
-            {"thread_id": thread_id, "labelIds": ["INBOX"]},
+            # ``threadId`` (camelCase) is the Gmail MCP's required arg
+            # name. Passing ``thread_id`` makes the MCP reject with a
+            # misleading "Invalid label" error.
+            {"threadId": thread_id, "labelIds": ["INBOX"]},
         )
     except Exception as exc:
         logger.exception("Email archive failed")
