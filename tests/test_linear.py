@@ -242,6 +242,66 @@ async def test_producer_cursor_advances_past_filtered_issues(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_producer_retires_task_when_ticket_leaves_active_set(tmp_path: Path):
+    """If a ticket the producer previously surfaced now returns with a
+    non-allowed statusType (user closed/canceled it in Linear), the
+    pending task is marked done. Linear has no push notification for
+    status changes, so this incremental-poll sweep is what keeps the
+    queue in sync without restart."""
+    p, q, mcp, _state = _producer(tmp_path, state_types=("started",))
+    p._first_poll = False  # incremental path is where the sweep runs
+
+    # First poll surfaces an active ticket.
+    mcp.call_tool.return_value = {
+        "issues": [{
+            "id": "AI-7",
+            "title": "active",
+            "statusType": "started",
+            "url": "u",
+            "updatedAt": "2026-05-28T10:00:00.000Z",
+        }]
+    }
+    await p._poll_once()
+    [task] = q.pending()
+    assert task.source["identifier"] == "AI-7"
+
+    # User closes AI-7 in Linear → next incremental poll returns it
+    # with statusType="completed". The producer should mark the
+    # existing task done rather than just skipping it.
+    mcp.call_tool.return_value = {
+        "issues": [{
+            "id": "AI-7",
+            "title": "active",
+            "statusType": "completed",
+            "url": "u",
+            "updatedAt": "2026-05-28T11:00:00.000Z",
+        }]
+    }
+    await p._poll_once()
+    assert q.pending() == []
+    assert q.get(task.id).state == "done"
+
+
+@pytest.mark.asyncio
+async def test_producer_filtered_issue_with_no_pending_task_is_silent(tmp_path: Path):
+    """A filtered-out issue we never had a task for is a plain skip —
+    we don't try to mark anything done and don't error."""
+    p, q, mcp, _state = _producer(tmp_path, state_types=("started",))
+    p._first_poll = False
+    mcp.call_tool.return_value = {
+        "issues": [{
+            "id": "AI-NEVERSEEN",
+            "title": "done before we noticed",
+            "statusType": "completed",
+            "url": "u",
+            "updatedAt": "2026-05-28T11:00:00.000Z",
+        }]
+    }
+    await p._poll_once()
+    assert q.all() == []
+
+
+@pytest.mark.asyncio
 async def test_producer_collapses_repeat_sightings_into_single_task(tmp_path: Path):
     """Seeing the same identifier on the next poll updates the existing task."""
     p, q, mcp, _state = _producer(tmp_path, state_types=("started",))

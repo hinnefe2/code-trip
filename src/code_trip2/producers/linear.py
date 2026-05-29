@@ -118,6 +118,7 @@ class LinearProducer:
             return
         emitted = 0
         skipped = 0
+        retired = 0
         max_ts_seen = self._state.last_updated_at() or ""
         for issue in issues:
             identifier = issue.get("identifier") or ""
@@ -131,7 +132,17 @@ class LinearProducer:
             if updated_at > max_ts_seen:
                 max_ts_seen = updated_at
             if status_type not in allowed:
-                skipped += 1
+                # Mid-session cleanup: a ticket that's now out of the
+                # active set (closed, canceled, moved to backlog) but
+                # has a pending queue task means the user just closed
+                # it in Linear. Linear has no push notification for
+                # status changes, so this incremental-poll sweep is
+                # the only way to retire the task without waiting for
+                # restart.
+                if self._mark_closed_task(identifier):
+                    retired += 1
+                else:
+                    skipped += 1
                 continue
             try:
                 self._emit_task(issue)
@@ -144,9 +155,9 @@ class LinearProducer:
             self._state.set_last_updated_at(max_ts_seen)
 
         logger.info(
-            "LinearProducer: %s poll — %d issues (%d emitted, %d filtered out)",
+            "LinearProducer: %s poll — %d issues (%d emitted, %d retired, %d filtered out)",
             "wide" if wide_poll else "incremental",
-            len(issues), emitted, skipped,
+            len(issues), emitted, retired, skipped,
         )
 
         # Wide-poll only happens once per session. Even if it returned
@@ -322,3 +333,16 @@ class LinearProducer:
             if (task.source or {}).get("identifier") == identifier:
                 return task
         return None
+
+    def _mark_closed_task(self, identifier: str) -> bool:
+        """Retire a queue task for a ticket that's left the active set.
+
+        Returns True when a pending task existed and was marked done;
+        False when there was nothing to clean up (the common case —
+        most filtered issues never had a queue task).
+        """
+        existing = self._find_pending_issue_task(identifier)
+        if existing is None:
+            return False
+        self._queue.mark_done(existing.id)
+        return True
