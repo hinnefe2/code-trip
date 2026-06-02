@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from code_trip2 import tts_client
+from code_trip2 import audio_out, tts_client
 from code_trip2.tts_client import (
     _FADE_MS,
     _SILENCE_PAD_MS,
@@ -138,89 +138,65 @@ def _stub_client():
     c.speed = 1.0
     c._client = MagicMock()
     c._playing = False
-    c._stream = None
-    c._stream_rate = 0
-    c._stream_channels = 0
-    c._stream_lock = threading.Lock()
     c._speak_lock = threading.Lock()
     c._stop_event = threading.Event()
     return c
 
 
-def test_ensure_stream_creates_once_and_caches():
-    c = _stub_client()
-    with patch.object(tts_client, "sd") as sd_mock:
-        sd_mock.OutputStream.return_value = MagicMock()
-        s1 = c._ensure_stream(24_000, 1)
-        s2 = c._ensure_stream(24_000, 1)
-    assert s1 is s2
-    assert sd_mock.OutputStream.call_count == 1
-
-
-def test_ensure_stream_recreates_on_rate_change():
-    c = _stub_client()
-    stream_a = MagicMock()
-    stream_b = MagicMock()
-    with patch.object(tts_client, "sd") as sd_mock:
-        sd_mock.OutputStream.side_effect = [stream_a, stream_b]
-        c._ensure_stream(24_000, 1)
-        c._ensure_stream(48_000, 1)
-    stream_a.close.assert_called_once()
-    assert sd_mock.OutputStream.call_count == 2
-
-
-def test_ensure_stream_uses_high_latency():
-    c = _stub_client()
-    with patch.object(tts_client, "sd") as sd_mock:
-        sd_mock.OutputStream.return_value = MagicMock()
-        c._ensure_stream(24_000, 1)
-    kwargs = sd_mock.OutputStream.call_args.kwargs
-    assert kwargs["latency"] == "high"
-    assert kwargs["samplerate"] == 24_000
-    assert kwargs["channels"] == 1
-    assert kwargs["dtype"] == "int16"
-
-
 @pytest.mark.asyncio
-async def test_write_in_blocks_streams_full_array():
+async def test_write_in_blocks_streams_full_array(monkeypatch):
     c = _stub_client()
-    stream = MagicMock()
+    monkeypatch.setattr(audio_out, "stream_rate", lambda: 24_000)
+    writes: list[np.ndarray] = []
+    monkeypatch.setattr(audio_out, "play_blocking", lambda s: writes.append(s))
     samples = np.zeros(_WRITE_BLOCK_FRAMES * 3 + 100, dtype=np.int16)
-    await c._write_in_blocks(stream, samples)
+    await c._write_in_blocks(samples, 24_000)
     # Expect 4 writes: 3 full blocks + a remainder.
-    assert stream.write.call_count == 4
-    total_written = sum(len(call.args[0]) for call in stream.write.call_args_list)
+    assert len(writes) == 4
+    total_written = sum(len(w) for w in writes)
     assert total_written == len(samples)
 
 
 @pytest.mark.asyncio
-async def test_write_in_blocks_stops_when_event_set():
+async def test_write_in_blocks_stops_when_event_set(monkeypatch):
     c = _stub_client()
-    stream = MagicMock()
-    samples = np.zeros(_WRITE_BLOCK_FRAMES * 5, dtype=np.int16)
-    # Set the stop event before write 3.
+    monkeypatch.setattr(audio_out, "stream_rate", lambda: 24_000)
     counter = {"calls": 0}
+
     def fake_write(_):
         counter["calls"] += 1
         if counter["calls"] == 2:
             c._stop_event.set()
-    stream.write.side_effect = fake_write
-    await c._write_in_blocks(stream, samples)
-    # Stop should be honored within one extra block (the loop checks
-    # at the top of each iteration).
-    assert stream.write.call_count == 2
+
+    monkeypatch.setattr(audio_out, "play_blocking", fake_write)
+    samples = np.zeros(_WRITE_BLOCK_FRAMES * 5, dtype=np.int16)
+    await c._write_in_blocks(samples, 24_000)
+    # Stop is honored within one extra block (loop checks at the top).
+    assert counter["calls"] == 2
 
 
-def test_stop_does_not_close_stream():
-    """The stream must stay alive across stop()/speak() cycles so the
-    audio device doesn't get reinitialized on every utterance."""
+@pytest.mark.asyncio
+async def test_write_in_blocks_resamples_to_stream_rate(monkeypatch):
+    """Source at 24 kHz played through a 48 kHz stream should be
+    upsampled, so the total written sample count roughly doubles."""
     c = _stub_client()
-    c._stream = MagicMock()
-    c._stream_rate = 24_000
-    c._stream_channels = 1
+    monkeypatch.setattr(audio_out, "stream_rate", lambda: 48_000)
+    writes: list[np.ndarray] = []
+    monkeypatch.setattr(audio_out, "play_blocking", lambda s: writes.append(s))
+    samples = np.zeros(1200, dtype=np.int16)  # 50 ms at 24 kHz
+    await c._write_in_blocks(samples, 24_000)
+    total = sum(len(w) for w in writes)
+    # ~2400 samples at 48 kHz; allow a rounding wiggle.
+    assert 2390 <= total <= 2410
+
+
+def test_stop_just_sets_event():
+    """stop() must not touch the shared OutputStream — leaving it
+    alive across utterances is what keeps the audio device warm."""
+    c = _stub_client()
+    assert not c._stop_event.is_set()
     c.stop()
-    c._stream.close.assert_not_called()
-    assert c._stream is not None
+    assert c._stop_event.is_set()
 
 
 # --- SilentTTSClient ------------------------------------------------------
@@ -245,14 +221,15 @@ def test_earcon_set_silent_short_circuits_play(monkeypatch):
     every audio path — not just TTS."""
     from code_trip2 import earcon
 
-    fake_sd = MagicMock()
-    monkeypatch.setattr(earcon, "sd", fake_sd)
-    # Sanity: when not silent, _play hits sounddevice.
+    monkeypatch.setattr(audio_out, "stream_rate", lambda: 48_000)
+    play_mock = MagicMock()
+    monkeypatch.setattr(audio_out, "play_blocking", play_mock)
+    # Sanity: when not silent, earcons hit the shared audio stream.
     earcon.set_silent(False)
     try:
         earcon.completion()
-        assert fake_sd.play.called
-        fake_sd.play.reset_mock()
+        assert play_mock.called
+        play_mock.reset_mock()
         # When silent, no audio call.
         earcon.set_silent(True)
         earcon.completion()
@@ -260,7 +237,7 @@ def test_earcon_set_silent_short_circuits_play(monkeypatch):
         earcon.mode_chime("queue")
         earcon.new_task()
         earcon.thinking()
-        fake_sd.play.assert_not_called()
+        play_mock.assert_not_called()
         # And the Thinking class declines to spawn its background thread.
         t = earcon.Thinking(interval=0.01)
         t.start()

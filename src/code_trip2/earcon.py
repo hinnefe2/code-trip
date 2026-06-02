@@ -1,4 +1,11 @@
-"""Short audio cues (earcons) via sounddevice + numpy."""
+"""Short audio cues (earcons) routed through the shared OutputStream.
+
+Earcons used to call ``sd.play()`` per beep, which opens and tears
+down a fresh CoreAudio stream every time. Repeated open/close
+thrashes the device and shows up as a click/chop at the start of
+the next sound — including in unrelated apps. We now write into the
+same persistent stream as TTS, so the device stays warm.
+"""
 
 from __future__ import annotations
 
@@ -6,17 +13,12 @@ import threading
 
 import numpy as np
 
-try:
-    import sounddevice as sd
-except OSError:
-    sd = None  # type: ignore[assignment]
+from code_trip2 import audio_out
 
 
 class EarconError(Exception):
     pass
 
-
-_SR = 44_100
 
 # Module-level mute. ``main.py`` flips this on for ``--silent``; every
 # play call early-returns and ``Thinking`` declines to spawn its
@@ -37,9 +39,10 @@ def is_silent() -> bool:
 
 
 def _tone(freq: float, duration: float, amplitude: float = 0.2) -> np.ndarray:
-    t = np.linspace(0, duration, int(_SR * duration), endpoint=False)
+    sr = audio_out.stream_rate()
+    t = np.linspace(0, duration, int(sr * duration), endpoint=False)
     wave = amplitude * np.sin(2 * np.pi * freq * t)
-    fade = int(_SR * 0.01)
+    fade = int(sr * 0.01)
     if fade * 2 < len(wave):
         env = np.ones_like(wave)
         env[:fade] = np.linspace(0, 1, fade)
@@ -52,8 +55,7 @@ def _play(samples: np.ndarray) -> None:
     if _silent:
         return
     try:
-        sd.play(samples, samplerate=_SR)
-        sd.wait()
+        audio_out.play_blocking(samples)
     except Exception as exc:
         raise EarconError(f"Playback failed: {exc}") from exc
 

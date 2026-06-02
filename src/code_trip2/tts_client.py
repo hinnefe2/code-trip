@@ -21,10 +21,7 @@ import numpy as np
 import openai
 from openai import APIConnectionError, APIError, AsyncOpenAI, AuthenticationError
 
-try:
-    import sounddevice as sd
-except OSError:
-    sd = None  # type: ignore[assignment]  # PortAudio not installed; tests mock this
+from code_trip2 import audio_out
 
 logger = logging.getLogger(__name__)
 
@@ -45,15 +42,9 @@ ENV_API_KEY: str = "OPENAI_API_KEY"
 _FADE_MS: int = 12
 _SILENCE_PAD_MS: int = 40
 
-# Playback is done over a single, long-lived OutputStream rather than
-# the high-level ``sd.play()`` helper, which opens and tears down a
-# fresh stream on every call. Repeated reinit thrashes the audio device
-# (especially when the device's native rate differs from the TTS rate
-# — 48 kHz vs 24 kHz on macOS) and shows up as buffer underruns / pops
-# throughout playback, not just at the edges. With a persistent stream
-# the device stays configured and we just write blocks to it. Blocks
-# of ~170 ms at 24 kHz give us a reasonable cadence for honoring stop
-# requests without holding the GIL too long per write.
+# Block size for writing into the shared OutputStream. Small enough
+# that stop() is honored within ~85 ms at 48 kHz (~170 ms at 24 kHz),
+# large enough that we're not paying GIL overhead per sample.
 _WRITE_BLOCK_FRAMES: int = 4096
 
 
@@ -109,17 +100,8 @@ class TTSClient:
 
     _client: AsyncOpenAI = field(default=None, init=False, repr=False)  # type: ignore[assignment]
     _playing: bool = field(default=False, init=False, repr=False)
-    # Persistent OutputStream so we don't reopen the audio device on every
-    # speak() call. Lazily created and recreated only when the sample
-    # rate / channel count changes.
-    _stream: object = field(default=None, init=False, repr=False)
-    _stream_rate: int = field(default=0, init=False, repr=False)
-    _stream_channels: int = field(default=0, init=False, repr=False)
-    _stream_lock: threading.Lock = field(
-        default_factory=threading.Lock, init=False, repr=False
-    )
     # Serializes the body of speak() so two concurrent callers can't both
-    # write into the persistent OutputStream's ring buffer at once.
+    # write into the shared OutputStream's ring buffer at once.
     # PortAudio's PaUtil_WriteRingBuffer is single-writer; concurrent
     # writes corrupt the head/tail pointers and segfault the process
     # (DiagnosticReports 2026-05-22 onward: PaUtil_WriteRingBuffer + 180,
@@ -185,13 +167,11 @@ class TTSClient:
                 raise TTSClientError("Empty audio returned")
 
             samples, sample_rate = _decode_wav(audio)
-            channels = 1 if samples.ndim == 1 else samples.shape[1]
 
             self._stop_event.clear()
-            stream = self._ensure_stream(sample_rate, channels)
             self._playing = True
             try:
-                await self._write_in_blocks(stream, samples)
+                await self._write_in_blocks(samples, sample_rate)
             finally:
                 self._playing = False
 
@@ -199,11 +179,8 @@ class TTSClient:
         """Interrupt any in-progress playback.
 
         Sync and thread-safe — sets a stop flag that the block writer
-        loop checks between writes. The stream itself is left open so
-        the next ``speak()`` doesn't pay the reopen cost. The next
-        ``speak()`` acquires ``_speak_lock`` and won't overlap with a
-        still-finishing writer because the writer holds the lock until
-        it exits.
+        loop checks between writes. The shared audio stream is left
+        open so the next ``speak()`` doesn't pay the reopen cost.
         """
         self._stop_event.set()
 
@@ -213,60 +190,24 @@ class TTSClient:
 
     # --- internals --------------------------------------------------------
 
-    def _ensure_stream(self, sample_rate: int, channels: int):
-        """Return the live OutputStream, creating it if needed.
-
-        Recreated when the sample-rate or channel count changes (rare —
-        OpenAI TTS always returns mono 24 kHz today, but the device may
-        be the user's choice and we want to honor whatever WAV comes
-        back).
-        """
-        with self._stream_lock:
-            if (
-                self._stream is not None
-                and self._stream_rate == sample_rate
-                and self._stream_channels == channels
-            ):
-                return self._stream
-
-            if self._stream is not None:
-                try:
-                    self._stream.close()
-                except Exception:
-                    logger.warning("TTS: failed to close prior stream", exc_info=True)
-
-            try:
-                self._stream = sd.OutputStream(
-                    samplerate=sample_rate,
-                    channels=channels,
-                    dtype="int16",
-                    latency="high",
-                )
-                self._stream.start()
-            except Exception as exc:
-                self._stream = None
-                self._stream_rate = 0
-                self._stream_channels = 0
-                raise TTSClientError(f"Could not open audio stream: {exc}") from exc
-
-            self._stream_rate = sample_rate
-            self._stream_channels = channels
-            return self._stream
-
-    async def _write_in_blocks(self, stream, samples: np.ndarray) -> None:
-        """Push samples into the stream in small blocks so we can
-        honor ``stop()`` without aborting the stream.
+    async def _write_in_blocks(self, samples: np.ndarray, src_rate: int) -> None:
+        """Resample to the shared stream's rate, then push samples in
+        small blocks so we can honor ``stop()`` without aborting playback.
 
         Each block is written from an executor thread so the event loop
-        stays responsive — sounddevice's ``stream.write`` blocks until
-        the block is consumed (~170 ms at 24 kHz).
+        stays responsive. The shared OutputStream's write lock keeps the
+        TTS writer from interleaving with earcons mid-utterance.
         """
-        total = len(samples)
+        if samples.ndim > 1:
+            samples = samples.mean(axis=1)
+        float_samples = samples.astype(np.float32) / 32768.0
+        resampled = audio_out.resample_to_stream(float_samples, src_rate)
+        total = len(resampled)
         for start in range(0, total, _WRITE_BLOCK_FRAMES):
             if self._stop_event.is_set():
                 return
             end = min(start + _WRITE_BLOCK_FRAMES, total)
-            await asyncio.to_thread(stream.write, samples[start:end])
+            await asyncio.to_thread(audio_out.play_blocking, resampled[start:end])
 
 
 # --- helpers --------------------------------------------------------------

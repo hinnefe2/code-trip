@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from code_trip2 import earcon
+from code_trip2 import audio_out, earcon
 from code_trip2.chords import handle_chord, handle_tap
 from code_trip2.config import Config, load_config
 from code_trip2.dispatch import QueueConsumer, handle_skill, handle_voice
@@ -431,6 +431,10 @@ async def main_async(config: Config, *, tui: bool = False, silent: bool = False)
         await supervisor.stop_all()
         macropad.stop()
         thinking.stop()
+        # Release the shared CoreAudio stream so the OS doesn't keep
+        # the device pinned at our sample rate — leaving it open is
+        # what makes the *next* app's first sound get clipped.
+        audio_out.shutdown()
         log.close()
 
 
