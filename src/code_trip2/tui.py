@@ -226,7 +226,7 @@ def _queue_table(ctx: "Context") -> Panel:
     table.add_column("headline", overflow="ellipsis")
     now = time.time()
     cursor_id = ctx.current_task.id if ctx.current_task is not None else None
-    for i, (t, _score) in enumerate(ranked[:10]):
+    for i, (t, _score) in enumerate(ranked):
         # The ▶ marker follows the cursor (not the top-ranked row) so
         # arrow-key navigation moves visibly without reshuffling the
         # queue. Falls back to the top row when there's no cursor —
@@ -244,8 +244,6 @@ def _queue_table(ctx: "Context") -> Panel:
             _truncate(t.headline or "", 80),
         )
     title = f"Queue ({len(pending)} pending)"
-    if len(ranked) > 10:
-        title += f"  (+{len(ranked) - 10} more)"
     return Panel(table, title=title, border_style="green")
 
 

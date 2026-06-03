@@ -248,6 +248,23 @@ def test_queue_table_populated_shows_pending_count_and_top():
     assert "alice pinged" in out
 
 
+def test_queue_table_renders_all_pending_tasks():
+    """No display cap — every pending task should appear, however long
+    the queue grows."""
+    ctx = _make_ctx()
+    for i in range(15):
+        ctx.queue.add(Task(
+            kind="note", topic=f"t{i}", headline=f"row-{i:02d}",
+            created_at=float(i),
+        ))
+    out = _render(tui._queue_table(ctx))
+    assert "15 pending" in out
+    for i in range(15):
+        assert f"row-{i:02d}" in out
+    # The pre-expansion overflow indicator must be gone.
+    assert "more" not in out.lower()
+
+
 def test_queue_table_marker_follows_cursor():
     """The ▶ marker tracks ctx.current_task so arrow-key navigation moves
     visibly without reshuffling the queue."""
