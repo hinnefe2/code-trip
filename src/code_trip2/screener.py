@@ -67,6 +67,12 @@ class ScreeningOutcome:
     summary: str | None = None
     error: str | None = None
     dry_run_nominated: bool = False
+    # New tasks the skill chose to spawn (e.g. the meeting-notes archiver
+    # turning a "Henry: investigate X" action item into a meeting_followup
+    # task). The screener routes these through ``add_to_queue`` regardless
+    # of the action on the original task — handling the parent and
+    # spawning children are independent decisions.
+    follow_up_tasks: tuple[Task, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -108,6 +114,18 @@ def candidates_for(
 # mis-tags an auto-handle skill as DISMISS still gets the right
 # behavior.
 _PICK_RE = re.compile(r"(?:HANDLE|DISMISS)\s*[:= ]\s*([A-Za-z0-9_\-]+)")
+# Skill executors can spawn additional tasks by emitting one line per
+# task: ``FOLLOWUP_TASK: {"headline": "...", "body": "...", "topic": "…"}``.
+# The line must be on its own (no leading text other than whitespace /
+# code-fence backticks) — the JSON payload itself can use any of the
+# documented fields. The kind defaults to ``meeting_followup``, the
+# topic defaults to ``inbox``. Designed for the Gemini meeting-notes
+# archiver but available to any skill.
+_FOLLOWUP_RE = re.compile(
+    r"^\s*`*\s*FOLLOWUP_TASK\s*:\s*(\{.*\})\s*`*\s*$", re.MULTILINE,
+)
+_FOLLOWUP_DEFAULT_KIND = "meeting_followup"
+_FOLLOWUP_DEFAULT_TOPIC = "inbox"
 
 
 def parse_classifier_reply(
@@ -121,6 +139,46 @@ def parse_classifier_reply(
     if not m:
         return None
     return name_to_manifest.get(m.group(1).strip())
+
+
+def parse_follow_up_tasks(summary: str | None) -> tuple[Task, ...]:
+    """Pull spawned tasks from an executor's summary.
+
+    Recognises lines like ``FOLLOWUP_TASK: {"headline": "..."}``. Lines
+    with malformed JSON or a missing headline are skipped — a buggy
+    skill output shouldn't poison the queue. Returns tasks with
+    ``kind`` defaulted to ``meeting_followup`` unless the JSON
+    specifies one.
+    """
+    if not summary:
+        return ()
+    out: list[Task] = []
+    for m in _FOLLOWUP_RE.finditer(summary):
+        raw = m.group(1).strip()
+        try:
+            payload = json.loads(raw)
+        except (ValueError, TypeError):
+            logger.warning("Skipping malformed FOLLOWUP_TASK JSON: %s", raw)
+            continue
+        if not isinstance(payload, dict):
+            continue
+        headline = str(payload.get("headline") or "").strip()
+        if not headline:
+            continue
+        body = payload.get("body")
+        if body is not None:
+            body = str(body)
+        topic = str(payload.get("topic") or _FOLLOWUP_DEFAULT_TOPIC).strip() or _FOLLOWUP_DEFAULT_TOPIC
+        kind = str(payload.get("kind") or _FOLLOWUP_DEFAULT_KIND).strip() or _FOLLOWUP_DEFAULT_KIND
+        source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
+        out.append(Task(
+            kind=kind,
+            topic=topic,
+            headline=headline,
+            body=body,
+            source=source,
+        ))
+    return tuple(out)
 
 
 def build_classifier_prompt(
@@ -300,8 +358,12 @@ async def screen(
         return ScreeningOutcome(
             "failed", annotated, skill=chosen.name, error=str(exc),
         )
+    follow_ups = parse_follow_up_tasks(summary)
+    for ft in follow_ups:
+        ft.parent_id = task.id
     return ScreeningOutcome(
         "handled", task, skill=chosen.name, summary=summary,
+        follow_up_tasks=follow_ups,
     )
 
 
@@ -375,13 +437,23 @@ async def run_screener_loop(
             on_outcome(outcome)
         except Exception:
             logger.exception("on_outcome callback raised; continuing")
-        # Only ``forward`` and ``failed`` outcomes surface to the user.
-        # ``handled`` (executor ran) and ``dismissed`` (classifier said
-        # not worth surfacing) both suppress the task from the queue.
+        # Only ``forward`` and ``failed`` outcomes surface the original
+        # task to the user. ``handled`` (executor ran) and ``dismissed``
+        # (classifier said not worth surfacing) both suppress it.
         if outcome.action in ("forward", "failed"):
             try:
                 add_to_queue(outcome.task)
             except Exception:
                 logger.exception(
                     "add_to_queue failed for task %s", outcome.task.id,
+                )
+        # Follow-up tasks ride along independently — a handled
+        # meeting-notes email can still spawn a meeting_followup the
+        # user needs to see.
+        for ft in outcome.follow_up_tasks:
+            try:
+                add_to_queue(ft)
+            except Exception:
+                logger.exception(
+                    "add_to_queue failed for follow-up task %s", ft.id,
                 )

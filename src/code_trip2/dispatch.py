@@ -356,6 +356,9 @@ def _kind_label(task: Task) -> str:
     if task.kind == "linear_issue":
         identifier = task.source.get("identifier") or ""
         return f"Linear {identifier}" if identifier else "Linear issue"
+    if task.kind == "meeting_followup":
+        meeting = task.source.get("meeting") or task.topic or ""
+        return f"Meeting follow-up from {meeting}" if meeting else "Meeting follow-up"
     if task.kind == "note":
         return "Note"
     if task.kind == "web":

@@ -373,3 +373,28 @@ async def test_handle_skill_agent_error_keeps_task_active():
     await dispatch.handle_skill(ctx, "accept invite")
     assert ctx.queue.get(t.id).state != "done"
     assert ctx.current_task is t
+
+
+def test_kind_label_meeting_followup_uses_meeting_when_available():
+    t = Task(
+        kind="meeting_followup",
+        topic="planning-sync",
+        headline="Draft retention doc",
+        source={"meeting": "Planning sync"},
+    )
+    assert "Planning sync" in dispatch._kind_label(t)
+
+
+def test_kind_label_meeting_followup_falls_back_to_topic():
+    t = Task(
+        kind="meeting_followup",
+        topic="planning-sync",
+        headline="Draft retention doc",
+        source={},
+    )
+    assert "planning-sync" in dispatch._kind_label(t)
+
+
+def test_kind_label_meeting_followup_with_no_context():
+    t = Task(kind="meeting_followup", topic="", headline="x", source={})
+    assert dispatch._kind_label(t) == "Meeting follow-up"

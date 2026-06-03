@@ -14,6 +14,7 @@ from code_trip2.screener import (
     _next_or_stop,
     candidates_for,
     parse_classifier_reply,
+    parse_follow_up_tasks,
     run_screener_loop,
     screen,
 )
@@ -561,3 +562,124 @@ async def test_next_or_stop_returns_none_when_stop_fires_first():
     asyncio.create_task(setter())
     out = await asyncio.wait_for(_next_or_stop(q, stop), timeout=1.0)
     assert out is None
+
+
+# --- follow-up tasks ------------------------------------------------------
+
+
+def test_parse_follow_up_tasks_extracts_meeting_followups():
+    summary = (
+        "FOLLOWUP_TASK: {\"headline\": \"Draft retention doc\", "
+        "\"body\": \"From planning sync: draft retention metrics doc.\", "
+        "\"topic\": \"planning-sync\"}\n"
+        "FOLLOWUP_TASK: {\"headline\": \"Reply to Anna re: schema\"}\n"
+        "Archived Gemini meeting notes: Planning sync."
+    )
+    out = parse_follow_up_tasks(summary)
+    assert len(out) == 2
+    assert out[0].kind == "meeting_followup"
+    assert out[0].headline == "Draft retention doc"
+    assert out[0].topic == "planning-sync"
+    assert out[0].body and "retention metrics" in out[0].body
+    # Missing topic falls back to "inbox".
+    assert out[1].topic == "inbox"
+    assert out[1].headline == "Reply to Anna re: schema"
+
+
+def test_parse_follow_up_tasks_skips_malformed_lines():
+    summary = (
+        "FOLLOWUP_TASK: not-json-at-all\n"
+        "FOLLOWUP_TASK: {\"body\": \"no headline\"}\n"
+        "FOLLOWUP_TASK: {\"headline\": \"\"}\n"
+        "FOLLOWUP_TASK: {\"headline\": \"keep me\", \"body\": \"yep\"}\n"
+    )
+    out = parse_follow_up_tasks(summary)
+    assert [t.headline for t in out] == ["keep me"]
+
+
+def test_parse_follow_up_tasks_handles_no_summary():
+    assert parse_follow_up_tasks(None) == ()
+    assert parse_follow_up_tasks("") == ()
+    assert parse_follow_up_tasks("plain summary, no follow-ups") == ()
+
+
+def test_parse_follow_up_tasks_tolerates_backtick_wrapping():
+    """LLMs sometimes wrap the line in code fences."""
+    summary = "`FOLLOWUP_TASK: {\"headline\": \"a\"}`"
+    out = parse_follow_up_tasks(summary)
+    assert len(out) == 1 and out[0].headline == "a"
+
+
+@pytest.mark.asyncio
+async def test_screen_attaches_follow_up_tasks_from_summary():
+    mcp = MagicMock()
+    mcp.run_agent = AsyncMock(side_effect=[
+        "HANDLE: archive-gemini-meeting-notes",
+        (
+            "FOLLOWUP_TASK: {\"headline\": \"Send doc to Anna\", "
+            "\"body\": \"context\", \"topic\": \"docs\"}\n"
+            "Archived Gemini meeting notes: Planning sync."
+        ),
+    ])
+    parent = _task("email_msg")
+    outcome = await screen(
+        parent, [_manifest("archive-gemini-meeting-notes")], mcp,
+    )
+    assert outcome.action == "handled"
+    assert len(outcome.follow_up_tasks) == 1
+    spawned = outcome.follow_up_tasks[0]
+    assert spawned.kind == "meeting_followup"
+    assert spawned.headline == "Send doc to Anna"
+    assert spawned.topic == "docs"
+    # Spawned tasks reference the parent so the queue log can show lineage.
+    assert spawned.parent_id == parent.id
+
+
+@pytest.mark.asyncio
+async def test_loop_adds_follow_up_tasks_even_when_parent_handled():
+    """A handled meeting-notes email suppresses the parent but still
+    needs to enqueue the spawned meeting_followup tasks."""
+    intake: "asyncio.Queue[Task]" = asyncio.Queue()
+    added: list[Task] = []
+    outcomes: list[ScreeningOutcome] = []
+    stop = asyncio.Event()
+
+    intake.put_nowait(_task("email_msg"))
+
+    mcp = MagicMock()
+    mcp.run_agent = AsyncMock(side_effect=[
+        "HANDLE: archive-gemini-meeting-notes",
+        (
+            "FOLLOWUP_TASK: {\"headline\": \"Draft retention doc\"}\n"
+            "FOLLOWUP_TASK: {\"headline\": \"Reply re schema\"}\n"
+            "Archived Gemini meeting notes: Planning sync."
+        ),
+    ])
+
+    async def driver() -> None:
+        while not outcomes:
+            await asyncio.sleep(0)
+        stop.set()
+
+    loop_task = asyncio.create_task(
+        run_screener_loop(
+            intake=intake,
+            manifests=(_manifest(
+                "archive-gemini-meeting-notes", kinds=("email_msg",),
+            ),),
+            mcp=mcp,
+            add_to_queue=added.append,
+            on_outcome=outcomes.append,
+            allowed_kinds=None,
+            dry_run=False,
+            stop=stop,
+        )
+    )
+    await asyncio.wait_for(asyncio.gather(driver(), loop_task), timeout=2.0)
+    # Parent was handled (suppressed); both follow-ups enqueued.
+    assert [t.kind for t in added] == ["meeting_followup", "meeting_followup"]
+    assert [t.headline for t in added] == [
+        "Draft retention doc", "Reply re schema",
+    ]
+    assert outcomes[0].action == "handled"
+    assert len(outcomes[0].follow_up_tasks) == 2
