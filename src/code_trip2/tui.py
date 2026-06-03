@@ -131,6 +131,11 @@ def _header(ctx: "Context") -> Panel:
 # threads) can't push the Queue panel below it off-screen.
 _CURRENT_TASK_BODY_MAX_LINES = 16
 
+# Slack threads render the initial message + most recent N. Picked so
+# the panel stays under ~10 lines for typical short messages while
+# preserving the conversation arc on long threads.
+_SLACK_THREAD_TAIL = 7
+
 
 def _clip_body(body: str, max_lines: int) -> tuple[str, bool]:
     """Cap ``body`` at ``max_lines`` lines, preserving newlines.
@@ -149,6 +154,33 @@ def _clip_body(body: str, max_lines: int) -> tuple[str, bool]:
     return "\n".join(lines[:max_lines]).rstrip(), True
 
 
+def _render_slack_thread(messages: list[dict], tail: int = _SLACK_THREAD_TAIL) -> list[Text]:
+    """Format a Slack thread as initial + most-recent ``tail`` messages.
+
+    When the thread has more than ``1 + tail`` messages, the initial
+    message is shown, then an ellipsis line covering the hidden middle,
+    then the most recent ``tail``. Otherwise every message is shown.
+    """
+    parts: list[Text] = []
+
+    def _line(m: dict) -> Text:
+        sender = (m.get("sender") or "?").strip() or "?"
+        text = (m.get("text") or "").strip()
+        return Text.assemble(
+            Text(f"{sender}: ", style="bold cyan"),
+            Text(text, style="white"),
+        )
+
+    if len(messages) <= 1 + tail:
+        parts.extend(_line(m) for m in messages)
+        return parts
+    parts.append(_line(messages[0]))
+    hidden = len(messages) - 1 - tail
+    parts.append(Text(f"… ({hidden} older messages hidden)", style="dim italic"))
+    parts.extend(_line(m) for m in messages[-tail:])
+    return parts
+
+
 def _current_task_panel(ctx: "Context") -> Panel:
     t = ctx.current_task
     if t is None:
@@ -162,8 +194,11 @@ def _current_task_panel(ctx: "Context") -> Panel:
         Text(f"  {_format_age(now - t.created_at)} old", style="dim"),
     )
     headline = Text(t.headline or "(no headline)", style="white")
-    parts = [head, headline]
-    if t.body:
+    parts: list = [head, headline]
+    slack_msgs = (t.source or {}).get("messages") if t.kind == "slack_msg" else None
+    if isinstance(slack_msgs, list) and slack_msgs:
+        parts.extend(_render_slack_thread(slack_msgs))
+    elif t.body:
         clipped, truncated = _clip_body(t.body, _CURRENT_TASK_BODY_MAX_LINES)
         if clipped:
             parts.append(Text(clipped, style="dim"))

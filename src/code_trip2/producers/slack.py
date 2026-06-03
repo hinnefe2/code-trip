@@ -555,6 +555,37 @@ class SlackProducer:
         ts = msg.get("ts") or ""
         thread_ts = msg.get("thread_ts") or ts
         headline = f"{sender_name}: {text[:60]}"
+        entry = {"sender": sender_name, "text": text, "ts": ts}
+
+        # Collapse multiple messages in the same thread into a single
+        # pending task: if there's already a pending slack task for this
+        # (channel_id, thread_ts), append the new message to its
+        # source["messages"] history instead of stacking N tasks. The
+        # body holds the latest message text (used by the read-body
+        # feature + screener); the TUI renders the full thread from
+        # source["messages"].
+        existing = self._find_pending_thread_task(channel_id, thread_ts)
+        if existing is not None:
+            prior = existing.source or {}
+            messages = list(prior.get("messages") or [])
+            messages.append(entry)
+            new_source = {
+                **prior,
+                "ts": ts,
+                "sender_id": sender_id,
+                "sender_name": sender_name,
+                "url": msg.get("permalink") or prior.get("url") or "",
+                "messages": messages,
+            }
+            self._queue.update_task(
+                existing.id,
+                headline=headline,
+                body=text,
+                source=new_source,
+                created_at=time.time(),
+            )
+            return
+
         source = {
             "channel_id": channel_id,
             "channel_name": channel_name,
@@ -565,25 +596,8 @@ class SlackProducer:
             # Workspace-qualified permalink. Used by the ACT+YES chord
             # to jump straight to the message in the Slack desktop app.
             "url": msg.get("permalink") or "",
+            "messages": [entry],
         }
-
-        # Collapse multiple messages in the same thread into a single
-        # pending task: if there's already a pending slack task for this
-        # (channel_id, thread_ts), overwrite its body/headline with the
-        # latest message instead of stacking N tasks for one conversation.
-        # Long threads still surface as one inbox item — the body is just
-        # the most recent message, not the whole transcript.
-        existing = self._find_pending_thread_task(channel_id, thread_ts)
-        if existing is not None:
-            self._queue.update_task(
-                existing.id,
-                headline=headline,
-                body=text,
-                source=source,
-                created_at=time.time(),
-            )
-            return
-
         task = Task(
             kind="slack_msg",
             topic=channel_name,

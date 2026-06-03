@@ -1072,6 +1072,12 @@ async def test_producer_collapses_thread_replies_into_single_task(tmp_path: Path
     assert pending[0].id == first.id
     assert "follow-up message" in pending[0].body
     assert "Bob" in pending[0].headline
+    # Both messages in the thread should be recorded in source["messages"]
+    # so the TUI can render the initial + follow-ups.
+    msgs = pending[0].source["messages"]
+    assert [m["sender"] for m in msgs] == ["Alice", "Bob"]
+    assert "first message" in msgs[0]["text"]
+    assert "follow-up message" in msgs[1]["text"]
 
 
 @pytest.mark.asyncio

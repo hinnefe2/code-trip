@@ -158,6 +158,61 @@ def test_current_task_panel_caps_body_and_marks_truncation():
     assert "truncated" in out.lower()
 
 
+def test_current_task_panel_renders_slack_thread_messages():
+    """slack_msg tasks render every message in the thread, not just
+    the latest one stored in body."""
+    ctx = _make_ctx()
+    ctx.current_task = Task(
+        kind="slack_msg",
+        topic="general",
+        headline="Bob: ok let's ship it",
+        body="ok let's ship it",
+        source={
+            "channel_id": "C1",
+            "thread_ts": "1.0",
+            "messages": [
+                {"sender": "Alice", "text": "should we deploy now?", "ts": "1.0"},
+                {"sender": "Bob", "text": "wait for CI", "ts": "2.0"},
+                {"sender": "Bob", "text": "ok let's ship it", "ts": "3.0"},
+            ],
+        },
+    )
+    out = _render(tui._current_task_panel(ctx))
+    assert "Alice" in out and "should we deploy now?" in out
+    assert "wait for CI" in out
+    assert "ok let's ship it" in out
+    assert "hidden" not in out
+
+
+def test_current_task_panel_slack_thread_truncates_long_threads():
+    """When a thread exceeds the cap, the initial message + most recent
+    tail render, with an ellipsis marking the hidden middle."""
+    ctx = _make_ctx()
+    messages = [
+        {"sender": "Alice", "text": "kickoff message", "ts": "1.0"},
+    ] + [
+        {"sender": f"U{i}", "text": f"reply {i}", "ts": f"{i+2}.0"}
+        for i in range(15)
+    ]
+    ctx.current_task = Task(
+        kind="slack_msg",
+        topic="general",
+        headline="U14: reply 14",
+        body="reply 14",
+        source={"channel_id": "C1", "thread_ts": "1.0", "messages": messages},
+    )
+    out = _render(tui._current_task_panel(ctx))
+    # Initial message shown.
+    assert "kickoff message" in out
+    # Tail (most recent _SLACK_THREAD_TAIL=7) shown.
+    for i in range(15 - tui._SLACK_THREAD_TAIL, 15):
+        assert f"reply {i}" in out
+    # Older middle ones hidden.
+    assert "reply 0" not in out
+    hidden = len(messages) - 1 - tui._SLACK_THREAD_TAIL
+    assert f"{hidden} older messages hidden" in out
+
+
 def test_clip_body_short_body_passes_through():
     clipped, truncated = tui._clip_body("a\nb\nc", max_lines=10)
     assert clipped == "a\nb\nc"
