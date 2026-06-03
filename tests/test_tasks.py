@@ -139,6 +139,68 @@ def test_queue_ranked_orders_by_score():
     assert ranked[0][0].id == b.id  # older wins on age
 
 
+def test_queue_ranked_clusters_tasks_by_subject_key():
+    """A Linear task and a Linear-notification email for the same issue
+    should end up adjacent in the ranked output, even when an unrelated
+    higher-aged task would otherwise sit between them."""
+    q = TaskQueue()
+    now = 1000.0
+    sk = "linear:ENGAGE-3991"
+    # Order in queue: linear is oldest (top score), unrelated is middle,
+    # email about the same issue is newest. Without clustering we'd see
+    # [linear, unrelated, email]; with clustering [linear, email, unrelated].
+    linear = q.add(Task(
+        kind="linear_issue", topic="engage-3991", headline="L",
+        created_at=now - 300, subject_key=sk,
+    ))
+    unrelated = q.add(Task(
+        kind="note", topic="other", headline="U", created_at=now - 200,
+    ))
+    email = q.add(Task(
+        kind="email_msg", topic="email-foo", headline="E",
+        created_at=now - 100, subject_key=sk,
+    ))
+    out = q.ranked(now=now, recent=RecentTopics())
+    ids = [t.id for t, _ in out]
+    assert ids == [linear.id, email.id, unrelated.id]
+
+
+def test_queue_ranked_singletons_keep_score_order():
+    """Tasks without subject_key shouldn't be reshuffled — they slot in
+    by score relative to each cluster's head."""
+    q = TaskQueue()
+    now = 1000.0
+    older = q.add(Task(topic="t1", headline="older", created_at=now - 300))
+    newer = q.add(Task(topic="t2", headline="newer", created_at=now - 10))
+    out = q.ranked(now=now, recent=RecentTopics())
+    assert [t.id for t, _ in out] == [older.id, newer.id]
+
+
+def test_queue_ranked_cluster_position_uses_top_member_score():
+    """The cluster sits where its hottest member would, not where its
+    coolest member would. Singletons cluster around it accordingly."""
+    q = TaskQueue()
+    now = 1000.0
+    sk = "linear:AI-42"
+    # Highest-scoring (oldest) singleton wins the head; cluster's head
+    # member is second; the cluster's lower-scoring sibling lands
+    # adjacent rather than after the third singleton.
+    head = q.add(Task(topic="h", headline="head", created_at=now - 500))
+    cluster_top = q.add(Task(
+        kind="linear_issue", topic="ai-42", headline="ct",
+        created_at=now - 400, subject_key=sk,
+    ))
+    middle = q.add(Task(topic="m", headline="mid", created_at=now - 300))
+    cluster_tail = q.add(Task(
+        kind="email_msg", topic="email-x", headline="cl-tail",
+        created_at=now - 50, subject_key=sk,
+    ))
+    out = q.ranked(now=now, recent=RecentTopics())
+    assert [t.id for t, _ in out] == [
+        head.id, cluster_top.id, cluster_tail.id, middle.id,
+    ]
+
+
 def test_queue_pull_marks_active_and_returns_top():
     q = TaskQueue()
     t = q.add(Task(headline="x"))

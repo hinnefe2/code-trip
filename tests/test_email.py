@@ -12,7 +12,12 @@ import pytest
 from code_trip2 import dispatch, modes
 from code_trip2.email_state import EmailState
 from code_trip2.producers.claude_mcp import ClaudeMCPClient, ClaudeMCPError
-from code_trip2.producers.email import EmailProducer, _parse_ts, _split_name_addr
+from code_trip2.producers.email import (
+    EmailProducer,
+    _detect_subject_key,
+    _parse_ts,
+    _split_name_addr,
+)
 from code_trip2.tasks import Task, TaskQueue
 from conftest import make_mock_tts
 
@@ -84,6 +89,51 @@ def test_split_name_addr_bare_email():
 
 def test_split_name_addr_empty():
     assert _split_name_addr("") == ("", "")
+
+
+# --- subject_key detection (cross-producer task clustering) ---------------
+
+
+def test_detect_subject_key_linear_subject_prefix():
+    """Linear's notification mailer puts the issue identifier at the
+    front of the subject — that's the common case."""
+    assert _detect_subject_key(
+        "notifications@linear.app",
+        "ENGAGE-3991: Reduce import latency",
+        "alice commented",
+    ) == "linear:ENGAGE-3991"
+
+
+def test_detect_subject_key_linear_url_in_body():
+    """Some notification flavors leave the identifier out of the
+    subject; the linear.app permalink in the body is the fallback."""
+    assert _detect_subject_key(
+        "notifications@linear.app",
+        "Re: a comment on your issue",
+        "Alice replied — https://linear.app/picnic/issue/AI-42/foo",
+    ) == "linear:AI-42"
+
+
+def test_detect_subject_key_ignores_non_linear_sender():
+    """Same-shape identifier from a non-Linear sender shouldn't trigger
+    — protects against SOC-2 / RFC-1234 false positives."""
+    assert _detect_subject_key(
+        "auditor@example.com",
+        "SOC-2 audit follow-up",
+        "Please respond by Friday.",
+    ) is None
+
+
+def test_detect_subject_key_no_identifier_returns_none():
+    assert _detect_subject_key(
+        "notifications@linear.app",
+        "Weekly digest",
+        "Nothing to see here",
+    ) is None
+
+
+def test_detect_subject_key_empty_inputs_returns_none():
+    assert _detect_subject_key("", "ENGAGE-3991", "") is None
 
 
 # --- EmailProducer -------------------------------------------------------
@@ -183,6 +233,58 @@ async def test_producer_emits_task_from_structured_threads(tmp_path: Path):
     assert "Project update" in task.headline
     assert "Alice" in task.headline
     assert state.last_message_ts() == 1716000100
+
+
+@pytest.mark.asyncio
+async def test_producer_sets_subject_key_on_linear_notification(tmp_path: Path):
+    """A Gmail thread from notifications@linear.app with an issue id in
+    the subject becomes a task tagged ``linear:<KEY>`` so the queue
+    clusters it next to the Linear-API task for the same issue."""
+    p, q, mcp, _state = _producer(tmp_path)
+    mcp.call_tool.return_value = {
+        "threads": [
+            {
+                "id": "T-LINEAR",
+                "messages": [
+                    {
+                        "id": "M1",
+                        "subject": "ENGAGE-3991: Alice commented on your issue",
+                        "from": "Linear <notifications@linear.app>",
+                        "snippet": "Alice: nice work",
+                        "internalDate": "1716000200000",
+                    }
+                ],
+            }
+        ]
+    }
+    await p._poll_once()
+    [task] = q.all()
+    assert task.subject_key == "linear:ENGAGE-3991"
+
+
+@pytest.mark.asyncio
+async def test_producer_leaves_subject_key_none_for_normal_email(tmp_path: Path):
+    """Plain emails (no Linear sender, no Linear key) stay singleton."""
+    p, q, mcp, _state = _producer(tmp_path)
+    mcp.call_tool.return_value = {
+        "threads": [
+            {
+                "id": "T-PLAIN",
+                "messages": [
+                    {
+                        "id": "M1",
+                        "subject": "lunch plans",
+                        "from": "bob@example.com",
+                        "snippet": "noon ok?",
+                        "internalDate": "1716000200000",
+                    }
+                ],
+            }
+        ]
+    }
+    await p._poll_once()
+    [task] = q.all()
+    assert task.subject_key is None
 
 
 @pytest.mark.asyncio

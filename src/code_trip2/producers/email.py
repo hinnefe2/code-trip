@@ -41,6 +41,41 @@ logger = logging.getLogger(__name__)
 # Fallback markdown-block parser, in case the Gmail MCP ever returns a
 # detailed-text format like Slack's. The structured-JSON path is the
 # expected default — see ``_extract_threads``.
+# Subject-line marker for cross-producer task clustering. Linear's
+# notification mailer (``notifications@linear.app``) leads every subject
+# with the issue identifier ("ENGAGE-3991: …") or embeds it in the
+# permalink in the body. Matching the identifier lets a Linear
+# notification email sit adjacent to the Linear-API task for the same
+# issue in the queue. Restricted to Linear-origin emails to avoid false
+# positives (e.g. "SOC-2 audit" in a totally unrelated thread).
+_LINEAR_KEY_RE = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b")
+_LINEAR_URL_RE = re.compile(
+    r"linear\.app/[^/\s]+/issue/([A-Z][A-Z0-9]+-\d+)", re.IGNORECASE,
+)
+
+
+def _detect_subject_key(
+    sender_email: str, subject: str, snippet: str,
+) -> str | None:
+    """Identify the underlying subject this email is about, if any.
+
+    Currently recognises Linear notification emails — sender is on
+    ``linear.app`` and the subject (or a permalink in the body) carries
+    an issue identifier. Returns a namespaced key like
+    ``linear:ENGAGE-3991`` on a match, or ``None`` to leave the task
+    as a singleton.
+    """
+    if not sender_email or "linear.app" not in sender_email.lower():
+        return None
+    for source in (subject, snippet):
+        if not source:
+            continue
+        m = _LINEAR_URL_RE.search(source) or _LINEAR_KEY_RE.search(source)
+        if m:
+            return f"linear:{m.group(1).upper()}"
+    return None
+
+
 _BLOCK_SPLIT_RE = re.compile(r"^### (?:Result|Thread) \d+ of \d+\s*$", re.MULTILINE)
 _SUBJECT_RE = re.compile(r"^Subject:\s*(.*)$", re.IGNORECASE)
 _FROM_RE = re.compile(r"^(?:From|Sender):\s*(.*)$", re.IGNORECASE)
@@ -385,6 +420,7 @@ class EmailProducer:
             body=body,
             source=source,
             created_at=time.time(),
+            subject_key=_detect_subject_key(sender_email, subject, snippet),
         )
         self._intake(task)
 

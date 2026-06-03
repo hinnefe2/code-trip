@@ -321,6 +321,7 @@ class LinearProducer:
             body=body,
             source=source,
             created_at=time.time(),
+            subject_key=f"linear:{identifier.upper()}",
         )
         self._intake(task)
 

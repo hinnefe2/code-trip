@@ -180,6 +180,10 @@ async def test_producer_emits_task_from_structured_issues(tmp_path: Path):
     assert "AI-1389" in task.headline
     assert "Hide irrelevant skills" in task.headline
     assert task.topic == "ai-1389"
+    # Linear-API tasks always carry the namespaced subject key so the
+    # queue can cluster them with cross-producer references (e.g. a
+    # Gmail notification about the same issue).
+    assert task.subject_key == "linear:AI-1389"
     assert state.last_updated_at() == "2026-05-28T17:00:53.328Z"
 
 

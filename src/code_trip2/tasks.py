@@ -69,6 +69,15 @@ class Task:
     urgency: str = URGENCY_NORMAL
     state: str = STATE_PENDING
     parent_id: str | None = None
+    # Canonical identifier for the real-world subject this task is
+    # about (e.g. ``"linear:ENGAGE-3991"``). Producers populate it when
+    # they can name the subject; tasks without one are singletons.
+    # Used by :meth:`TaskQueue.ranked` to cluster cross-producer tasks
+    # that refer to the same thing — so a Linear issue task and a
+    # Gmail notification about a comment on that issue end up adjacent
+    # in the queue. The key is a free-form string by convention namespaced
+    # as ``<system>:<identifier>``.
+    subject_key: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -83,6 +92,7 @@ class Task:
             "urgency": self.urgency,
             "state": self.state,
             "parent_id": self.parent_id,
+            "subject_key": self.subject_key,
         }
 
     @classmethod
@@ -99,6 +109,7 @@ class Task:
             urgency=d.get("urgency", URGENCY_NORMAL),
             state=d.get("state", STATE_PENDING),
             parent_id=d.get("parent_id"),
+            subject_key=d.get("subject_key"),
         )
 
 
@@ -165,6 +176,42 @@ def score(task: Task, *, now: float, recent: RecentTopics) -> float:
         s += _URGENCY_BACKGROUND
 
     return s
+
+
+def _cluster_by_subject(
+    scored: list[tuple[Task, float]],
+) -> list[tuple[Task, float]]:
+    """Reorder a score-descending list so tasks sharing a
+    ``subject_key`` cluster adjacent.
+
+    Assumes ``scored`` is already sorted by score descending — that
+    guarantee lets us pick cluster ordering by first-arrival without a
+    second sort. The first time a subject_key is seen, the cluster's
+    top score is fixed (it's that task's score); subsequent members
+    are appended in score order. Singleton tasks (``subject_key`` is
+    ``None``) slot in by score relative to the cluster heads they sit
+    between.
+    """
+    clusters: dict[object, list[tuple[Task, float]]] = {}
+    cluster_order: list[object] = []
+    singleton_counter = 0
+    for pair in scored:
+        sk = pair[0].subject_key
+        if sk:
+            key: object = sk
+        else:
+            # Each subject_key-less task is its own cluster so it
+            # keeps its score-determined position.
+            key = ("__singleton__", singleton_counter)
+            singleton_counter += 1
+        if key not in clusters:
+            clusters[key] = []
+            cluster_order.append(key)
+        clusters[key].append(pair)
+    out: list[tuple[Task, float]] = []
+    for key in cluster_order:
+        out.extend(clusters[key])
+    return out
 
 
 # --- queue ----------------------------------------------------------------
@@ -297,12 +344,20 @@ class TaskQueue:
     # ----- scoring views --------------------------------------------------
 
     def ranked(self, *, now: float, recent: RecentTopics) -> list[tuple[Task, float]]:
-        """Return all pending tasks sorted by score descending."""
+        """Return all pending tasks sorted by score descending, then
+        clustered so tasks sharing a ``subject_key`` are adjacent.
+
+        Cluster placement is by the cluster's top-scoring member, so the
+        head of the list is still the global top-score task (``peek`` /
+        ``pull`` semantics unchanged). The trade-off is that the second
+        row may be a lower-scored sibling instead of the next-highest
+        unrelated task — that's the point of clustering.
+        """
         pending = self.pending()
         scored = [(t, score(t, now=now, recent=recent)) for t in pending]
         scored = [(t, s) for t, s in scored if s > _NOT_READY]
         scored.sort(key=lambda pair: pair[1], reverse=True)
-        return scored
+        return _cluster_by_subject(scored)
 
     def peek(self, *, now: float, recent: RecentTopics) -> Task | None:
         scored = self.ranked(now=now, recent=recent)
