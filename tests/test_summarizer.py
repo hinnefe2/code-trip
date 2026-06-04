@@ -205,3 +205,45 @@ async def test_claude_producer_no_summarizer_leaves_body_none():
     tasks = q.all()
     assert len(tasks) == 1
     assert tasks[0].body is None
+
+
+@pytest.mark.asyncio
+async def test_claude_producer_tags_ticket_window_with_subject_key():
+    """Stop events for windows named like Linear IDs cluster with the
+    originating linear_issue task via subject_key."""
+    from code_trip2.producers.claude import ClaudeProducer
+    from code_trip2.tasks import TaskQueue
+
+    cfg = SimpleNamespace(ssh_host="remote", ssh_options=(), tmux_session="main")
+    q = TaskQueue()
+    p = ClaudeProducer(config=cfg, queue=q, summarizer=None)  # type: ignore[arg-type]
+
+    await p._emit(
+        {"window": "ENGAGE-1234", "finished_at": 1000.0}, "remote", (),
+    )
+
+    tasks = q.all()
+    assert len(tasks) == 1
+    assert tasks[0].subject_key == "linear:ENGAGE-1234"
+
+
+@pytest.mark.asyncio
+async def test_claude_producer_leaves_non_ticket_window_unkeyed():
+    from code_trip2.producers.claude import ClaudeProducer
+    from code_trip2.tasks import TaskQueue
+
+    cfg = SimpleNamespace(ssh_host="remote", ssh_options=(), tmux_session="main")
+    q = TaskQueue()
+    p = ClaudeProducer(config=cfg, queue=q, summarizer=None)  # type: ignore[arg-type]
+
+    await p._emit({"window": "work", "finished_at": 1000.0}, "remote", ())
+    await p._emit(
+        {"window": "engage-1234", "finished_at": 1000.0}, "remote", (),
+    )  # lowercase — not the canonical ticket shape
+    await p._emit(
+        {"window": "AI-1389-followup", "finished_at": 1000.0}, "remote", (),
+    )
+
+    tasks = q.all()
+    assert len(tasks) == 3
+    assert all(t.subject_key is None for t in tasks)

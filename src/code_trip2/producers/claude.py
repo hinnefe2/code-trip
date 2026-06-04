@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import shlex
 import time
 
@@ -29,6 +30,13 @@ logger = logging.getLogger(__name__)
 
 
 EVENTS_DIR = "/tmp/claude-events"
+
+# Matches Linear-style ticket identifiers used as remote tmux window
+# names by the /do-ticket skill (e.g. ``ENGAGE-1234``). When a Stop event
+# arrives for one of these windows we tag the resulting claude_reply
+# with a subject_key so the queue clusters it adjacent to the original
+# linear_issue task that prompted the work.
+_TICKET_WINDOW_RE = re.compile(r"^[A-Z]+-\d+$")
 
 
 class ClaudeProducer:
@@ -126,6 +134,11 @@ class ClaudeProducer:
         last_user_msg = payload.get("last_user_msg") or ""
         headline = self._make_headline(window, last_user_msg)
         body = await self._summarize_pane(window, last_user_msg, host, opts)
+        subject_key = (
+            f"linear:{window.upper()}"
+            if _TICKET_WINDOW_RE.match(window)
+            else None
+        )
         task = Task(
             kind="claude_reply",
             topic=window,
@@ -133,6 +146,7 @@ class ClaudeProducer:
             body=body,
             source={"window": window, "finished_at": finished_at},
             created_at=time.time(),
+            subject_key=subject_key,
         )
         self._queue.add(task)
 
