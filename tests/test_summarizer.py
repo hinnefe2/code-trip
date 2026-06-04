@@ -228,6 +228,74 @@ async def test_claude_producer_tags_ticket_window_with_subject_key():
 
 
 @pytest.mark.asyncio
+async def test_claude_producer_collapses_repeat_stops_per_window():
+    """A window that emits multiple Stop events keeps one pending
+    claude_reply, rewriting it in place rather than stacking duplicates."""
+    from code_trip2.producers.claude import ClaudeProducer
+    from code_trip2.tasks import TaskQueue
+
+    cfg = SimpleNamespace(ssh_host="remote", ssh_options=(), tmux_session="main")
+    q = TaskQueue()
+    p = ClaudeProducer(config=cfg, queue=q, summarizer=None)  # type: ignore[arg-type]
+
+    await p._emit(
+        {"window": "ENGAGE-1234", "finished_at": 1000.0, "last_user_msg": "first"},
+        "remote", (),
+    )
+    first_id = q.all()[0].id
+
+    await p._emit(
+        {"window": "ENGAGE-1234", "finished_at": 1100.0, "last_user_msg": "second"},
+        "remote", (),
+    )
+
+    tasks = q.all()
+    assert len(tasks) == 1
+    assert tasks[0].id == first_id  # collapsed in place
+    assert tasks[0].headline == "replied to: second"
+    assert tasks[0].source["finished_at"] == 1100.0
+
+
+@pytest.mark.asyncio
+async def test_claude_producer_collapse_is_per_window():
+    """Two different windows still get their own pending task."""
+    from code_trip2.producers.claude import ClaudeProducer
+    from code_trip2.tasks import TaskQueue
+
+    cfg = SimpleNamespace(ssh_host="remote", ssh_options=(), tmux_session="main")
+    q = TaskQueue()
+    p = ClaudeProducer(config=cfg, queue=q, summarizer=None)  # type: ignore[arg-type]
+
+    await p._emit({"window": "ENGAGE-1234", "finished_at": 1000.0}, "remote", ())
+    await p._emit({"window": "AI-9", "finished_at": 1001.0}, "remote", ())
+
+    assert len(q.all()) == 2
+
+
+@pytest.mark.asyncio
+async def test_claude_producer_emits_fresh_after_prior_done():
+    """Once the user finishes (or drops) the previous claude_reply, a
+    new Stop event for the same window starts a fresh task — collapse
+    is bounded to *pending* tasks."""
+    from code_trip2.producers.claude import ClaudeProducer
+    from code_trip2.tasks import TaskQueue
+
+    cfg = SimpleNamespace(ssh_host="remote", ssh_options=(), tmux_session="main")
+    q = TaskQueue()
+    p = ClaudeProducer(config=cfg, queue=q, summarizer=None)  # type: ignore[arg-type]
+
+    await p._emit({"window": "ENGAGE-1234", "finished_at": 1000.0}, "remote", ())
+    first_id = q.all()[0].id
+    q.mark_done(first_id)
+
+    await p._emit({"window": "ENGAGE-1234", "finished_at": 1100.0}, "remote", ())
+
+    assert len(q.all()) == 2  # original (done) + a fresh pending one
+    ids = {t.id for t in q.all()}
+    assert first_id in ids
+
+
+@pytest.mark.asyncio
 async def test_claude_producer_leaves_non_ticket_window_unkeyed():
     from code_trip2.producers.claude import ClaudeProducer
     from code_trip2.tasks import TaskQueue

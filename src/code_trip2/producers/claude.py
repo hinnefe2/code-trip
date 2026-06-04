@@ -134,6 +134,24 @@ class ClaudeProducer:
         last_user_msg = payload.get("last_user_msg") or ""
         headline = self._make_headline(window, last_user_msg)
         body = await self._summarize_pane(window, last_user_msg, host, opts)
+        source = {"window": window, "finished_at": finished_at}
+
+        # Collapse: only one pending claude_reply per window. A long
+        # remote session that hits Stop multiple times (or a /do-ticket
+        # run that stops, then resumes after a follow-up) should keep
+        # rewriting the same queue task rather than stacking duplicates.
+        # Same pattern as LinearProducer._find_pending_issue_task.
+        existing = self._find_pending_window_task(window)
+        if existing is not None:
+            self._queue.update_task(
+                existing.id,
+                headline=headline,
+                body=body,
+                source=source,
+                created_at=time.time(),
+            )
+            return
+
         subject_key = (
             f"linear:{window.upper()}"
             if _TICKET_WINDOW_RE.match(window)
@@ -144,11 +162,21 @@ class ClaudeProducer:
             topic=window,
             headline=headline,
             body=body,
-            source={"window": window, "finished_at": finished_at},
+            source=source,
             created_at=time.time(),
             subject_key=subject_key,
         )
         self._queue.add(task)
+
+    def _find_pending_window_task(self, window: str) -> Task | None:
+        if not window:
+            return None
+        for task in self._queue.pending():
+            if task.kind != "claude_reply":
+                continue
+            if (task.source or {}).get("window") == window:
+                return task
+        return None
 
     async def _summarize_pane(
         self,
