@@ -268,23 +268,23 @@ async def test_queue_navigate_up_walks_backward():
 
 
 @pytest.mark.asyncio
-async def test_queue_navigate_clamps_at_end():
+async def test_queue_navigate_wraps_at_end():
     ctx = _make_ctx(app_mode="queue")
-    _a, _b, c = _seed_three(ctx)
+    a, _b, c = _seed_three(ctx)
     ctx.current_task = c
     with patch.object(modes, "speak_chunked"):
         await dispatch.queue_navigate(ctx, direction=+1)
-    assert ctx.current_task is c  # clamped, not wrapped
+    assert ctx.current_task is a  # down from the bottom wraps to top
 
 
 @pytest.mark.asyncio
-async def test_queue_navigate_clamps_at_start():
+async def test_queue_navigate_wraps_at_start():
     ctx = _make_ctx(app_mode="queue")
-    a, _b, _c = _seed_three(ctx)
+    a, _b, c = _seed_three(ctx)
     ctx.current_task = a
     with patch.object(modes, "speak_chunked"):
         await dispatch.queue_navigate(ctx, direction=-1)
-    assert ctx.current_task is a
+    assert ctx.current_task is c  # up from the top wraps to bottom
 
 
 @pytest.mark.asyncio

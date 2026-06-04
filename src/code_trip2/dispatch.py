@@ -605,8 +605,9 @@ async def queue_navigate(ctx: "Context", *, direction: int) -> None:
     ``direction`` is ``-1`` (up / previous) or ``+1`` (down / next).
     The cursor is just a pointer — no task state changes — so the
     queue list stays static and the cursor task remains visible in
-    its rightful ranked position. Clamps at the boundaries instead
-    of wrapping.
+    its rightful ranked position. Wraps at the boundaries: down on
+    the bottom row jumps to the top, up on the top jumps to the
+    bottom. Python's ``%`` makes the math symmetric for negatives.
 
     Doesn't touch ``recent_topics`` — arrow navigation is exploratory,
     so it shouldn't bias the scheduler the way an explicit "next" or
@@ -629,7 +630,7 @@ async def queue_navigate(ctx: "Context", *, direction: int) -> None:
             # Cursor task was removed from pending (e.g. just engaged
             # with). Treat as fresh — top for down, bottom for up.
             cur_idx = -1 if direction > 0 else len(pending_ids)
-        new_idx = max(0, min(len(pending_ids) - 1, cur_idx + direction))
+        new_idx = (cur_idx + direction) % len(pending_ids)
     ctx.current_task = ctx.queue.get(pending_ids[new_idx])
     _announce_headline(ctx, ctx.current_task)
 
