@@ -32,7 +32,13 @@ from code_trip2._async_utils import event_or_timeout
 from code_trip2.config import Config
 from code_trip2.linear_state import LinearState
 from code_trip2.producers.claude_mcp import ClaudeMCPClient, ClaudeMCPError
-from code_trip2.tasks import Task, TaskQueue
+from code_trip2.tasks import (
+    STATE_ACTIVE,
+    STATE_PENDING,
+    STATE_SNOOZED,
+    Task,
+    TaskQueue,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -300,10 +306,13 @@ class LinearProducer:
             "priority": priority,
         }
 
-        # Same collapse rule as Slack/email: one pending task per
-        # issue identifier. Updates to title/description/status replace
-        # the existing task's body rather than stacking duplicates.
-        existing = self._find_pending_issue_task(identifier)
+        # Same collapse rule as Slack/email: one live task per issue
+        # identifier. Updates to title/description/status replace the
+        # existing task's body rather than stacking duplicates. "Live"
+        # spans PENDING + ACTIVE + SNOOZED so a Linear update that
+        # lands while the user is viewing the ticket (ACTIVE) refreshes
+        # the open panel instead of spawning a sibling in the queue.
+        existing = self._find_live_issue_task(identifier)
         if existing is not None:
             self._queue.update_task(
                 existing.id,
@@ -326,10 +335,37 @@ class LinearProducer:
         self._intake(task)
 
     def _find_pending_issue_task(self, identifier: str) -> Task | None:
+        """Pending-only lookup used by the retire path.
+
+        ``_mark_closed_task`` deliberately leaves ACTIVE tasks alone —
+        if the user is mid-conversation with a ticket that just got
+        closed in Linear, yanking it out from under them would be
+        worse than letting the stale state linger until they finish.
+        """
         if not identifier:
             return None
         for task in self._queue.pending():
             if task.kind != "linear_issue":
+                continue
+            if (task.source or {}).get("identifier") == identifier:
+                return task
+        return None
+
+    def _find_live_issue_task(self, identifier: str) -> Task | None:
+        """Live-state lookup used by the collapse path in ``_emit_task``.
+
+        Scans PENDING + ACTIVE + SNOOZED — see the comment in
+        ``_emit_task`` for why. DONE / DROPPED are skipped so a
+        dismissed ticket whose status flips back into the active set
+        starts a fresh task.
+        """
+        if not identifier:
+            return None
+        live = {STATE_PENDING, STATE_ACTIVE, STATE_SNOOZED}
+        for task in self._queue.all():
+            if task.kind != "linear_issue":
+                continue
+            if task.state not in live:
                 continue
             if (task.source or {}).get("identifier") == identifier:
                 return task

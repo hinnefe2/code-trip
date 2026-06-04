@@ -24,7 +24,13 @@ from code_trip2 import remote
 from code_trip2._async_utils import event_or_timeout
 from code_trip2.config import Config
 from code_trip2.summarizer import Summarizer, SummarizerError
-from code_trip2.tasks import Task, TaskQueue
+from code_trip2.tasks import (
+    STATE_ACTIVE,
+    STATE_PENDING,
+    STATE_SNOOZED,
+    Task,
+    TaskQueue,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -169,10 +175,21 @@ class ClaudeProducer:
         self._queue.add(task)
 
     def _find_pending_window_task(self, window: str) -> Task | None:
+        """Locate a live claude_reply for the given window.
+
+        "Live" spans PENDING + ACTIVE + SNOOZED — a second Stop event
+        for a window the user is currently viewing should refresh
+        their open task rather than spawn a sibling in the queue.
+        DONE / DROPPED bail out so a closed-out reply that revives
+        later starts fresh.
+        """
         if not window:
             return None
-        for task in self._queue.pending():
+        live = {STATE_PENDING, STATE_ACTIVE, STATE_SNOOZED}
+        for task in self._queue.all():
             if task.kind != "claude_reply":
+                continue
+            if task.state not in live:
                 continue
             if (task.source or {}).get("window") == window:
                 return task

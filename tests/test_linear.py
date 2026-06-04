@@ -344,6 +344,50 @@ async def test_producer_collapses_repeat_sightings_into_single_task(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_producer_collapses_update_into_active_issue_task(tmp_path: Path):
+    """A Linear update for a ticket the user is currently viewing
+    (task is ACTIVE) refreshes the open task in place, not a sibling
+    in the queue."""
+    p, q, mcp, _state = _producer(tmp_path, state_types=("started",))
+    mcp.call_tool.return_value = {
+        "issues": [
+            {
+                "id": "AI-7",
+                "title": "Original",
+                "description": "first body",
+                "statusType": "started",
+                "url": "https://linear.app/x/issue/AI-7",
+                "updatedAt": "2026-05-28T10:00:00.000Z",
+            }
+        ]
+    }
+    await p._poll_once()
+    [first] = q.all()
+    q.mark_active(first.id)  # user opened it in the Current panel
+
+    mcp.call_tool.return_value = {
+        "issues": [
+            {
+                "id": "AI-7",
+                "title": "Title updated mid-view",
+                "description": "fresh body",
+                "statusType": "started",
+                "url": "https://linear.app/x/issue/AI-7",
+                "updatedAt": "2026-05-28T11:00:00.000Z",
+            }
+        ]
+    }
+    await p._poll_once()
+
+    all_tasks = q.all()
+    assert len(all_tasks) == 1, (
+        "active task should absorb the update, not spawn a sibling"
+    )
+    assert all_tasks[0].id == first.id
+    assert "Title updated mid-view" in all_tasks[0].headline
+
+
+@pytest.mark.asyncio
 async def test_producer_handles_empty_results(tmp_path: Path):
     p, q, mcp, _state = _producer(tmp_path, state_types=("started",))
     mcp.call_tool.return_value = {"issues": []}

@@ -257,6 +257,36 @@ async def test_claude_producer_collapses_repeat_stops_per_window():
 
 
 @pytest.mark.asyncio
+async def test_claude_producer_collapses_into_active_window_task():
+    """A second Stop event for a window the user is currently viewing
+    (task is ACTIVE) refreshes the open task in place, rather than
+    spawning a sibling in the queue."""
+    from code_trip2.producers.claude import ClaudeProducer
+    from code_trip2.tasks import TaskQueue
+
+    cfg = SimpleNamespace(ssh_host="remote", ssh_options=(), tmux_session="main")
+    q = TaskQueue()
+    p = ClaudeProducer(config=cfg, queue=q, summarizer=None)  # type: ignore[arg-type]
+
+    await p._emit(
+        {"window": "ENGAGE-1234", "finished_at": 1000.0, "last_user_msg": "first"},
+        "remote", (),
+    )
+    first_id = q.all()[0].id
+    q.mark_active(first_id)
+
+    await p._emit(
+        {"window": "ENGAGE-1234", "finished_at": 1100.0, "last_user_msg": "second"},
+        "remote", (),
+    )
+
+    tasks = q.all()
+    assert len(tasks) == 1
+    assert tasks[0].id == first_id
+    assert tasks[0].headline == "replied to: second"
+
+
+@pytest.mark.asyncio
 async def test_claude_producer_collapse_is_per_window():
     """Two different windows still get their own pending task."""
     from code_trip2.producers.claude import ClaudeProducer
