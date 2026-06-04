@@ -36,7 +36,13 @@ from code_trip2._async_utils import event_or_timeout
 from code_trip2.config import Config
 from code_trip2.producers.claude_mcp import ClaudeMCPClient, ClaudeMCPError
 from code_trip2.slack_state import SlackState
-from code_trip2.tasks import Task, TaskQueue
+from code_trip2.tasks import (
+    STATE_ACTIVE,
+    STATE_PENDING,
+    STATE_SNOOZED,
+    Task,
+    TaskQueue,
+)
 
 
 _USER_ID_RE = re.compile(r"User ID:\s*(U[A-Z0-9]+)", re.IGNORECASE)
@@ -609,11 +615,22 @@ class SlackProducer:
         self._queue.add(task)
 
     def _find_pending_thread_task(self, channel_id: str, thread_ts: str) -> Task | None:
-        """Locate a pending slack task for the same channel + thread."""
+        """Locate a live slack task for the same channel + thread.
+
+        "Live" means any state where the user might still want the
+        thread to grow under them: PENDING (queued), ACTIVE (currently
+        being viewed in the Current task panel — this is the case that
+        used to leak a sibling task into the queue), or SNOOZED
+        (deferred but will return). DONE / DROPPED tasks are skipped so
+        a finished conversation that revives later starts a fresh task.
+        """
         if not channel_id or not thread_ts:
             return None
-        for task in self._queue.pending():
+        live = {STATE_PENDING, STATE_ACTIVE, STATE_SNOOZED}
+        for task in self._queue.all():
             if task.kind != "slack_msg":
+                continue
+            if task.state not in live:
                 continue
             src = task.source or {}
             if (

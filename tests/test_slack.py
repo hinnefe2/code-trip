@@ -1096,6 +1096,37 @@ async def test_producer_separate_threads_get_separate_tasks(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_producer_appends_into_active_thread_task(tmp_path: Path):
+    """When the user is viewing a Slack thread (task is ACTIVE), a new
+    reply should append to its source["messages"] rather than spawn a
+    sibling task in the queue — otherwise the Current task panel stays
+    frozen at the original message count."""
+    p, q, mcp, _state = _producer(tmp_path)
+    p._user_id = "UME"
+
+    mcp.call_tool.return_value = {
+        "results": _thread_fixture("1716001000.000000", "1716001000.000000", "first")
+    }
+    await p._poll_once()
+    [first] = q.all()
+    q.mark_active(first.id)  # user opened the task in the Current panel
+
+    mcp.call_tool.return_value = {
+        "results": _thread_fixture(
+            "1716001000.000000", "1716001100.000000", "reply while viewing", sender="Bob",
+        )
+    }
+    await p._poll_once()
+
+    all_tasks = q.all()
+    assert len(all_tasks) == 1, (
+        "active task should absorb the reply, not spawn a sibling"
+    )
+    msgs = all_tasks[0].source["messages"]
+    assert [m["sender"] for m in msgs] == ["Alice", "Bob"]
+
+
+@pytest.mark.asyncio
 async def test_producer_does_not_collapse_into_done_threads(tmp_path: Path):
     """If the user has already dismissed (marked done) a thread task,
     a new message in the same thread should create a fresh task — not
