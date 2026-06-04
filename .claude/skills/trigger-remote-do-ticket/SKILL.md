@@ -20,16 +20,18 @@ You're being invoked on a `linear_issue` task. Your job is to send a single `/do
 
 2. **Read the identifier.** It's `task.source.identifier` (e.g. `AI-1332`). Call it `<ID>` below.
 
-3. **Send the slash command.** Run via `Bash` exactly one SSH call:
+3. **Send the slash command.** Run via `Bash` exactly one SSH call, **with the entire remote command wrapped in double quotes and the slash-command payload single-quoted inside**:
 
    ```
-   ssh coder.dec-8 tmux send-keys -t dev:0 "/do-ticket <ID>" Enter
+   ssh coder.dec-8 "tmux send-keys -t dev:0 '/do-ticket <ID>' Enter"
    ```
 
-   - Replace `<ID>` with the literal identifier from step 2 (e.g. `/do-ticket AI-1332`).
+   - Replace `<ID>` with the literal identifier from step 2 (e.g. so the inner payload reads `'/do-ticket AI-1332'`).
    - `coder.dec-8` is the SSH host alias.
    - `dev:0` is the tmux session:window where the user keeps Claude always running. **Do not** create a new window, do not start Claude, do not chain commands with `\;`. One `tmux send-keys` call, done.
-   - The `Enter` argument to `send-keys` is the literal token `Enter` (tmux interprets it as the Return key) — leave it unquoted; it is not part of the string being typed.
+   - The `Enter` argument to `send-keys` is the literal token `Enter` (tmux interprets it as the Return key) — leave it outside the single quotes; it is not part of the string being typed.
+
+   **Critical SSH-quoting note** — the nested quoting matters. Plain `ssh host tmux send-keys -t dev:0 "/do-ticket <ID>" Enter` looks right locally but doesn't work: the local shell strips the double quotes, ssh forwards `tmux send-keys -t dev:0 /do-ticket <ID> Enter` to the remote, the remote shell re-tokenizes the slash-command into two args, and tmux `send-keys` concatenates them with no space — the remote Claude then sees `/do-ticket<ID>` and errors with `Unknown command`. The double-quoted-outer, single-quoted-inner form above preserves the space across the round-trip.
 
 4. **Return** one sentence:
 
