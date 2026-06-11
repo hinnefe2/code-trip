@@ -673,9 +673,16 @@ async def test_respond_email_archive_api_error_keeps_task_active():
 # --- ACT+NO dismiss archives the email ------------------------------------
 
 
+async def _flush_bg(ctx) -> None:
+    """Let the chord's background side effects run to completion."""
+    while ctx.background_jobs:
+        await asyncio.gather(*list(ctx.background_jobs))
+
+
 @pytest.mark.asyncio
 async def test_dismiss_email_task_archives_thread_and_marks_done():
-    """ACT+NO on an email task: archive the Gmail thread, then dismiss."""
+    """ACT+NO on an email task: dismiss immediately, archive the Gmail
+    thread in the background."""
     mcp = create_autospec(ClaudeMCPClient, instance=True)
     mcp.call_tool = AsyncMock()
     ctx = _ctx_with_email_mcp(mcp)
@@ -692,13 +699,16 @@ async def test_dismiss_email_task_archives_thread_and_marks_done():
     ctx.queue.add(task)
     ctx.current_task = task
     await dispatch.dismiss_current_task(ctx)
+    # Local effect lands before the archive roundtrip completes.
+    assert ctx.queue.get(task.id).state == "done"
+    assert ctx.current_task is None
+    ctx.tts.speak.assert_called_with("Done.")
+    await _flush_bg(ctx)
     mcp.call_tool.assert_called_once()
     call = mcp.call_tool.call_args
     assert call.args[0] == "unlabel_thread"
     assert call.args[1] == {"threadId": "T1", "labelIds": ["INBOX"]}
     assert ctx.queue.get(task.id).state == "done"
-    assert ctx.current_task is None
-    ctx.tts.speak.assert_called_with("Archived.")
 
 
 @pytest.mark.asyncio
@@ -753,19 +763,48 @@ async def test_dismiss_email_task_advances_cursor_past_archive(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_dismiss_email_task_archive_error_keeps_task_active():
-    """Transient MCP failure: the email is still in the inbox, so keep
-    the task active and let the spoken error tell the user."""
+async def test_dismiss_email_task_archive_error_returns_task_to_pending():
+    """Transient MCP failure: the email is still in the inbox, so the
+    optimistically-dismissed task is resurrected and TTS says so."""
     mcp = create_autospec(ClaudeMCPClient, instance=True)
     mcp.call_tool = AsyncMock(side_effect=ClaudeMCPError("network down"))
+    ctx = _ctx_with_email_mcp(mcp)
+    ctx.app_mode = dispatch.MODE_QUEUE
+    task = Task(kind="email_msg", source={"thread_id": "T1", "sender_name": "Alice"})
+    ctx.queue.add(task)
+    ctx.current_task = task
+    await dispatch.dismiss_current_task(ctx)
+    assert ctx.queue.get(task.id).state == "done"  # optimistic
+    await _flush_bg(ctx)
+    assert ctx.queue.get(task.id).state == "pending"  # resurrected
+    spoken = ctx.tts.speak.call_args.args[0]
+    assert "archive" in spoken.lower()
+    assert "Alice" in spoken
+
+
+@pytest.mark.asyncio
+async def test_dismiss_email_task_is_immediate_while_archive_in_flight():
+    """Responsiveness regression: the chord handler returns and the
+    queue/cursor settle while the Gmail call is still parked."""
+    gate = asyncio.Event()
+
+    async def slow_archive(*args, **kwargs):
+        await gate.wait()
+        return {}
+
+    mcp = create_autospec(ClaudeMCPClient, instance=True)
+    mcp.call_tool = AsyncMock(side_effect=slow_archive)
     ctx = _ctx_with_email_mcp(mcp)
     ctx.app_mode = dispatch.MODE_QUEUE
     task = Task(kind="email_msg", source={"thread_id": "T1"})
     ctx.queue.add(task)
     ctx.current_task = task
     await dispatch.dismiss_current_task(ctx)
-    assert ctx.queue.get(task.id).state != "done"
-    assert ctx.current_task is task
+    assert ctx.queue.get(task.id).state == "done"
+    assert ctx.current_task is None
+    ctx.tts.speak.assert_called_with("Done.")
+    gate.set()
+    await _flush_bg(ctx)
 
 
 @pytest.mark.asyncio

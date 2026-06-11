@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 
@@ -516,6 +517,12 @@ def _followup_ctx(*, agent_reply: str | Exception = "Filed in AI: Draft doc."):
     return ctx, mcp
 
 
+async def _flush_bg(ctx) -> None:
+    """Let the chord's background side effects run to completion."""
+    while ctx.background_jobs:
+        await asyncio.gather(*list(ctx.background_jobs))
+
+
 @pytest.mark.asyncio
 async def test_create_linear_ticket_invokes_file_meeting_followup_skill():
     ctx, mcp = _followup_ctx(
@@ -532,6 +539,14 @@ async def test_create_linear_ticket_invokes_file_meeting_followup_skill():
 
     await dispatch.create_linear_ticket_from_followup(ctx, t)
 
+    # Local effect is immediate: done + cursor cleared before the
+    # agent reply lands.
+    assert ctx.queue.get(t.id).state == "done"
+    assert ctx.current_task is None
+    ctx.tts.speak.assert_called_with("Filing.")
+
+    await _flush_bg(ctx)
+
     mcp.run_agent.assert_awaited_once()
     call = mcp.run_agent.await_args
     prompt = call.kwargs["prompt"]
@@ -546,7 +561,6 @@ async def test_create_linear_ticket_invokes_file_meeting_followup_skill():
     assert call.kwargs["allowed_tools"] == ctx.agent_allowed_tools
 
     assert ctx.queue.get(t.id).state == "done"
-    assert ctx.current_task is None
     ctx.tts.speak.assert_called_with(
         "Filed in AI / Retention: Draft retention metrics doc."
     )
@@ -559,6 +573,7 @@ async def test_create_linear_ticket_uses_default_when_agent_returns_empty():
     t = ctx.queue.add(Task(kind="meeting_followup", headline="x"))
     ctx.current_task = t
     await dispatch.create_linear_ticket_from_followup(ctx, t)
+    await _flush_bg(ctx)
     ctx.tts.speak.assert_called_with("Filed.")
     assert ctx.queue.get(t.id).state == "done"
 
@@ -589,12 +604,16 @@ async def test_create_linear_ticket_with_disabled_mcp_speaks_error():
 
 
 @pytest.mark.asyncio
-async def test_create_linear_ticket_agent_failure_keeps_task_active():
+async def test_create_linear_ticket_agent_failure_returns_task_to_pending():
+    """Optimistic filing marks the task done at chord time; a failed
+    agent run must resurrect it so the work isn't silently lost."""
     ctx, _mcp = _followup_ctx(agent_reply=RuntimeError("subprocess died"))
     t = ctx.queue.add(Task(kind="meeting_followup", headline="x"))
     ctx.current_task = t
     await dispatch.create_linear_ticket_from_followup(ctx, t)
-    assert ctx.queue.get(t.id).state != "done"
+    assert ctx.queue.get(t.id).state == "done"  # optimistic
+    await _flush_bg(ctx)
+    assert ctx.queue.get(t.id).state == "pending"  # resurrected
     spoken = ctx.tts.speak.call_args.args[0]
     assert "subprocess died" in spoken
 
@@ -607,5 +626,43 @@ async def test_create_linear_ticket_runs_thinking_earcon():
     t = ctx.queue.add(Task(kind="meeting_followup", headline="x"))
     ctx.current_task = t
     await dispatch.create_linear_ticket_from_followup(ctx, t)
+    await _flush_bg(ctx)
     ctx.thinking.start.assert_called_once()
     ctx.thinking.stop.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_create_linear_ticket_advances_cursor_to_successor():
+    """ACT+YES leaves the queue like a dismissal does — the cursor
+    moves to the next ranked task immediately."""
+    ctx, _mcp = _followup_ctx()
+    a, b, _c = _seed_three(ctx)
+    a.kind = "meeting_followup"
+    ctx.current_task = a
+    with patch.object(modes, "speak_chunked"):
+        await dispatch.create_linear_ticket_from_followup(ctx, a)
+    assert ctx.current_task is b  # before the agent reply lands
+    await _flush_bg(ctx)
+
+
+@pytest.mark.asyncio
+async def test_create_linear_ticket_local_effect_precedes_agent_run():
+    """Responsiveness regression: while the agent is still running, the
+    task is already done and the chord handler has returned."""
+    ctx, mcp = _followup_ctx()
+    gate = asyncio.Event()
+
+    async def slow_agent(**kwargs):
+        await gate.wait()
+        return "Filed in AI: x."
+
+    mcp.run_agent = AsyncMock(side_effect=slow_agent)
+    t = ctx.queue.add(Task(kind="meeting_followup", headline="x"))
+    ctx.current_task = t
+    await dispatch.create_linear_ticket_from_followup(ctx, t)
+    # Agent is parked on the gate; local state already settled.
+    assert ctx.queue.get(t.id).state == "done"
+    assert ctx.current_task is None
+    gate.set()
+    await _flush_bg(ctx)
+    ctx.tts.speak.assert_called_with("Filed in AI: x.")

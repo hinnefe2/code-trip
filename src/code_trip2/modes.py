@@ -109,6 +109,11 @@ class Context:
     # rather than by which class implements it — keeps the type-level
     # dependency one-way and avoids importing tui.py here.
     submit_input: Callable[[], bool] | None = None
+    # Strong refs to in-flight background side effects (email archive,
+    # Linear filing) spawned by dispatch._spawn_bg so the chord returns
+    # immediately. Holding the refs keeps asyncio from GC'ing the
+    # tasks mid-run; the done callback discards them.
+    background_jobs: "set[asyncio.Task]" = field(default_factory=set)
 
     def __post_init__(self) -> None:
         if not self.active_window:

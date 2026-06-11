@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING
 
 from code_trip2 import earcon, modes, remote
 from code_trip2._async_utils import event_or_timeout
-from code_trip2.tasks import Task
+from code_trip2.tasks import STATE_PENDING, Task
 
 if TYPE_CHECKING:
     from code_trip2.modes import Context
@@ -533,6 +533,30 @@ async def _respond_linear(ctx: "Context", task: Task, transcript: str) -> None:
     await _speak(ctx, "Commented.")
 
 
+def _spawn_bg(ctx: "Context", coro, *, name: str) -> "asyncio.Task":
+    """Run a slow remote side effect off the chord's critical path.
+
+    The chord handler applies the local effect (queue state, cursor,
+    spoken ack) immediately and hands the MCP roundtrip here, so the
+    press feels instant. Refs live in ``ctx.background_jobs`` to keep
+    asyncio from GC'ing the task; the body is expected to handle its
+    own errors (resurrect + speak), the done callback is just the
+    can't-happen backstop.
+    """
+    t = asyncio.create_task(coro, name=name)
+    ctx.background_jobs.add(t)
+
+    def _done(t: "asyncio.Task") -> None:
+        ctx.background_jobs.discard(t)
+        if not t.cancelled() and t.exception() is not None:
+            logger.error(
+                "Background job %r died", t.get_name(), exc_info=t.exception()
+            )
+
+    t.add_done_callback(_done)
+    return t
+
+
 async def create_linear_ticket_from_followup(
     ctx: "Context", task: Task,
 ) -> None:
@@ -543,39 +567,55 @@ async def create_linear_ticket_from_followup(
     agent reads the follow-up's headline / body / source, picks the
     right team (and project, when an obvious match exists) from the
     user's Linear workspace, then calls ``save_issue`` with
-    ``assignee="me"`` and ``state="Backlog"``. The agent's
-    one-sentence reply is spoken back to the user verbatim
-    (e.g. ``Filed in AI / Retention: Draft retention metrics doc.``).
+    ``assignee="me"`` and ``state="Backlog"``.
 
     Agent-driven instead of config-driven because the user works
     across multiple teams; a fixed default would mis-route most
-    follow-ups. On any failure (no agent MCP, run_agent raises) the
-    task stays active and TTS surfaces the error.
+    follow-ups.
+
+    Optimistic: the agent run takes ~90s, so the local effect happens
+    at chord time — task marked done, "Filing." spoken, cursor advanced
+    to the next ranked task — and the agent runs in the background with
+    the thinking earcon ticking. Its one-sentence reply is spoken when
+    it lands (e.g. ``Filed in AI: Draft retention metrics doc.``). On
+    failure the task returns to pending and TTS surfaces the error.
     """
     mcp = ctx.agent_mcp
     if mcp is None or not getattr(mcp, "enabled", False):
         await _speak(ctx, "Agent MCP is not configured.")
         return
-    prompt = _build_followup_filing_prompt(task)
     logger.info(
         "ACT+YES on meeting_followup: invoking file-meeting-followup for task %s",
         task.id,
     )
+    successor = _ranked_successor(ctx, task)
+    ctx.queue.mark_done(task.id)
+    if ctx.current_task is task:
+        ctx.current_task = None
+    await _speak(ctx, "Filing.")
+    _advance_cursor_after_dismiss(ctx, successor)
+    _spawn_bg(
+        ctx, _file_followup_bg(ctx, task), name=f"file-followup-{task.id[:8]}",
+    )
+
+
+async def _file_followup_bg(ctx: "Context", task: Task) -> None:
+    """Background half of :func:`create_linear_ticket_from_followup`."""
+    prompt = _build_followup_filing_prompt(task)
     ctx.thinking.start()
     try:
         try:
-            summary = await mcp.run_agent(
+            summary = await ctx.agent_mcp.run_agent(
                 prompt=prompt,
                 allowed_tools=ctx.agent_allowed_tools,
             )
         except Exception as exc:
             logger.exception("Linear follow-up filing failed")
-            await _speak(ctx, f"Could not file ticket: {exc}")
+            ctx.queue.set_state(task.id, STATE_PENDING)
+            await _speak(ctx, f"Could not file ticket: {exc} Returned to queue.")
             return
     finally:
         ctx.thinking.stop()
-    ctx.queue.mark_done(task.id)
-    ctx.current_task = None
     ctx.log.event(
         "queue_turn",
         task_id=task.id,
@@ -730,12 +770,14 @@ async def dismiss_current_task(ctx: "Context") -> None:
     thread (same ``unlabel_thread`` call as the voice "archive"
     command) — dropping the task without archiving would leave the
     email in the inbox, where the next wide poll re-surfaces it as a
-    fresh task.
+    fresh task. The archive is optimistic: it runs in the background
+    so the chord feels instant — silence means it worked; on failure
+    the task returns to pending and TTS says so.
 
-    After a completed dismissal the cursor advances to the task that
-    was ranked immediately below the dismissed one (wrapping to the
-    top from the bottom) instead of resetting to the top of the queue
-    — the user dismissing their way down the list shouldn't get yanked
+    After the dismissal the cursor advances to the task that was
+    ranked immediately below the dismissed one (wrapping to the top
+    from the bottom) instead of resetting to the top of the queue —
+    the user dismissing their way down the list shouldn't get yanked
     back up on every chord.
     """
     logger.info(
@@ -748,15 +790,57 @@ async def dismiss_current_task(ctx: "Context") -> None:
     modes.stop_playback(ctx)
     dismissed = ctx.current_task
     successor = _ranked_successor(ctx, dismissed)
-    if dismissed.kind == "email_msg":
-        await _dismiss_current_email(ctx)
-    else:
-        await _drop_current(ctx)
-    if ctx.current_task is not None:
-        # Dismissal didn't complete (e.g. the archive call failed and
-        # the task stayed active) — leave the cursor where it is.
-        return
+    needs_archive = (
+        dismissed.kind == "email_msg"
+        and ctx.email_mcp is not None
+        # No thread_id → archiving is impossible in principle; ACT+NO
+        # must never get stuck behind a missing capability, so it
+        # degrades to a plain dismiss.
+        and bool((dismissed.source or {}).get("thread_id"))
+    )
+    await _drop_current(ctx)
     _advance_cursor_after_dismiss(ctx, successor)
+    if needs_archive:
+        _spawn_bg(
+            ctx, _archive_email_bg(ctx, dismissed),
+            name=f"archive-{dismissed.id[:8]}",
+        )
+
+
+async def _archive_email_bg(ctx: "Context", task: Task) -> None:
+    """Background Gmail archive behind an already-dismissed email task.
+
+    The user already heard "Done." and moved on, so success is silent.
+    On failure the email is still in the inbox — return the task to
+    pending so it re-surfaces (the producer's incremental poll won't
+    re-emit it this session) and say what happened.
+    """
+    thread_id = (task.source or {}).get("thread_id") or ""
+    try:
+        await ctx.email_mcp.call_tool(
+            # ``threadId`` (camelCase) is the Gmail MCP's required arg
+            # name; ``thread_id`` makes it reject with a misleading
+            # "Invalid label" error.
+            "unlabel_thread",
+            {"threadId": thread_id, "labelIds": ["INBOX"]},
+        )
+    except Exception:
+        logger.exception("Background email archive failed for task %s", task.id)
+        ctx.queue.set_state(task.id, STATE_PENDING)
+        sender = (
+            task.source.get("sender_name")
+            or task.source.get("sender_email")
+            or "the email"
+        )
+        await _speak(ctx, f"Couldn't archive {sender}. Returned to queue.")
+        return
+    ctx.log.event(
+        "queue_turn",
+        task_id=task.id,
+        task_kind=task.kind,
+        topic=task.topic,
+        action="archive",
+    )
 
 
 def _ranked_successor(ctx: "Context", task: Task) -> Task | None:
@@ -799,25 +883,6 @@ def _advance_cursor_after_dismiss(ctx: "Context", successor: Task | None) -> Non
     ctx.current_task = t
     ctx.recent_topics.touch(t.topic)
     _announce_headline(ctx, t)
-
-
-async def _dismiss_current_email(ctx: "Context") -> None:
-    """Dismiss the active email task, archiving its Gmail thread.
-
-    ACT+NO is the user's permanent skip, so it must never get stuck
-    behind a missing capability: when archiving is impossible in
-    principle (no Gmail MCP configured, task has no thread_id) the
-    dismissal still goes through as a plain drop. A transient failure
-    (the MCP call raising) instead keeps the task active —
-    :func:`_archive_email` speaks the error — so the user knows the
-    email is still in the inbox and can retry.
-    """
-    task = ctx.current_task
-    thread_id = (task.source or {}).get("thread_id") or ""
-    if ctx.email_mcp is None or not thread_id:
-        await _drop_current(ctx)
-        return
-    await _archive_email(ctx, task)
 
 
 # --- consumer / auto-announce thread --------------------------------------
