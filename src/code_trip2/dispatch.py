@@ -731,6 +731,12 @@ async def dismiss_current_task(ctx: "Context") -> None:
     command) — dropping the task without archiving would leave the
     email in the inbox, where the next wide poll re-surfaces it as a
     fresh task.
+
+    After a completed dismissal the cursor advances to the task that
+    was ranked immediately below the dismissed one (wrapping to the
+    top from the bottom) instead of resetting to the top of the queue
+    — the user dismissing their way down the list shouldn't get yanked
+    back up on every chord.
     """
     logger.info(
         "dismiss_current_task: current_task=%s",
@@ -740,10 +746,59 @@ async def dismiss_current_task(ctx: "Context") -> None:
         await _speak(ctx, "Nothing active.")
         return
     modes.stop_playback(ctx)
-    if ctx.current_task.kind == "email_msg":
+    dismissed = ctx.current_task
+    successor = _ranked_successor(ctx, dismissed)
+    if dismissed.kind == "email_msg":
         await _dismiss_current_email(ctx)
+    else:
+        await _drop_current(ctx)
+    if ctx.current_task is not None:
+        # Dismissal didn't complete (e.g. the archive call failed and
+        # the task stayed active) — leave the cursor where it is.
         return
-    await _drop_current(ctx)
+    _advance_cursor_after_dismiss(ctx, successor)
+
+
+def _ranked_successor(ctx: "Context", task: Task) -> Task | None:
+    """The task ranked immediately below ``task``, wrapping bottom → top.
+
+    Captured *before* a dismissal mutates the ranking. ``None`` when
+    ``task`` is the only pending task or isn't in the ranking at all —
+    the caller then leaves the cursor empty and the QueueConsumer's
+    auto-announce takes over from the top, which is the only sensible
+    landing anyway.
+    """
+    ranked = ctx.queue.ranked(now=time.time(), recent=ctx.recent_topics)
+    if len(ranked) < 2:
+        return None
+    ids = [t.id for t, _ in ranked]
+    try:
+        idx = ids.index(task.id)
+    except ValueError:
+        return None
+    return ranked[(idx + 1) % len(ranked)][0]
+
+
+def _advance_cursor_after_dismiss(ctx: "Context", successor: Task | None) -> None:
+    """Point the cursor at ``successor`` and announce it.
+
+    Re-fetches the task first: an email dismissal awaits an MCP call,
+    during which producers can mutate the queue, so the successor may
+    no longer be pending. In that case (or with no successor) the
+    cursor stays empty and auto-announce picks up from the top.
+    Mirrors :func:`_announce_next`'s bookkeeping — this announcement
+    replaces the auto-announce that would otherwise have fired.
+    """
+    if successor is None:
+        return
+    t = ctx.queue.get(successor.id)
+    if t is None or t.state != "pending":
+        return
+    if ctx.queue_log is not None:
+        ctx.queue_log.record("pull", t)
+    ctx.current_task = t
+    ctx.recent_topics.touch(t.topic)
+    _announce_headline(ctx, t)
 
 
 async def _dismiss_current_email(ctx: "Context") -> None:

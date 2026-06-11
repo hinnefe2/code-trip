@@ -731,6 +731,28 @@ async def test_dismiss_email_task_without_thread_id_still_dismisses():
 
 
 @pytest.mark.asyncio
+async def test_dismiss_email_task_advances_cursor_past_archive(monkeypatch):
+    """The cursor advance applies to the email path too: after the
+    archive completes, the cursor moves to the next ranked task."""
+    import time as _time
+    mcp = create_autospec(ClaudeMCPClient, instance=True)
+    mcp.call_tool = AsyncMock()
+    ctx = _ctx_with_email_mcp(mcp)
+    ctx.app_mode = dispatch.MODE_QUEUE
+    base = _time.time() - 100
+    first = Task(kind="email_msg", source={"thread_id": "T1"}, created_at=base)
+    second = Task(kind="email_msg", source={"thread_id": "T2"}, created_at=base + 10)
+    ctx.queue.add(first)
+    ctx.queue.add(second)
+    ctx.current_task = first
+    with monkeypatch.context() as m:
+        m.setattr(modes, "speak_chunked", lambda *a, **k: None)
+        await dispatch.dismiss_current_task(ctx)
+    assert ctx.queue.get(first.id).state == "done"
+    assert ctx.current_task is second
+
+
+@pytest.mark.asyncio
 async def test_dismiss_email_task_archive_error_keeps_task_active():
     """Transient MCP failure: the email is still in the inbox, so keep
     the task active and let the spoken error tell the user."""

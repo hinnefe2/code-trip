@@ -217,6 +217,55 @@ async def test_dismiss_current_task_with_nothing_active_speaks():
     ctx.tts.speak.assert_called_with("Nothing active.")
 
 
+@pytest.mark.asyncio
+async def test_dismiss_advances_cursor_to_next_ranked_task():
+    """ACT+NO mid-list: the cursor lands on the task below the
+    dismissed one, not back at the top of the queue."""
+    ctx = _make_ctx(app_mode="queue")
+    _a, b, c = _seed_three(ctx)
+    ctx.current_task = b
+    with patch.object(modes, "speak_chunked") as spoke:
+        await dispatch.dismiss_current_task(ctx)
+    assert ctx.queue.get(b.id).state == "done"
+    assert ctx.current_task is c
+    spoke.assert_called()  # successor headline announced
+
+
+@pytest.mark.asyncio
+async def test_dismiss_bottom_task_wraps_cursor_to_top():
+    ctx = _make_ctx(app_mode="queue")
+    a, _b, c = _seed_three(ctx)
+    ctx.current_task = c
+    with patch.object(modes, "speak_chunked"):
+        await dispatch.dismiss_current_task(ctx)
+    assert ctx.queue.get(c.id).state == "done"
+    assert ctx.current_task is a
+
+
+@pytest.mark.asyncio
+async def test_dismiss_only_task_leaves_cursor_empty():
+    """No successor: cursor stays empty and the consumer's
+    auto-announce owns the next move."""
+    ctx = _make_ctx(app_mode="queue")
+    t = ctx.queue.add(Task(headline="only one"))
+    ctx.current_task = t
+    await dispatch.dismiss_current_task(ctx)
+    assert ctx.queue.get(t.id).state == "done"
+    assert ctx.current_task is None
+
+
+@pytest.mark.asyncio
+async def test_dismiss_advance_touches_recent_topics_like_announce_next():
+    """The advance replaces an auto-announce, so it carries the same
+    scheduler bookkeeping — unlike exploratory arrow navigation."""
+    ctx = _make_ctx(app_mode="queue")
+    _a, b, c = _seed_three(ctx)
+    ctx.current_task = b
+    with patch.object(modes, "speak_chunked"):
+        await dispatch.dismiss_current_task(ctx)
+    assert c.topic in [topic for topic, _ts in ctx.recent_topics.as_list()]
+
+
 # --- queue_navigate (TUI arrow keys) --------------------------------------
 
 
