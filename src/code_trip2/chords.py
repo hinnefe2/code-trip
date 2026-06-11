@@ -101,7 +101,8 @@ async def handle_chord(ctx: "Context", name: str) -> None:
     elif name == "act+no":
         # ACT+NO is mode-dependent: in queue mode it dismisses the
         # current task (the "permanent skip" the user reaches for when
-        # NO-tap-as-defer keeps re-surfacing the same message). In
+        # NO-tap-as-defer keeps re-surfacing the same message); for
+        # email tasks the dismissal also archives the Gmail thread. In
         # focused mode it stays as Ctrl+U for shell input.
         logger.info("Chord act+no fired in app_mode=%r", ctx.app_mode)
         if ctx.app_mode == dispatch.MODE_QUEUE:

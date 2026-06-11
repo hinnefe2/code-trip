@@ -725,6 +725,12 @@ async def dismiss_current_task(ctx: "Context") -> None:
     "permanently drop this task" — the user has decided they don't
     care. Stops any in-flight announcement first so we don't keep
     speaking about a task we just killed.
+
+    For ``email_msg`` tasks the dismissal also archives the Gmail
+    thread (same ``unlabel_thread`` call as the voice "archive"
+    command) — dropping the task without archiving would leave the
+    email in the inbox, where the next wide poll re-surfaces it as a
+    fresh task.
     """
     logger.info(
         "dismiss_current_task: current_task=%s",
@@ -734,7 +740,29 @@ async def dismiss_current_task(ctx: "Context") -> None:
         await _speak(ctx, "Nothing active.")
         return
     modes.stop_playback(ctx)
+    if ctx.current_task.kind == "email_msg":
+        await _dismiss_current_email(ctx)
+        return
     await _drop_current(ctx)
+
+
+async def _dismiss_current_email(ctx: "Context") -> None:
+    """Dismiss the active email task, archiving its Gmail thread.
+
+    ACT+NO is the user's permanent skip, so it must never get stuck
+    behind a missing capability: when archiving is impossible in
+    principle (no Gmail MCP configured, task has no thread_id) the
+    dismissal still goes through as a plain drop. A transient failure
+    (the MCP call raising) instead keeps the task active —
+    :func:`_archive_email` speaks the error — so the user knows the
+    email is still in the inbox and can retry.
+    """
+    task = ctx.current_task
+    thread_id = (task.source or {}).get("thread_id") or ""
+    if ctx.email_mcp is None or not thread_id:
+        await _drop_current(ctx)
+        return
+    await _archive_email(ctx, task)
 
 
 # --- consumer / auto-announce thread --------------------------------------

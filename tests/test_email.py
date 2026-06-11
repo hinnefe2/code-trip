@@ -670,6 +670,82 @@ async def test_respond_email_archive_api_error_keeps_task_active():
     assert ctx.current_task is task
 
 
+# --- ACT+NO dismiss archives the email ------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dismiss_email_task_archives_thread_and_marks_done():
+    """ACT+NO on an email task: archive the Gmail thread, then dismiss."""
+    mcp = create_autospec(ClaudeMCPClient, instance=True)
+    mcp.call_tool = AsyncMock()
+    ctx = _ctx_with_email_mcp(mcp)
+    ctx.app_mode = dispatch.MODE_QUEUE
+    task = Task(
+        kind="email_msg",
+        source={
+            "thread_id": "T1",
+            "message_id": "M1",
+            "sender_email": "alice@example.com",
+            "subject": "Help",
+        },
+    )
+    ctx.queue.add(task)
+    ctx.current_task = task
+    await dispatch.dismiss_current_task(ctx)
+    mcp.call_tool.assert_called_once()
+    call = mcp.call_tool.call_args
+    assert call.args[0] == "unlabel_thread"
+    assert call.args[1] == {"threadId": "T1", "labelIds": ["INBOX"]}
+    assert ctx.queue.get(task.id).state == "done"
+    assert ctx.current_task is None
+    ctx.tts.speak.assert_called_with("Archived.")
+
+
+@pytest.mark.asyncio
+async def test_dismiss_email_task_without_mcp_still_dismisses():
+    """No Gmail MCP — ACT+NO must not get stuck; plain dismiss."""
+    ctx = _ctx_with_email_mcp(mcp=None)
+    ctx.app_mode = dispatch.MODE_QUEUE
+    task = Task(kind="email_msg", source={"thread_id": "T1"})
+    ctx.queue.add(task)
+    ctx.current_task = task
+    await dispatch.dismiss_current_task(ctx)
+    assert ctx.queue.get(task.id).state == "done"
+    assert ctx.current_task is None
+
+
+@pytest.mark.asyncio
+async def test_dismiss_email_task_without_thread_id_still_dismisses():
+    """No thread_id — archiving is impossible in principle; plain dismiss."""
+    mcp = create_autospec(ClaudeMCPClient, instance=True)
+    mcp.call_tool = AsyncMock()
+    ctx = _ctx_with_email_mcp(mcp)
+    ctx.app_mode = dispatch.MODE_QUEUE
+    task = Task(kind="email_msg", source={"message_id": "M1"})
+    ctx.queue.add(task)
+    ctx.current_task = task
+    await dispatch.dismiss_current_task(ctx)
+    mcp.call_tool.assert_not_called()
+    assert ctx.queue.get(task.id).state == "done"
+    assert ctx.current_task is None
+
+
+@pytest.mark.asyncio
+async def test_dismiss_email_task_archive_error_keeps_task_active():
+    """Transient MCP failure: the email is still in the inbox, so keep
+    the task active and let the spoken error tell the user."""
+    mcp = create_autospec(ClaudeMCPClient, instance=True)
+    mcp.call_tool = AsyncMock(side_effect=ClaudeMCPError("network down"))
+    ctx = _ctx_with_email_mcp(mcp)
+    ctx.app_mode = dispatch.MODE_QUEUE
+    task = Task(kind="email_msg", source={"thread_id": "T1"})
+    ctx.queue.add(task)
+    ctx.current_task = task
+    await dispatch.dismiss_current_task(ctx)
+    assert ctx.queue.get(task.id).state != "done"
+    assert ctx.current_task is task
+
+
 @pytest.mark.asyncio
 async def test_dispatch_task_response_routes_email_kind():
     mcp = create_autospec(ClaudeMCPClient, instance=True)
