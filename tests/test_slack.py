@@ -318,6 +318,28 @@ async def test_run_agent_transcript_with_single_block_returns_block(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_run_agent_default_deadline_fits_multi_tool_skill_flows(monkeypatch):
+    """Regression: skill flows chain several claude.ai MCP roundtrips —
+    a healthy file-meeting-followup run measured ~90s end-to-end, and
+    the old 120s floor killed a working run mid-flight (2026-06-11).
+    Pin the 300s floor, and that an explicit timeout still wins."""
+    from code_trip2.producers import claude_mcp as claude_mcp_module
+
+    c = _mk_client()  # default self.timeout=60.0 — floor must override
+    captured = {}
+
+    async def fake_run(cmd, *, input_, timeout, what):
+        captured["timeout"] = timeout
+        return (_assistant_text_event("ok"), "", 0)
+
+    monkeypatch.setattr(claude_mcp_module, "_run_subprocess", fake_run)
+    await c.run_agent(prompt="file it")
+    assert captured["timeout"] == 300.0
+    await c.run_agent(prompt="file it", timeout=42.0)
+    assert captured["timeout"] == 42.0
+
+
+@pytest.mark.asyncio
 async def test_run_agent_raises_on_nonzero_exit(monkeypatch):
     c = _mk_client()
     _patch_exec(monkeypatch, stdout="", stderr="oh no", returncode=2)

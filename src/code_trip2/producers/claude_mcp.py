@@ -200,7 +200,15 @@ class ClaudeMCPClient:
             raise ClaudeMCPError("claude CLI not available")
 
         budget = max_budget_usd if max_budget_usd is not None else max(self.max_budget_usd, 0.20)
-        deadline = timeout if timeout is not None else max(self.timeout, 120.0)
+        # Skill flows chain several claude.ai MCP roundtrips (skill
+        # discovery, then each tool call proxies through the remote
+        # server) — a healthy file-meeting-followup run measured ~90s
+        # end-to-end, so the old 120s floor left no headroom and killed
+        # a working run mid-flight. Worse than slow: a kill can land
+        # after the side effect (issue created, email archived) but
+        # before the summary, leaving the task active for a re-trigger.
+        # 300s is a ceiling, not a wait — healthy runs are unaffected.
+        deadline = timeout if timeout is not None else max(self.timeout, 300.0)
         cmd = [
             self.binary,
             "--print",
