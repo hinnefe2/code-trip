@@ -246,12 +246,24 @@ def test_ptt_alone_does_not_set_skill_mode(monkeypatch):
 
 def test_act_plus_yes_fires_chord(monkeypatch):
     """ACT+YES routes through handle_chord — chords.py decides what to do
-    per mode / active-task kind (e.g. open an email in the browser)."""
+    per mode / active-task kind (e.g. file a meeting follow-up)."""
     pad, rec, *_ = _make(monkeypatch)
     pad._on_press(keyboard.Key.f14)  # ACT
     pad._on_press(keyboard.Key.f15)  # YES under ACT
     assert rec.chords == ["act+yes"]
     assert rec.taps == []
+
+
+def test_act_plus_nav_fires_chord(monkeypatch):
+    """ACT held + NAV tap fires act+nav (open-in-app), and neither key
+    fires its solo tap on release."""
+    pad, rec, *_ = _make(monkeypatch)
+    pad._on_press(keyboard.Key.f14)    # ACT
+    pad._on_press(keyboard.Key.f17)    # NAV under ACT
+    assert rec.chords == ["act+nav"]
+    pad._on_release(keyboard.Key.f17)
+    pad._on_release(keyboard.Key.f14)
+    assert rec.taps == []  # both keys were chorded
 
 
 def test_nav_beats_act_when_both_held(monkeypatch):
@@ -732,7 +744,7 @@ async def test_chord_act_no_in_queue_mode_dismisses_task(monkeypatch):
     assert sent == []  # no Ctrl+U leaking into the focused app
 
 
-# --- act+yes (open in browser) -------------------------------------------
+# --- act+nav (open in app) -------------------------------------------
 
 
 def _email_task(thread_id: str = "T123ABC"):
@@ -747,15 +759,15 @@ def _email_task(thread_id: str = "T123ABC"):
 
 
 @pytest.mark.asyncio
-async def test_chord_act_yes_queue_mode_opens_gmail_thread(monkeypatch):
-    """ACT+YES on an email_msg active task opens the Gmail thread URL."""
+async def test_chord_act_nav_queue_mode_opens_gmail_thread(monkeypatch):
+    """ACT+NAV on an email_msg active task opens the Gmail thread URL."""
     opened = _patch_open_subprocess(monkeypatch)
     monkeypatch.setattr(chords.earcon, "completion", lambda: None)
     ctx = _ctx()
     ctx.app_mode = "queue"
     ctx.current_task = _email_task(thread_id="THR456")
 
-    await chords.handle_chord(ctx, "act+yes")
+    await chords.handle_chord(ctx, "act+nav")
 
     assert len(opened) == 1
     cmd = opened[0]
@@ -766,14 +778,14 @@ async def test_chord_act_yes_queue_mode_opens_gmail_thread(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_chord_act_yes_no_active_task_speaks_error(monkeypatch):
+async def test_chord_act_nav_no_active_task_speaks_error(monkeypatch):
     opened = _patch_open_subprocess(monkeypatch)
     monkeypatch.setattr(chords.earcon, "error", lambda: None)
     ctx = _ctx()
     ctx.app_mode = "queue"
     ctx.current_task = None
 
-    await chords.handle_chord(ctx, "act+yes")
+    await chords.handle_chord(ctx, "act+nav")
 
     assert opened == []
     ctx.tts.speak.assert_called_once()
@@ -781,8 +793,8 @@ async def test_chord_act_yes_no_active_task_speaks_error(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_chord_act_yes_non_email_task_speaks_error(monkeypatch):
-    """ACT+YES is email-only today — other kinds get a spoken hint, not silence."""
+async def test_chord_act_nav_non_email_task_speaks_error(monkeypatch):
+    """ACT+NAV is email-only today — other kinds get a spoken hint, not silence."""
     from code_trip2.tasks import Task
     opened = _patch_open_subprocess(monkeypatch)
     monkeypatch.setattr(chords.earcon, "error", lambda: None)
@@ -790,7 +802,7 @@ async def test_chord_act_yes_non_email_task_speaks_error(monkeypatch):
     ctx.app_mode = "queue"
     ctx.current_task = Task(kind="slack_msg", topic="general", headline="hi")
 
-    await chords.handle_chord(ctx, "act+yes")
+    await chords.handle_chord(ctx, "act+nav")
 
     assert opened == []
     ctx.tts.speak.assert_called_once()
@@ -798,35 +810,35 @@ async def test_chord_act_yes_non_email_task_speaks_error(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_chord_act_yes_missing_thread_id_speaks_error(monkeypatch):
+async def test_chord_act_nav_missing_thread_id_speaks_error(monkeypatch):
     opened = _patch_open_subprocess(monkeypatch)
     monkeypatch.setattr(chords.earcon, "error", lambda: None)
     ctx = _ctx()
     ctx.app_mode = "queue"
     ctx.current_task = _email_task(thread_id="")
 
-    await chords.handle_chord(ctx, "act+yes")
+    await chords.handle_chord(ctx, "act+nav")
 
     assert opened == []
     ctx.tts.speak.assert_called_once()
 
 
 @pytest.mark.asyncio
-async def test_chord_act_yes_in_focused_mode_is_noop(monkeypatch):
+async def test_chord_act_nav_in_focused_mode_is_noop(monkeypatch):
     """Focused mode has no active-task concept — chord is silently inert."""
     opened = _patch_open_subprocess(monkeypatch)
     ctx = _ctx()
     ctx.app_mode = "focused"
     ctx.current_task = _email_task()
 
-    await chords.handle_chord(ctx, "act+yes")
+    await chords.handle_chord(ctx, "act+nav")
 
     assert opened == []
     ctx.tts.speak.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_chord_act_yes_open_subprocess_failure_speaks_error(monkeypatch):
+async def test_chord_act_nav_open_subprocess_failure_speaks_error(monkeypatch):
     """A nonzero exit from ``open`` surfaces as a spoken error, no crash."""
     monkeypatch.setattr(chords.earcon, "error", lambda: None)
 
@@ -841,13 +853,13 @@ async def test_chord_act_yes_open_subprocess_failure_speaks_error(monkeypatch):
     ctx.app_mode = "queue"
     ctx.current_task = _email_task()
 
-    await chords.handle_chord(ctx, "act+yes")
+    await chords.handle_chord(ctx, "act+nav")
     ctx.tts.speak.assert_called_once()
 
 
 @pytest.mark.asyncio
-async def test_chord_act_yes_slack_opens_permalink_in_chrome(monkeypatch):
-    """ACT+YES on a slack_msg opens its permalink in Chrome.
+async def test_chord_act_nav_slack_opens_permalink_in_chrome(monkeypatch):
+    """ACT+NAV on a slack_msg opens its permalink in Chrome.
 
     Direct app handoffs (``open -a Slack <url>`` and ``osascript open
     location``) didn't reliably deep-link to the specific message —
@@ -871,14 +883,14 @@ async def test_chord_act_yes_slack_opens_permalink_in_chrome(monkeypatch):
         source={"url": permalink, "channel_id": "C09019R7RK2"},
     )
 
-    await chords.handle_chord(ctx, "act+yes")
+    await chords.handle_chord(ctx, "act+nav")
 
     assert opened == [["open", "-a", chords._CHROME_APP, permalink]]
 
 
 @pytest.mark.asyncio
-async def test_chord_act_yes_linear_goes_to_chrome(monkeypatch):
-    """ACT+YES on a Linear ticket opens its URL in Chrome (regression
+async def test_chord_act_nav_linear_goes_to_chrome(monkeypatch):
+    """ACT+NAV on a Linear ticket opens its URL in Chrome (regression
     guard — only slack_msg should use osascript)."""
     from code_trip2.tasks import Task
     opened = _patch_open_subprocess(monkeypatch)
@@ -893,7 +905,7 @@ async def test_chord_act_yes_linear_goes_to_chrome(monkeypatch):
         source={"identifier": "AI-7", "url": url},
     )
 
-    await chords.handle_chord(ctx, "act+yes")
+    await chords.handle_chord(ctx, "act+nav")
 
     assert opened == [["open", "-a", chords._CHROME_APP, url]]
 
@@ -953,8 +965,9 @@ async def test_chord_act_yes_on_meeting_followup_routes_to_linear_create(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_chord_act_yes_on_email_still_opens_browser(monkeypatch):
-    """The new routing must not regress the existing email_msg path."""
+async def test_chord_act_yes_on_email_is_silent_noop(monkeypatch):
+    """Open-in-app moved to ACT+NAV; ACT+YES on a kind with no accept
+    action does nothing — no browser, no agent, no speech."""
     from code_trip2 import dispatch as dispatch_module
 
     opened = _patch_open_subprocess(monkeypatch)
@@ -962,7 +975,6 @@ async def test_chord_act_yes_on_email_still_opens_browser(monkeypatch):
     monkeypatch.setattr(
         dispatch_module, "create_linear_ticket_from_followup", create,
     )
-    monkeypatch.setattr(chords.earcon, "completion", lambda: None)
 
     ctx = _ctx()
     ctx.app_mode = "queue"
@@ -971,5 +983,74 @@ async def test_chord_act_yes_on_email_still_opens_browser(monkeypatch):
     await chords.handle_chord(ctx, "act+yes")
 
     create.assert_not_called()
-    assert len(opened) == 1
-    assert "THR789" in opened[0][3]
+    assert opened == []
+    ctx.tts.speak.assert_not_called()
+
+
+# --- act+nav on meeting_followup (notes doc) ------------------------------
+
+
+@pytest.mark.asyncio
+async def test_chord_act_nav_meeting_followup_opens_notes_doc(monkeypatch):
+    """ACT+NAV on a meeting_followup opens the meeting-notes doc the
+    follow-up was extracted from."""
+    from code_trip2.tasks import Task
+
+    opened = _patch_open_subprocess(monkeypatch)
+    monkeypatch.setattr(chords.earcon, "completion", lambda: None)
+    ctx = _ctx()
+    ctx.app_mode = "queue"
+    doc = "https://docs.google.com/document/d/abc123/edit"
+    ctx.current_task = Task(
+        kind="meeting_followup",
+        topic="planning-sync",
+        headline="Draft doc",
+        source={"meeting": "Planning Sync", "thread_id": "T1", "notes_doc_url": doc},
+    )
+
+    await chords.handle_chord(ctx, "act+nav")
+
+    assert opened == [["open", "-a", chords._CHROME_APP, doc]]
+
+
+@pytest.mark.asyncio
+async def test_chord_act_nav_meeting_followup_falls_back_to_gmail_thread(monkeypatch):
+    """Follow-ups spawned before notes_doc_url existed still open
+    something useful: the Gmail thread of the notes email."""
+    from code_trip2.tasks import Task
+
+    opened = _patch_open_subprocess(monkeypatch)
+    monkeypatch.setattr(chords.earcon, "completion", lambda: None)
+    ctx = _ctx()
+    ctx.app_mode = "queue"
+    ctx.current_task = Task(
+        kind="meeting_followup",
+        topic="planning-sync",
+        headline="Draft doc",
+        source={"meeting": "Planning Sync", "thread_id": "TNOTES"},
+    )
+
+    await chords.handle_chord(ctx, "act+nav")
+
+    assert opened == [[
+        "open", "-a", chords._CHROME_APP,
+        "https://mail.google.com/mail/u/0/#all/TNOTES",
+    ]]
+
+
+@pytest.mark.asyncio
+async def test_chord_act_nav_meeting_followup_without_any_url_speaks_error(monkeypatch):
+    from code_trip2.tasks import Task
+
+    opened = _patch_open_subprocess(monkeypatch)
+    monkeypatch.setattr(chords.earcon, "error", lambda: None)
+    ctx = _ctx()
+    ctx.app_mode = "queue"
+    ctx.current_task = Task(
+        kind="meeting_followup", topic="x", headline="y", source={"meeting": "M"},
+    )
+
+    await chords.handle_chord(ctx, "act+nav")
+
+    assert opened == []
+    ctx.tts.speak.assert_called_once()

@@ -13,7 +13,7 @@ currently held. Behavior:
   - NAV held + YES/NO/ACT   → ``on_chord("nav+yes" | "nav+no" | "nav+act")``.
   - NAV tapped alone        → ``on_tap("nav")`` (fires on release if NAV was
                               not used as a modifier).
-  - ACT held + NO           → ``on_chord("act+no")`` (clear-line Ctrl+U).
+  - ACT held + YES/NO/NAV   → ``on_chord("act+yes" | "act+no" | "act+nav")``.
   - YES or NO tapped alone  → ``on_tap("yes" | "no")``.
   - Everything else         → no-op.
 
@@ -194,7 +194,7 @@ class Macropad:
                     self._start_recording()
         elif name in ("yes", "no", "act") and nav_modifier:
             self._fire_chord(f"nav+{name}")
-        elif name in ("yes", "no") and act_modifier:
+        elif name in ("yes", "no", "nav") and act_modifier:
             self._fire_chord(f"act+{name}")
         elif name in ("yes", "no") and self.on_tap is not None:
             self._fire_tap(name)

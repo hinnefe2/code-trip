@@ -1,11 +1,19 @@
-"""Chord dispatch: NAV-modifier combos trigger per-app actions.
+"""Chord dispatch: NAV- and ACT-modifier combos trigger per-app actions.
 
-Four chords, all triggered by tapping a key while NAV is held:
+NAV-held chords drive the focused app:
 
   - ``nav+yes`` — forward in the focused app's natural unit
   - ``nav+no``  — backward in the focused app's natural unit
   - ``nav+act`` — rotate to the next app in ``config.app_cycle``
   - ``nav+ptt`` — speak the frontmost app's name via TTS
+
+ACT-held chords act on the queue's cursor task (queue mode):
+
+  - ``act+yes`` — per-kind "accept" (meeting_followup → Linear ticket)
+  - ``act+no``  — dismiss permanently (emails also archive); Ctrl+U in
+    focused mode
+  - ``act+nav`` — open the task in its app (Gmail / Linear / Slack /
+    the meeting-notes doc)
 
 "Natural unit" per app is defined in ``APP_NAV`` as a (yes, no) pair of
 :class:`KeyStroke` values. YES and NO do not have to be symmetric — Slack
@@ -110,20 +118,22 @@ async def handle_chord(ctx: "Context", name: str) -> None:
         else:
             await _send_stroke(ctx, _ACT_NO_CLEAR_LINE)
     elif name == "act+yes":
-        # ACT+YES in queue mode:
-        #   - ``meeting_followup`` → create a Linear backlog ticket
-        #     assigned to the user. The follow-up has no natural URL
-        #     to open, so this is the right place to wire it.
-        #   - everything else → open the active task in a browser
-        #     when the task has an obvious URL (email_msg → Gmail
-        #     thread; linear_issue / slack_msg → source["url"]).
-        # No-op in focused mode.
+        # ACT+YES in queue mode is the "accept" action per kind. Only
+        # ``meeting_followup`` has one wired today (create a Linear
+        # backlog ticket assigned to the user); other kinds are a
+        # silent no-op. Open-in-app lives on ACT+NAV. No-op in
+        # focused mode.
         if ctx.app_mode == dispatch.MODE_QUEUE:
             task = ctx.current_task
             if task is not None and task.kind == "meeting_followup":
                 await dispatch.create_linear_ticket_from_followup(ctx, task)
-            else:
-                await _open_current_task_in_browser(ctx)
+    elif name == "act+nav":
+        # ACT+NAV in queue mode: open the active task in its app —
+        # email_msg → Gmail thread; linear_issue / slack_msg →
+        # source["url"]; meeting_followup → the meeting-notes doc.
+        # No-op in focused mode.
+        if ctx.app_mode == dispatch.MODE_QUEUE:
+            await _open_current_task_in_browser(ctx)
     else:
         logger.warning("Unknown chord: %s", name)
 
@@ -138,6 +148,11 @@ def _task_browser_url(task) -> str | None:
     ``slack_msg`` use the URL the producer captured in
     ``source["url"]`` (Linear's MCP response field; Slack's
     workspace-qualified permalink from the message's metadata).
+    ``meeting_followup`` opens the meeting-notes doc the follow-up was
+    extracted from (``source["notes_doc_url"]``, captured by the
+    archive-gemini-meeting-notes skill); tasks spawned before that
+    field existed fall back to the Gmail thread of the notes email —
+    archived mail is still reachable via the ``#all`` view.
     """
     src = task.source or {}
     if task.kind == "email_msg":
@@ -146,6 +161,12 @@ def _task_browser_url(task) -> str | None:
     if task.kind in ("linear_issue", "slack_msg"):
         url = src.get("url") or ""
         return url or None
+    if task.kind == "meeting_followup":
+        url = src.get("notes_doc_url") or ""
+        if url:
+            return url
+        thread_id = src.get("thread_id") or ""
+        return _GMAIL_THREAD_URL.format(thread_id=thread_id) if thread_id else None
     return None
 
 

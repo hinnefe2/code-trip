@@ -34,7 +34,7 @@ You're being invoked on an email task that looks like an auto-generated meeting-
 3. **Emit one `FOLLOWUP_TASK` line per action item for Henry**, BEFORE the final summary sentence. Format (one line per task, valid JSON object, no surrounding code fences):
 
    ```
-   FOLLOWUP_TASK: {"headline": "<short imperative — what Henry needs to do>", "body": "<the verbatim action item plus any context from the notes that makes it actionable standalone>", "topic": "<short slug, e.g. the meeting title kebab-cased>", "source": {"meeting": "<meeting title>", "thread_id": "<the email thread id>"}}
+   FOLLOWUP_TASK: {"headline": "<short imperative — what Henry needs to do>", "body": "<the verbatim action item plus any context from the notes that makes it actionable standalone>", "topic": "<short slug, e.g. the meeting title kebab-cased>", "source": {"meeting": "<meeting title>", "thread_id": "<the email thread id>", "notes_doc_url": "<the Google Docs link to the full meeting notes from the email body, if present — the ACT+NAV chord opens it; omit the key when the email has no doc link>"}}
    ```
 
    Rules:
