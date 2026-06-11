@@ -26,6 +26,14 @@ logger = logging.getLogger(__name__)
 
 _REPLAY_WINDOW_S = 24 * 60 * 60  # Drop events older than 24h on startup.
 
+# Kinds whose source of truth IS the queue log — no producer re-emits
+# them on the next poll, so age-cutoff filtering would silently lose
+# user-visible work. ``meeting_followup`` is spawned once by the
+# Gemini-notes archiver and then orphaned (the email is archived);
+# ``note`` is a voice-entered personal todo. Both are pure backlog
+# items that should persist until the user marks them done.
+_DURABLE_KINDS = frozenset({"meeting_followup", "note"})
+
 
 def default_queue_dir() -> Path:
     return Path.home() / ".code-trip" / "queue"
@@ -94,12 +102,14 @@ class QueueLog:
     # ----- replay ---------------------------------------------------------
 
     def replay(self) -> list[Task]:
-        """Reconstruct queue state from the most-recent queue log file(s).
+        """Reconstruct queue state from the queue log files.
 
-        Reads up to the last 2 daily files (to handle the midnight boundary),
-        applies events in order, and drops anything older than 24 hours by
-        ``created_at``. Tasks marked done/dropped during the replay window
-        are not returned — they're terminal.
+        Reads every ``queue-*.jsonl`` file in the log directory (so
+        durable kinds aren't capped to a yesterday-only lookback),
+        applies events in order, and drops anything older than 24 hours
+        by ``created_at`` — *unless* the task's kind is in
+        :data:`_DURABLE_KINDS`. Tasks marked done/dropped during the
+        replay window are not returned — they're terminal.
 
         Tasks left in ``active`` state at shutdown are demoted back to
         ``pending``. The active state only means anything while the
@@ -110,7 +120,7 @@ class QueueLog:
         """
         cutoff = time.time() - _REPLAY_WINDOW_S
         state: dict[str, Task] = {}
-        for path in self._recent_queue_files():
+        for path in self._queue_files():
             try:
                 with path.open("r", encoding="utf-8") as f:
                     for line in f:
@@ -128,7 +138,10 @@ class QueueLog:
                             t = Task.from_dict(td)
                         except (KeyError, TypeError):
                             continue
-                        if t.created_at < cutoff:
+                        if (
+                            t.created_at < cutoff
+                            and t.kind not in _DURABLE_KINDS
+                        ):
                             continue
                         state[t.id] = t
             except OSError:
@@ -143,14 +156,20 @@ class QueueLog:
             # done / dropped are terminal — skip.
         return out
 
-    def _recent_queue_files(self) -> list[Path]:
+    def _queue_files(self) -> list[Path]:
+        """Every queue log file in the directory, oldest first.
+
+        Older files matter because durable kinds (notes, meeting
+        follow-ups) accumulate over weeks. Replay only does this scan
+        once per startup; even with months of logs it's parsing
+        single-digit MB of JSONL.
+        """
         try:
-            files = sorted(
+            return sorted(
                 p for p in self.dir.iterdir() if p.name.startswith("queue-")
             )
         except OSError:
             return []
-        return files[-2:]  # today and yesterday is enough for a 24h window
 
     # ----- internals ------------------------------------------------------
 

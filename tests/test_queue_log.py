@@ -8,7 +8,9 @@ from pathlib import Path
 
 import pytest
 
-from code_trip2.queue_log import QueueLog, _REPLAY_WINDOW_S
+from datetime import datetime, timedelta, timezone
+
+from code_trip2.queue_log import _DURABLE_KINDS, QueueLog, _REPLAY_WINDOW_S
 from code_trip2.tasks import STATE_DONE, RecentTopics, Task, TaskQueue
 
 
@@ -46,14 +48,13 @@ def test_replay_rebuilds_pending(tmp_path: Path):
     assert b.id not in ids  # terminal state filtered out
 
 
-def test_replay_drops_old_events(tmp_path: Path):
-    # Hand-write a stale event older than the 24h window.
-    stale = {
+def _stale_record(kind: str, task_id: str = "stale-1") -> dict:
+    return {
         "ts": "2020-01-01T00:00:00Z",
         "event": "add",
         "task": {
-            "id": "stale-1",
-            "kind": "note",
+            "id": task_id,
+            "kind": kind,
             "topic": "inbox",
             "headline": "ancient",
             "body": None,
@@ -65,9 +66,76 @@ def test_replay_drops_old_events(tmp_path: Path):
             "parent_id": None,
         },
     }
-    from datetime import datetime, timezone
-    name = f"queue-{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.jsonl"
-    (tmp_path / name).write_text(json.dumps(stale) + "\n")
+
+
+def _write_log_for_date(dir_: Path, date: datetime, records: list[dict]) -> Path:
+    path = dir_ / f"queue-{date.strftime('%Y-%m-%d')}.jsonl"
+    path.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+    return path
+
+
+def test_replay_drops_old_events_for_non_durable_kinds(tmp_path: Path):
+    """Non-durable kinds (slack_msg, etc.) older than 24h still drop —
+    the cutoff only relaxes for the explicitly-durable set."""
+    _write_log_for_date(
+        tmp_path, datetime.now(timezone.utc), [_stale_record("slack_msg")],
+    )
+    log = QueueLog(dir_=tmp_path)
+    assert log.replay() == []
+
+
+def test_replay_keeps_durable_kinds_past_cutoff(tmp_path: Path):
+    """Meeting follow-ups and notes outlive the 24h cutoff — the queue
+    log IS the source of truth for them, so they shouldn't silently
+    vanish across restarts."""
+    records = [
+        _stale_record("meeting_followup", task_id="followup-1"),
+        _stale_record("note", task_id="note-1"),
+    ]
+    _write_log_for_date(tmp_path, datetime.now(timezone.utc), records)
+    log = QueueLog(dir_=tmp_path)
+    surviving = {t.id for t in log.replay()}
+    assert surviving == {"followup-1", "note-1"}
+
+
+def test_durable_kinds_constant_covers_expected_kinds():
+    """Lock the set so a future kind addition forces an intentional
+    decision about durability — easy thing to forget."""
+    assert _DURABLE_KINDS == frozenset({"meeting_followup", "note"})
+
+
+def test_replay_reads_files_older_than_yesterday_for_durable_tasks(tmp_path: Path):
+    """The old ``[-2:]`` file window made meeting_followups invisible
+    after 36-ish hours regardless of the cutoff. Replay should scan
+    further back so durable tasks from a week ago still load."""
+    week_ago = datetime.now(timezone.utc) - timedelta(days=7)
+    rec = _stale_record("meeting_followup", task_id="week-old")
+    # Re-anchor created_at to "7 days ago" so the durable-kind path is
+    # what saves it, not happenstance.
+    rec["task"]["created_at"] = time.time() - 7 * 24 * 60 * 60
+    _write_log_for_date(tmp_path, week_ago, [rec])
+    # Add a few intermediate empty files so this isn't trivially the
+    # most-recent file.
+    for offset in (1, 3, 5):
+        d = datetime.now(timezone.utc) - timedelta(days=offset)
+        _write_log_for_date(tmp_path, d, [])
+
+    log = QueueLog(dir_=tmp_path)
+    tasks = log.replay()
+    assert [t.id for t in tasks] == ["week-old"]
+
+
+def test_replay_honors_terminal_state_in_older_files(tmp_path: Path):
+    """A meeting_followup created last week and marked done last week
+    should NOT come back — terminal state is honored even when reading
+    older files."""
+    last_week = datetime.now(timezone.utc) - timedelta(days=5)
+    rec_add = _stale_record("meeting_followup", task_id="done-task")
+    rec_add["task"]["created_at"] = time.time() - 5 * 24 * 60 * 60
+    rec_done = json.loads(json.dumps(rec_add))  # deep copy
+    rec_done["event"] = "state"
+    rec_done["task"]["state"] = "done"
+    _write_log_for_date(tmp_path, last_week, [rec_add, rec_done])
 
     log = QueueLog(dir_=tmp_path)
     assert log.replay() == []
