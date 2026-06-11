@@ -359,7 +359,7 @@ def test_slack_state_handles_corrupt_file(tmp_path: Path):
 # --- SlackProducer -------------------------------------------------------
 
 
-def _producer(tmp_path: Path, *, poll_interval=30.0, watch_channels=()):
+def _producer(tmp_path: Path, *, poll_interval=30.0, watch_channels=(), reconsider=None):
     cfg = SimpleNamespace(
         slack_poll_interval=poll_interval,
         slack_watch_channels=tuple(watch_channels),
@@ -368,7 +368,9 @@ def _producer(tmp_path: Path, *, poll_interval=30.0, watch_channels=()):
     mcp = create_autospec(ClaudeMCPClient, instance=True)
     mcp.enabled = True
     q = TaskQueue()
-    p = SlackProducer(config=cfg, queue=q, mcp=mcp, state=state)
+    p = SlackProducer(
+        config=cfg, queue=q, mcp=mcp, state=state, reconsider=reconsider,
+    )
     return p, q, mcp, state
 
 
@@ -1194,3 +1196,432 @@ async def test_producer_does_not_collapse_into_done_threads(tmp_path: Path):
     pending = q.pending()
     assert len(pending) == 1
     assert pending[0].id != first.id
+
+
+# --- is_self tagging + reconsider trigger --------------------------------
+
+
+def _self_thread_fixture(thread_ts: str, msg_ts: str, body: str) -> str:
+    """A message from Henry himself (sender_id == UME)."""
+    return (
+        f"### Result 1 of 1\n"
+        f"Channel: #ai-tools (ID: CTHREAD)\n"
+        f"From: Henry (ID: UME) \n"
+        f"Message_ts: {msg_ts}\n"
+        f"Permalink: [link](https://x.slack.com/archives/CTHREAD/p{msg_ts.replace('.','')}"
+        f"?thread_ts={thread_ts}&cid=CTHREAD)\n"
+        f"Text: \n"
+        f"<@UME> {body}\n\n"
+        f"---\n\n"
+    )
+
+
+@pytest.mark.asyncio
+async def test_new_task_branch_tags_is_self_on_entry(tmp_path: Path):
+    """Every message entry should carry an ``is_self`` flag so the
+    dismiss classifier doesn't need name-matching."""
+    p, q, mcp, _state = _producer(tmp_path)
+    p._user_id = "UME"
+    mcp.call_tool.return_value = {
+        "results": _thread_fixture("1716010000.000000", "1716010000.000000", "from someone else"),
+    }
+    await p._poll_once()
+    [t] = q.all()
+    assert t.source["messages"][0]["is_self"] is False
+
+
+@pytest.mark.asyncio
+async def test_new_task_branch_tags_is_self_true_when_sender_is_user(tmp_path: Path):
+    """First message of a fresh task can be the user themselves
+    (e.g. mention search picks up Henry replying in a channel he's
+    watching). Entry should reflect that."""
+    p, q, mcp, _state = _producer(tmp_path)
+    p._user_id = "UME"
+    mcp.call_tool.return_value = {
+        "results": _self_thread_fixture("1716020000.000000", "1716020000.000000", "kicking this off"),
+    }
+    await p._poll_once()
+    [t] = q.all()
+    assert t.source["messages"][0]["is_self"] is True
+
+
+@pytest.mark.asyncio
+async def test_new_task_branch_does_not_fire_reconsider(tmp_path: Path):
+    """Reconsider is only for collapse-path appends — a brand-new task
+    goes through the intake screener, not reconsider."""
+    seen: list[Task] = []
+    p, _q, mcp, _state = _producer(tmp_path, reconsider=seen.append)
+    p._user_id = "UME"
+    mcp.call_tool.return_value = {
+        "results": _self_thread_fixture("1716030000.000000", "1716030000.000000", "from me"),
+    }
+    await p._poll_once()
+    assert seen == []
+
+
+@pytest.mark.asyncio
+async def test_collapse_branch_fires_reconsider_when_user_replies(tmp_path: Path):
+    """The interesting case: producer is tracking a thread, Henry replies
+    in the Slack desktop client, the producer absorbs his reply via the
+    collapse path AND fires reconsider so the screener can judge 'done'."""
+    seen: list[Task] = []
+    p, q, mcp, _state = _producer(tmp_path, reconsider=seen.append)
+    p._user_id = "UME"
+
+    # First poll: someone else opens a thread (no reconsider fire).
+    mcp.call_tool.return_value = {
+        "results": _thread_fixture("1716040000.000000", "1716040000.000000", "ping you"),
+    }
+    await p._poll_once()
+    [task] = q.all()
+    assert seen == []
+
+    # Second poll: Henry replies in the same thread.
+    mcp.call_tool.return_value = {
+        "results": _self_thread_fixture("1716040000.000000", "1716040100.000000", "ack, on it"),
+    }
+    await p._poll_once()
+
+    # Reconsider got the (now-updated) task with the appended is_self entry.
+    assert seen == [task]
+    msgs = q.all()[0].source["messages"]
+    assert [m["is_self"] for m in msgs] == [False, True]
+
+
+@pytest.mark.asyncio
+async def test_collapse_branch_does_not_fire_reconsider_on_non_self_reply(tmp_path: Path):
+    """A follow-up reply from someone other than Henry should NOT
+    trigger reconsider — the thread isn't wrapped, it's growing."""
+    seen: list[Task] = []
+    p, _q, mcp, _state = _producer(tmp_path, reconsider=seen.append)
+    p._user_id = "UME"
+    mcp.call_tool.return_value = {
+        "results": _thread_fixture("1716050000.000000", "1716050000.000000", "first"),
+    }
+    await p._poll_once()
+    mcp.call_tool.return_value = {
+        "results": _thread_fixture(
+            "1716050000.000000", "1716050100.000000", "another reply", sender="Bob",
+        )
+    }
+    await p._poll_once()
+    assert seen == []
+
+
+@pytest.mark.asyncio
+async def test_collapse_branch_skips_reconsider_when_callback_unset(tmp_path: Path):
+    """No reconsider callback (autohandle off / kind not gated) — the
+    producer must not crash when Henry replies in a tracked thread."""
+    p, q, mcp, _state = _producer(tmp_path, reconsider=None)
+    p._user_id = "UME"
+    mcp.call_tool.return_value = {
+        "results": _thread_fixture("1716060000.000000", "1716060000.000000", "first"),
+    }
+    await p._poll_once()
+    mcp.call_tool.return_value = {
+        "results": _self_thread_fixture(
+            "1716060000.000000", "1716060100.000000", "ack",
+        ),
+    }
+    await p._poll_once()  # should not raise
+    # Collapse still happened.
+    assert len(q.all()) == 1
+    assert q.all()[0].source["messages"][-1]["is_self"] is True
+
+
+@pytest.mark.asyncio
+async def test_reconsider_callback_exception_does_not_break_producer(tmp_path: Path):
+    """A buggy reconsider callback must not crash the poll loop or
+    corrupt the queue state."""
+    def boom(_t: Task) -> None:
+        raise RuntimeError("queue full")
+
+    p, q, mcp, _state = _producer(tmp_path, reconsider=boom)
+    p._user_id = "UME"
+    mcp.call_tool.return_value = {
+        "results": _thread_fixture("1716070000.000000", "1716070000.000000", "first"),
+    }
+    await p._poll_once()
+    mcp.call_tool.return_value = {
+        "results": _self_thread_fixture(
+            "1716070000.000000", "1716070100.000000", "ack",
+        ),
+    }
+    await p._poll_once()  # should not raise
+    # The reply still landed in source["messages"].
+    assert q.all()[0].source["messages"][-1]["is_self"] is True
+
+
+# --- _poll_thread_replies ------------------------------------------------
+
+
+def _thread_read_block(
+    msg_ts: str,
+    body: str,
+    sender: str = "Alice",
+    sender_id: str | None = None,
+    thread_ts: str = "",
+    channel_id: str = "CTHREAD",
+    index: tuple[int, int] = (1, 1),
+) -> str:
+    """Build one block of a ``slack_read_thread`` detailed response.
+
+    Unlike ``_thread_fixture`` (search results), thread reads don't
+    include a ``Channel:`` line per block — the channel is the input
+    argument. We still emit one for parser robustness, since
+    ``_parse_block`` ignores it when ``channel_id`` is already set via
+    the caller's ``setdefault``.
+    """
+    sid = sender_id or f"U{sender.upper()}"
+    tts = thread_ts or msg_ts
+    n, total = index
+    return (
+        f"### Result {n} of {total}\n"
+        f"From: {sender} (ID: {sid}) \n"
+        f"Message_ts: {msg_ts}\n"
+        f"Permalink: [link](https://x.slack.com/archives/{channel_id}/p{msg_ts.replace('.','')}"
+        f"?thread_ts={tts}&cid={channel_id})\n"
+        f"Text: \n"
+        f"{body}\n\n"
+        f"---\n\n"
+    )
+
+
+def _thread_read_response(blocks: list[str]) -> dict:
+    return {"results": "# Thread\n" + "".join(blocks)}
+
+
+def _seed_thread_task(
+    q: TaskQueue,
+    *,
+    channel_id: str = "CTHREAD",
+    thread_ts: str = "1716100000.000000",
+    initial_sender: str = "Heidi",
+    initial_text: str = "@henry mind taking a look?",
+) -> Task:
+    """Drop a live (pending) slack_msg task into the queue with one
+    initial message — the shape a real producer would have created via
+    a mention search."""
+    entry = {
+        "sender": initial_sender,
+        "text": initial_text,
+        "ts": thread_ts,
+        "is_self": False,
+    }
+    t = Task(
+        kind="slack_msg",
+        topic="recruitment-inception-team",
+        headline=f"{initial_sender}: {initial_text[:60]}",
+        body=initial_text,
+        source={
+            "channel_id": channel_id,
+            "channel_name": "recruitment-inception-team",
+            "ts": thread_ts,
+            "thread_ts": thread_ts,
+            "sender_id": "UHEIDI",
+            "sender_name": initial_sender,
+            "url": "",
+            "messages": [entry],
+        },
+    )
+    q.add(t)
+    return t
+
+
+@pytest.mark.asyncio
+async def test_poll_thread_replies_appends_new_reply_to_live_task(tmp_path: Path):
+    """The headline use case: Heidi @-mentioned Henry (initial task already
+    exists), Henry replies in the thread, the new poll path picks up his
+    reply and appends it into source["messages"]."""
+    p, q, mcp, _state = _producer(tmp_path)
+    p._user_id = "UME"
+    seeded = _seed_thread_task(q, thread_ts="1716100000.000000")
+
+    # The MCP returns the parent + Henry's reply. ``oldest`` is
+    # inclusive, so the parent comes back too — _emit_task dedupes it.
+    mcp.call_tool.return_value = _thread_read_response([
+        _thread_read_block(
+            "1716100000.000000", "@henry mind taking a look?",
+            sender="Heidi", sender_id="UHEIDI",
+            thread_ts="1716100000.000000", index=(1, 2),
+        ),
+        _thread_read_block(
+            "1716100500.000000", "yep — pulling the data now",
+            sender="Henry", sender_id="UME",
+            thread_ts="1716100000.000000", index=(2, 2),
+        ),
+    ])
+    await p._poll_thread_replies()
+
+    [task] = q.all()
+    assert task.id == seeded.id  # appended, not spawned
+    msgs = task.source["messages"]
+    assert [m["sender"] for m in msgs] == ["Heidi", "Henry"]
+    assert "pulling the data now" in msgs[-1]["text"]
+    # Henry's reply gets tagged as self for the reconsider classifier.
+    assert msgs[-1]["is_self"] is True
+
+
+@pytest.mark.asyncio
+async def test_poll_thread_replies_uses_last_known_ts_as_oldest(tmp_path: Path):
+    """The MCP call's ``oldest`` should be the ts of the latest entry
+    we already have, so each poll only pulls what's new."""
+    p, q, mcp, _state = _producer(tmp_path)
+    p._user_id = "UME"
+    parent_ts = "1716200000.000000"
+    reply1_ts = "1716200500.000000"
+    t = _seed_thread_task(q, thread_ts=parent_ts)
+    # Add a reply that's already on file.
+    t.source["messages"].append(
+        {"sender": "Bob", "text": "first reply", "ts": reply1_ts, "is_self": False}
+    )
+
+    mcp.call_tool.return_value = _thread_read_response([])
+    await p._poll_thread_replies()
+
+    [(name, args)] = [(c.args[0], c.args[1]) for c in mcp.call_tool.call_args_list]
+    assert name == "slack_read_thread"
+    assert args["channel_id"] == "CTHREAD"
+    assert args["message_ts"] == parent_ts
+    assert args["oldest"] == reply1_ts  # latest-known, not parent
+
+
+@pytest.mark.asyncio
+async def test_poll_thread_replies_dedupes_against_existing_messages(tmp_path: Path):
+    """``oldest`` is inclusive in Slack's API, so the matching message
+    comes back in the read. Our ts-dedup guard inside _emit_task keeps
+    it from being appended twice."""
+    p, q, mcp, _state = _producer(tmp_path)
+    p._user_id = "UME"
+    parent_ts = "1716300000.000000"
+    _seed_thread_task(q, thread_ts=parent_ts)
+
+    mcp.call_tool.return_value = _thread_read_response([
+        # Parent — already in messages.
+        _thread_read_block(
+            parent_ts, "@henry mind taking a look?",
+            sender="Heidi", sender_id="UHEIDI",
+            thread_ts=parent_ts, index=(1, 1),
+        ),
+    ])
+    await p._poll_thread_replies()
+
+    [task] = q.all()
+    assert len(task.source["messages"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_poll_thread_replies_skips_done_tasks(tmp_path: Path):
+    """A finished thread should not get re-polled — calling the MCP for
+    every old task would scale badly and risks reviving a dismissed
+    conversation."""
+    p, q, mcp, _state = _producer(tmp_path)
+    p._user_id = "UME"
+    t = _seed_thread_task(q)
+    q.mark_done(t.id)
+
+    await p._poll_thread_replies()
+    tool_names = [c.args[0] for c in mcp.call_tool.call_args_list]
+    assert "slack_read_thread" not in tool_names
+
+
+@pytest.mark.asyncio
+async def test_poll_thread_replies_resilient_to_mcp_errors(tmp_path: Path):
+    """One thread's MCP failure shouldn't block reads of other live
+    tasks or crash the poll."""
+    p, q, mcp, _state = _producer(tmp_path)
+    p._user_id = "UME"
+    _seed_thread_task(q, channel_id="CONE", thread_ts="1716400000.000000")
+    _seed_thread_task(q, channel_id="CTWO", thread_ts="1716400100.000000")
+
+    calls: list[str] = []
+
+    def call_tool(name, args):
+        calls.append(args["channel_id"])
+        if args["channel_id"] == "CONE":
+            raise ClaudeMCPError("transient")
+        return _thread_read_response([])
+
+    mcp.call_tool.side_effect = call_tool
+
+    await p._poll_thread_replies()  # must not raise
+    assert calls == ["CONE", "CTWO"]
+
+
+@pytest.mark.asyncio
+async def test_poll_thread_replies_fires_reconsider_on_user_reply(tmp_path: Path):
+    """When the new reply is Henry's own, reconsider should fire (same
+    contract as the mention-search collapse path) so the screener can
+    judge whether the thread is wrapped."""
+    seen: list[Task] = []
+    p, q, mcp, _state = _producer(tmp_path, reconsider=seen.append)
+    p._user_id = "UME"
+    seeded = _seed_thread_task(q, thread_ts="1716500000.000000")
+
+    mcp.call_tool.return_value = _thread_read_response([
+        _thread_read_block(
+            "1716500500.000000", "thanks — got it",
+            sender="Henry", sender_id="UME",
+            thread_ts="1716500000.000000", index=(1, 1),
+        ),
+    ])
+    await p._poll_thread_replies()
+    assert [t.id for t in seen] == [seeded.id]
+
+
+@pytest.mark.asyncio
+async def test_poll_thread_replies_skips_tasks_with_no_thread_metadata(tmp_path: Path):
+    """A malformed slack_msg task (missing channel_id / thread_ts) is
+    silently skipped — no MCP call attempted."""
+    p, q, mcp, _state = _producer(tmp_path)
+    p._user_id = "UME"
+    q.add(Task(kind="slack_msg", topic="x", headline="h", body="b", source={}))
+
+    await p._poll_thread_replies()
+    assert mcp.call_tool.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_poll_once_invokes_thread_replies_path(tmp_path: Path):
+    """_poll_once should drive mention search, each watched channel, AND
+    a thread-replies sweep over every live slack task."""
+    p, q, mcp, _state = _producer(tmp_path, watch_channels=("team-ai",))
+    p._user_id = "UME"
+    p._watched = {"team-ai": "C0TEAMAI"}
+    _seed_thread_task(q)
+    mcp.call_tool.return_value = {"results": ""}
+
+    await p._poll_once()
+    tool_names = [c.args[0] for c in mcp.call_tool.call_args_list]
+    assert tool_names.count("slack_search_public_and_private") == 1
+    assert tool_names.count("slack_read_channel") == 1
+    assert tool_names.count("slack_read_thread") == 1
+
+
+# --- _emit_task ts-dedup guard (independent regression test) -------------
+
+
+@pytest.mark.asyncio
+async def test_emit_task_dedupes_same_ts_in_append_branch(tmp_path: Path):
+    """The ts-dedup guard makes _emit_task idempotent: two emits with the
+    same ts under one active thread task don't double-append."""
+    p, q, _mcp, _state = _producer(tmp_path)
+    p._user_id = "UME"
+    _seed_thread_task(q, thread_ts="1716600000.000000")
+
+    msg = {
+        "channel_id": "CTHREAD",
+        "channel_name": "recruitment-inception-team",
+        "sender_id": "UME",
+        "sender_name": "Henry",
+        "ts": "1716600500.000000",
+        "thread_ts": "1716600000.000000",
+        "text": "follow-up",
+        "permalink": "",
+    }
+    p._emit_task(msg)
+    p._emit_task(msg)  # second call with same ts
+
+    [task] = q.all()
+    # Seeded initial + one (not two) follow-up.
+    assert [m["sender"] for m in task.source["messages"]] == ["Heidi", "Henry"]

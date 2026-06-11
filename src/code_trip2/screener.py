@@ -379,25 +379,38 @@ async def screen(
 
 
 async def _next_or_stop(
-    intake: "asyncio.Queue[Task]", stop: asyncio.Event,
-) -> Task | None:
-    """Block on either the next intake task or the stop event.
+    intake: "asyncio.Queue[Task]",
+    stop: asyncio.Event,
+    reconsider_intake: "asyncio.Queue[Task] | None" = None,
+) -> tuple[Task, bool] | None:
+    """Block on the next task from either intake queue, or the stop event.
 
-    Cancels whichever awaitable lost the race so neither leaks.
+    Returns ``(task, is_reconsider)`` — ``is_reconsider`` is True when
+    the task arrived via ``reconsider_intake`` (already in the user
+    queue, screener may mark it done). Returns ``None`` when stop fires
+    before any task arrives. Cancels whichever awaitables lost the
+    race so none leaks.
     """
-    getter = asyncio.create_task(intake.get())
+    intake_getter = asyncio.create_task(intake.get())
     stopper = asyncio.create_task(stop.wait())
+    waiters: list[asyncio.Task] = [intake_getter, stopper]
+    reconsider_getter: asyncio.Task | None = None
+    if reconsider_intake is not None:
+        reconsider_getter = asyncio.create_task(reconsider_intake.get())
+        waiters.append(reconsider_getter)
     try:
         done, pending = await asyncio.wait(
-            {getter, stopper}, return_when=asyncio.FIRST_COMPLETED,
+            set(waiters), return_when=asyncio.FIRST_COMPLETED,
         )
         for p in pending:
             p.cancel()
-        if getter in done:
-            return getter.result()
+        if intake_getter in done:
+            return (intake_getter.result(), False)
+        if reconsider_getter is not None and reconsider_getter in done:
+            return (reconsider_getter.result(), True)
         return None
     finally:
-        for t in (getter, stopper):
+        for t in waiters:
             if not t.done():
                 t.cancel()
 
@@ -412,6 +425,8 @@ async def run_screener_loop(
     allowed_kinds: frozenset[str] | None,
     dry_run: bool,
     stop: asyncio.Event,
+    reconsider_intake: "asyncio.Queue[Task] | None" = None,
+    mark_existing_done: Callable[[str], None] | None = None,
 ) -> None:
     """Drain the intake queue, screen each task, dispatch the outcome.
 
@@ -424,11 +439,18 @@ async def run_screener_loop(
     restriction beyond what manifests opt into"; a frozenset further
     restricts. An empty frozenset effectively disables auto-handling
     without changing the call sites that feed the intake queue.
+
+    ``reconsider_intake`` is a second queue carrying tasks that already
+    live in the user-facing queue — the screener re-judges them and,
+    if a dismiss skill picks, marks the existing task done via
+    ``mark_existing_done``. Other outcomes are no-ops in reconsider
+    mode (the task is already in the user's queue; nothing to add).
     """
     while not stop.is_set():
-        task = await _next_or_stop(intake, stop)
-        if task is None:
+        nxt = await _next_or_stop(intake, stop, reconsider_intake)
+        if nxt is None:
             return
+        task, is_reconsider = nxt
         if allowed_kinds is not None and task.kind not in allowed_kinds:
             outcome = ScreeningOutcome("forward", task)
         else:
@@ -445,19 +467,36 @@ async def run_screener_loop(
             on_outcome(outcome)
         except Exception:
             logger.exception("on_outcome callback raised; continuing")
-        # Only ``forward`` and ``failed`` outcomes surface the original
-        # task to the user. ``handled`` (executor ran) and ``dismissed``
-        # (classifier said not worth surfacing) both suppress it.
-        if outcome.action in ("forward", "failed"):
-            try:
-                add_to_queue(outcome.task)
-            except Exception:
-                logger.exception(
-                    "add_to_queue failed for task %s", outcome.task.id,
-                )
+        if is_reconsider:
+            # Reconsider mode: the task is already in the user queue.
+            # Only ``dismissed`` does anything — mark the existing
+            # task done. Everything else (forward, handled, failed)
+            # leaves the task where it is. Follow-up tasks still need
+            # enqueueing if some future skill spawns them under
+            # reconsider.
+            if outcome.action == "dismissed" and mark_existing_done is not None:
+                try:
+                    mark_existing_done(outcome.task.id)
+                except Exception:
+                    logger.exception(
+                        "mark_existing_done failed for task %s",
+                        outcome.task.id,
+                    )
+        else:
+            # Intake mode: only ``forward`` and ``failed`` outcomes
+            # surface the original task to the user. ``handled``
+            # (executor ran) and ``dismissed`` (classifier said not
+            # worth surfacing) both suppress it.
+            if outcome.action in ("forward", "failed"):
+                try:
+                    add_to_queue(outcome.task)
+                except Exception:
+                    logger.exception(
+                        "add_to_queue failed for task %s", outcome.task.id,
+                    )
         # Follow-up tasks ride along independently — a handled
         # meeting-notes email can still spawn a meeting_followup the
-        # user needs to see.
+        # user needs to see. Same applies in reconsider mode.
         for ft in outcome.follow_up_tasks:
             try:
                 add_to_queue(ft)

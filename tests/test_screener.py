@@ -550,7 +550,7 @@ async def test_next_or_stop_returns_task_when_available():
     task = _task("note")
     q.put_nowait(task)
     out = await _next_or_stop(q, stop)
-    assert out is task
+    assert out == (task, False)
 
 
 @pytest.mark.asyncio
@@ -565,6 +565,34 @@ async def test_next_or_stop_returns_none_when_stop_fires_first():
     asyncio.create_task(setter())
     out = await asyncio.wait_for(_next_or_stop(q, stop), timeout=1.0)
     assert out is None
+
+
+@pytest.mark.asyncio
+async def test_next_or_stop_tags_reconsider_task():
+    """A task arriving via the reconsider queue gets is_reconsider=True."""
+    intake: "asyncio.Queue[Task]" = asyncio.Queue()
+    reconsider: "asyncio.Queue[Task]" = asyncio.Queue()
+    stop = asyncio.Event()
+    task = _task("slack_msg")
+    reconsider.put_nowait(task)
+    out = await _next_or_stop(intake, stop, reconsider)
+    assert out == (task, True)
+
+
+@pytest.mark.asyncio
+async def test_next_or_stop_prefers_either_intake_when_both_have_tasks():
+    """When both queues have items, the call returns one (either) but
+    tags it correctly."""
+    intake: "asyncio.Queue[Task]" = asyncio.Queue()
+    reconsider: "asyncio.Queue[Task]" = asyncio.Queue()
+    stop = asyncio.Event()
+    intake.put_nowait(_task("note"))
+    reconsider.put_nowait(_task("slack_msg"))
+    out = await _next_or_stop(intake, stop, reconsider)
+    # Whichever wins, the tag matches its queue.
+    assert out is not None
+    task, is_reconsider = out
+    assert is_reconsider == (task.kind == "slack_msg")
 
 
 # --- follow-up tasks ------------------------------------------------------
@@ -686,3 +714,171 @@ async def test_loop_adds_follow_up_tasks_even_when_parent_handled():
     ]
     assert outcomes[0].action == "handled"
     assert len(outcomes[0].follow_up_tasks) == 2
+
+
+# --- reconsider path ------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_loop_reconsider_dismissed_calls_mark_existing_done():
+    """The interesting case: a task already in the user queue arrives
+    via the reconsider intake, the classifier picks a dismiss skill, and
+    the loop marks the *existing* task done (not add_to_queue)."""
+    intake: "asyncio.Queue[Task]" = asyncio.Queue()
+    reconsider: "asyncio.Queue[Task]" = asyncio.Queue()
+    added: list[Task] = []
+    marked_done: list[str] = []
+    outcomes: list[ScreeningOutcome] = []
+    stop = asyncio.Event()
+
+    task = _task("slack_msg")
+    reconsider.put_nowait(task)
+
+    mcp = _mcp(agent_reply="DISMISS: dismiss-resolved-slack-thread")
+
+    async def driver() -> None:
+        while not outcomes:
+            await asyncio.sleep(0)
+        stop.set()
+
+    loop_task = asyncio.create_task(
+        run_screener_loop(
+            intake=intake,
+            manifests=(_dismiss_manifest("dismiss-resolved-slack-thread"),),
+            mcp=mcp,
+            add_to_queue=added.append,
+            on_outcome=outcomes.append,
+            allowed_kinds=None,
+            dry_run=False,
+            stop=stop,
+            reconsider_intake=reconsider,
+            mark_existing_done=marked_done.append,
+        )
+    )
+    await asyncio.wait_for(asyncio.gather(driver(), loop_task), timeout=2.0)
+    assert added == []  # task already in queue; not re-added
+    assert marked_done == [task.id]
+    assert outcomes[0].action == "dismissed"
+
+
+@pytest.mark.asyncio
+async def test_loop_reconsider_classifier_declines_is_noop():
+    """Classifier says NONE on a reconsider task → no mark_existing_done,
+    no add_to_queue. Task stays where it is in the user queue."""
+    intake: "asyncio.Queue[Task]" = asyncio.Queue()
+    reconsider: "asyncio.Queue[Task]" = asyncio.Queue()
+    added: list[Task] = []
+    marked_done: list[str] = []
+    outcomes: list[ScreeningOutcome] = []
+    stop = asyncio.Event()
+
+    reconsider.put_nowait(_task("slack_msg"))
+
+    mcp = _mcp(agent_reply="NONE")
+
+    async def driver() -> None:
+        while not outcomes:
+            await asyncio.sleep(0)
+        stop.set()
+
+    loop_task = asyncio.create_task(
+        run_screener_loop(
+            intake=intake,
+            manifests=(_dismiss_manifest("dismiss-resolved-slack-thread"),),
+            mcp=mcp,
+            add_to_queue=added.append,
+            on_outcome=outcomes.append,
+            allowed_kinds=None,
+            dry_run=False,
+            stop=stop,
+            reconsider_intake=reconsider,
+            mark_existing_done=marked_done.append,
+        )
+    )
+    await asyncio.wait_for(asyncio.gather(driver(), loop_task), timeout=2.0)
+    assert added == []
+    assert marked_done == []
+    assert outcomes[0].action == "forward"
+
+
+@pytest.mark.asyncio
+async def test_loop_reconsider_dry_run_logs_pick_but_does_not_mark_done():
+    """Dry-run is a hard gate even for reconsider — the user can validate
+    the dismiss judgement before letting it actually fire."""
+    intake: "asyncio.Queue[Task]" = asyncio.Queue()
+    reconsider: "asyncio.Queue[Task]" = asyncio.Queue()
+    added: list[Task] = []
+    marked_done: list[str] = []
+    outcomes: list[ScreeningOutcome] = []
+    stop = asyncio.Event()
+
+    reconsider.put_nowait(_task("slack_msg"))
+
+    mcp = _mcp(agent_reply="DISMISS: dismiss-resolved-slack-thread")
+
+    async def driver() -> None:
+        while not outcomes:
+            await asyncio.sleep(0)
+        stop.set()
+
+    loop_task = asyncio.create_task(
+        run_screener_loop(
+            intake=intake,
+            manifests=(_dismiss_manifest("dismiss-resolved-slack-thread"),),
+            mcp=mcp,
+            add_to_queue=added.append,
+            on_outcome=outcomes.append,
+            allowed_kinds=None,
+            dry_run=True,
+            stop=stop,
+            reconsider_intake=reconsider,
+            mark_existing_done=marked_done.append,
+        )
+    )
+    await asyncio.wait_for(asyncio.gather(driver(), loop_task), timeout=2.0)
+    # Dry-run forwards (no dismiss), but in reconsider mode forward is a
+    # no-op. The pick is captured in the outcome for visibility.
+    assert added == []
+    assert marked_done == []
+    assert outcomes[0].action == "forward"
+    assert outcomes[0].dry_run_nominated is True
+    assert outcomes[0].skill == "dismiss-resolved-slack-thread"
+
+
+@pytest.mark.asyncio
+async def test_loop_intake_still_works_alongside_reconsider():
+    """Adding the reconsider parameter must not regress the normal
+    intake disposition — a regular intake task still gets forwarded
+    when no skill applies."""
+    intake: "asyncio.Queue[Task]" = asyncio.Queue()
+    reconsider: "asyncio.Queue[Task]" = asyncio.Queue()
+    added: list[Task] = []
+    marked_done: list[str] = []
+    outcomes: list[ScreeningOutcome] = []
+    stop = asyncio.Event()
+
+    intake.put_nowait(_task("note"))
+
+    async def driver() -> None:
+        while not outcomes:
+            await asyncio.sleep(0)
+        stop.set()
+
+    loop_task = asyncio.create_task(
+        run_screener_loop(
+            intake=intake,
+            manifests=(),
+            mcp=_mcp(),
+            add_to_queue=added.append,
+            on_outcome=outcomes.append,
+            allowed_kinds=None,
+            dry_run=False,
+            stop=stop,
+            reconsider_intake=reconsider,
+            mark_existing_done=marked_done.append,
+        )
+    )
+    await asyncio.wait_for(asyncio.gather(driver(), loop_task), timeout=2.0)
+    assert len(added) == 1
+    assert marked_done == []
+    assert outcomes[0].action == "forward"

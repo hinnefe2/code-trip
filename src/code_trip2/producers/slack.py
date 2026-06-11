@@ -30,7 +30,7 @@ import logging
 import re
 import time
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from code_trip2._async_utils import event_or_timeout
 from code_trip2.config import Config
@@ -158,6 +158,7 @@ class SlackProducer:
         queue: TaskQueue,
         mcp: ClaudeMCPClient | None = None,
         state: SlackState | None = None,
+        reconsider: Callable[[Task], None] | None = None,
     ) -> None:
         self._config = config
         self._queue = queue
@@ -171,6 +172,11 @@ class SlackProducer:
         # Watched-channel name → channel_id. Populated by setup; empty
         # if config has no watch list or resolution fails.
         self._watched: dict[str, str] = {}
+        # Re-screen hook: when an existing thread task gets a reply from
+        # the user themselves, the producer fires this so the screener
+        # can ask "is this thread wrapped now?" None disables the path
+        # (autohandle off / kind not gated in).
+        self._reconsider = reconsider
 
     # ---- lifecycle ------------------------------------------------------
 
@@ -307,6 +313,7 @@ class SlackProducer:
         await self._poll_mentions()
         for name, channel_id in self._watched.items():
             await self._poll_watched_channel(name, channel_id)
+        await self._poll_thread_replies()
         # Cap the in-memory dedup set so it doesn't grow unbounded.
         if len(self._recent_ids) > 500:
             self._recent_ids = set(sorted(self._recent_ids)[-250:])
@@ -427,6 +434,132 @@ class SlackProducer:
             emitted,
             skipped_old,
         )
+
+    async def _poll_thread_replies(self) -> None:
+        """For every live ``slack_msg`` task, pull any new thread replies.
+
+        Closes the gap left by the other two paths: the mention search
+        only catches messages containing ``<@HenryUserId>``, and the
+        watched-channel read only returns top-level channel messages.
+        Neither sees Henry's own reply in a thread he was @-mentioned
+        in — so without this, an active conversation's task body stays
+        frozen at the initial message.
+
+        For each live task we ask ``slack_read_thread`` with ``oldest``
+        set to the ts of the last reply we already have on file (or the
+        parent's ts on first call), then append any new replies
+        directly to the task's ``source["messages"]``. We deliberately
+        do not route through :meth:`_emit_task` — its thread_ts-based
+        lookup would risk cross-routing if the MCP ever returned mixed
+        threads, and the new-task branch isn't applicable here.
+        """
+        live = {STATE_PENDING, STATE_ACTIVE, STATE_SNOOZED}
+        for task in self._queue.all():
+            if task.kind != "slack_msg" or task.state not in live:
+                continue
+            src = task.source or {}
+            channel_id = src.get("channel_id") or ""
+            thread_ts = src.get("thread_ts") or ""
+            if not channel_id or not thread_ts:
+                continue
+            await self._refresh_thread_task(task, channel_id, thread_ts)
+
+    async def _refresh_thread_task(
+        self, task: Task, channel_id: str, thread_ts: str,
+    ) -> None:
+        existing_msgs = list((task.source or {}).get("messages") or [])
+        # ``oldest`` is inclusive — we filter out the matching entry
+        # below via the known-ts check.
+        oldest = (
+            existing_msgs[-1].get("ts") if existing_msgs else thread_ts
+        ) or thread_ts
+        try:
+            result = await self._mcp.call_tool(
+                "slack_read_thread",
+                {
+                    "channel_id": channel_id,
+                    "message_ts": thread_ts,
+                    "oldest": oldest,
+                    "response_format": "detailed",
+                },
+            )
+        except ClaudeMCPError as exc:
+            logger.warning(
+                "SlackProducer: read thread %s/%s failed: %s",
+                channel_id, thread_ts, exc,
+            )
+            return
+        src = task.source or {}
+        parsed = self._extract_channel_messages(
+            result, src.get("channel_name") or "channel", channel_id,
+        )
+        # Parser preserves source order, but the MCP often returns
+        # newest-first — normalize.
+        parsed.sort(key=lambda m: m.get("ts") or "")
+        known_ts = {m.get("ts") for m in existing_msgs if m.get("ts")}
+        new_entries: list[dict] = []
+        for reply in parsed:
+            ts = reply.get("ts") or ""
+            # Defensive: the MCP could theoretically return messages
+            # outside the requested thread (mixed-thread responses, mock
+            # mistakes in tests). Trust only entries that match.
+            reply_thread = reply.get("thread_ts") or ts
+            if reply_thread != thread_ts:
+                continue
+            if not ts or ts in known_ts:
+                continue
+            raw_text = (reply.get("text") or "").strip()
+            text = slack_to_plain_text(raw_text)
+            if not text:
+                continue
+            sender_id = reply.get("sender_id") or ""
+            sender_name = reply.get("sender_name") or sender_id or "someone"
+            entry = {
+                "sender": sender_name,
+                "text": text,
+                "ts": ts,
+                "is_self": bool(sender_id) and sender_id == self._user_id,
+            }
+            new_entries.append(entry)
+            known_ts.add(ts)
+        if not new_entries:
+            return
+        last = new_entries[-1]
+        all_messages = existing_msgs + new_entries
+        new_source = {
+            **src,
+            "messages": all_messages,
+            "ts": last["ts"],
+            "sender_id": (
+                # Preserve the original sender_id if the latest reply
+                # has no id (shouldn't happen, but defensive).
+                next(
+                    (r.get("sender_id") for r in reversed(parsed)
+                     if r.get("ts") == last["ts"]), src.get("sender_id"),
+                ) or src.get("sender_id", "")
+            ),
+            "sender_name": last["sender"],
+        }
+        self._queue.update_task(
+            task.id,
+            headline=f"{last['sender']}: {last['text'][:60]}",
+            body=last["text"],
+            source=new_source,
+            created_at=time.time(),
+        )
+        # Fire reconsider if Henry just replied — the screener can then
+        # judge "thread wrapped?". Mirrors the collapse path in
+        # :meth:`_emit_task`.
+        if (
+            any(e["is_self"] for e in new_entries)
+            and self._reconsider is not None
+        ):
+            try:
+                self._reconsider(task)
+            except Exception:
+                logger.exception(
+                    "reconsider callback raised for task %s", task.id,
+                )
 
     def _extract_channel_messages(
         self, result: dict, channel_name: str, channel_id: str
@@ -561,7 +694,11 @@ class SlackProducer:
         ts = msg.get("ts") or ""
         thread_ts = msg.get("thread_ts") or ts
         headline = f"{sender_name}: {text[:60]}"
-        entry = {"sender": sender_name, "text": text, "ts": ts}
+        # ``is_self`` lets the dismiss-resolved-slack-thread classifier
+        # spot Henry's own replies without name-matching. Compare by
+        # Slack user ID, which the producer already resolved on setup.
+        is_self = bool(sender_id) and sender_id == self._user_id
+        entry = {"sender": sender_name, "text": text, "ts": ts, "is_self": is_self}
 
         # Collapse multiple messages in the same thread into a single
         # pending task: if there's already a pending slack task for this
@@ -574,6 +711,13 @@ class SlackProducer:
         if existing is not None:
             prior = existing.source or {}
             messages = list(prior.get("messages") or [])
+            # The thread-replies poll and the mention search can both
+            # surface the same message in one tick (mention search runs
+            # first; thread poll's ``oldest`` is inclusive so it
+            # re-returns the matching entry). Skip if we already have
+            # this ts on file — leaves _emit_task idempotent w.r.t. ts.
+            if ts and any(m.get("ts") == ts for m in messages):
+                return
             messages.append(entry)
             new_source = {
                 **prior,
@@ -590,6 +734,16 @@ class SlackProducer:
                 source=new_source,
                 created_at=time.time(),
             )
+            # Henry just replied in a thread we're tracking — give the
+            # screener a chance to mark it done. Skill judges "wrapped
+            # or not"; producer only decides whether to ask.
+            if is_self and self._reconsider is not None:
+                try:
+                    self._reconsider(existing)
+                except Exception:
+                    logger.exception(
+                        "reconsider callback raised for task %s", existing.id,
+                    )
             return
 
         source = {

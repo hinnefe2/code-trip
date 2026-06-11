@@ -196,6 +196,11 @@ async def main_async(config: Config, *, tui: bool = False, silent: bool = False)
         and agent_mcp.enabled
     )
     intake_q: "asyncio.Queue[Task]" = asyncio.Queue()
+    # Reconsider queue: producers push *already-queued* tasks here when
+    # something changes (e.g. SlackProducer when Henry replies in a
+    # tracked thread). The screener re-judges and, if a dismiss skill
+    # picks, marks the existing task done.
+    reconsider_q: "asyncio.Queue[Task]" = asyncio.Queue()
     screener_stop = asyncio.Event()
 
     def _on_screener_outcome(outcome: ScreeningOutcome) -> None:
@@ -227,8 +232,16 @@ async def main_async(config: Config, *, tui: bool = False, silent: bool = False)
         if outcome.action == "handled":
             queue_log.record("autohandle", outcome.task)
 
+    submit_to_reconsider: Callable[[Task], None] | None
     if autohandle_active:
         submit_to_intake: Callable[[Task], None] = intake_q.put_nowait
+        # Reconsider is gated by the same kinds list. SlackProducer
+        # only fires it when slack_msg is in autohandle_kinds.
+        submit_to_reconsider = (
+            reconsider_q.put_nowait
+            if "slack_msg" in config.autohandle_kinds
+            else None
+        )
         logger.info(
             "Autohandle ON: kinds=%s dry_run=%s (%d eligible skills)",
             list(config.autohandle_kinds),
@@ -237,6 +250,7 @@ async def main_async(config: Config, *, tui: bool = False, silent: bool = False)
         )
     else:
         submit_to_intake = queue.add
+        submit_to_reconsider = None
         logger.info(
             "Autohandle OFF (enabled=%s, kinds=%s, agent_mcp.enabled=%s)",
             config.autohandle_enabled,
@@ -246,7 +260,10 @@ async def main_async(config: Config, *, tui: bool = False, silent: bool = False)
 
     supervisor = ProducerSupervisor()
     supervisor.add(ClaudeProducer(config=config, queue=queue, summarizer=summarizer))
-    supervisor.add(SlackProducer(config=config, queue=queue, mcp=slack_mcp, state=SlackState()))
+    supervisor.add(SlackProducer(
+        config=config, queue=queue, mcp=slack_mcp, state=SlackState(),
+        reconsider=submit_to_reconsider,
+    ))
     supervisor.add(EmailProducer(
         config=config, queue=queue, mcp=email_mcp,
         state=EmailState(), intake=submit_to_intake,
@@ -398,6 +415,8 @@ async def main_async(config: Config, *, tui: bool = False, silent: bool = False)
                 allowed_kinds=frozenset(config.autohandle_kinds),
                 dry_run=config.autohandle_dry_run,
                 stop=screener_stop,
+                reconsider_intake=reconsider_q,
+                mark_existing_done=queue.mark_done,
             ),
             name="screener",
         )
