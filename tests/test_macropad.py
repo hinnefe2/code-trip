@@ -921,3 +921,55 @@ async def test_chord_active_app_error_reported(monkeypatch):
     await chords.handle_chord(ctx, "nav+ptt")
     ctx.tts.speak.assert_called_once()
     assert "boom" in ctx.tts.speak.call_args.args[0]
+
+
+# --- act+yes routing for meeting_followup -------------------------------
+
+
+@pytest.mark.asyncio
+async def test_chord_act_yes_on_meeting_followup_routes_to_linear_create(monkeypatch):
+    """ACT+YES on a meeting_followup goes to the Linear-create path, NOT
+    the browser opener — that's the whole point of this wiring."""
+    from code_trip2 import dispatch as dispatch_module
+    from code_trip2.tasks import Task
+
+    opened = _patch_open_subprocess(monkeypatch)
+    create = AsyncMock()
+    monkeypatch.setattr(
+        dispatch_module, "create_linear_ticket_from_followup", create,
+    )
+
+    ctx = _ctx()
+    ctx.app_mode = "queue"
+    ctx.current_task = Task(
+        kind="meeting_followup", topic="planning-sync", headline="Draft doc",
+    )
+
+    await chords.handle_chord(ctx, "act+yes")
+
+    create.assert_awaited_once()
+    assert create.await_args.args[1] is ctx.current_task
+    assert opened == []  # browser path was NOT taken
+
+
+@pytest.mark.asyncio
+async def test_chord_act_yes_on_email_still_opens_browser(monkeypatch):
+    """The new routing must not regress the existing email_msg path."""
+    from code_trip2 import dispatch as dispatch_module
+
+    opened = _patch_open_subprocess(monkeypatch)
+    create = AsyncMock()
+    monkeypatch.setattr(
+        dispatch_module, "create_linear_ticket_from_followup", create,
+    )
+    monkeypatch.setattr(chords.earcon, "completion", lambda: None)
+
+    ctx = _ctx()
+    ctx.app_mode = "queue"
+    ctx.current_task = _email_task(thread_id="THR789")
+
+    await chords.handle_chord(ctx, "act+yes")
+
+    create.assert_not_called()
+    assert len(opened) == 1
+    assert "THR789" in opened[0][3]

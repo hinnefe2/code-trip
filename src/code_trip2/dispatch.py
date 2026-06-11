@@ -533,6 +533,89 @@ async def _respond_linear(ctx: "Context", task: Task, transcript: str) -> None:
     await _speak(ctx, "Commented.")
 
 
+async def create_linear_ticket_from_followup(
+    ctx: "Context", task: Task,
+) -> None:
+    """Turn a meeting_followup task into a Linear backlog ticket.
+
+    Bound to ACT+YES on a ``meeting_followup`` task. Hands the follow-up
+    to the ``file-meeting-followup`` skill via ``run_agent`` — the
+    agent reads the follow-up's headline / body / source, picks the
+    right team (and project, when an obvious match exists) from the
+    user's Linear workspace, then calls ``save_issue`` with
+    ``assignee="me"`` and ``state="Backlog"``. The agent's
+    one-sentence reply is spoken back to the user verbatim
+    (e.g. ``Filed in AI / Retention: Draft retention metrics doc.``).
+
+    Agent-driven instead of config-driven because the user works
+    across multiple teams; a fixed default would mis-route most
+    follow-ups. On any failure (no agent MCP, run_agent raises) the
+    task stays active and TTS surfaces the error.
+    """
+    mcp = ctx.agent_mcp
+    if mcp is None or not getattr(mcp, "enabled", False):
+        await _speak(ctx, "Agent MCP is not configured.")
+        return
+    prompt = _build_followup_filing_prompt(task)
+    logger.info(
+        "ACT+YES on meeting_followup: invoking file-meeting-followup for task %s",
+        task.id,
+    )
+    ctx.thinking.start()
+    try:
+        try:
+            summary = await mcp.run_agent(
+                prompt=prompt,
+                allowed_tools=ctx.agent_allowed_tools,
+            )
+        except Exception as exc:
+            logger.exception("Linear follow-up filing failed")
+            await _speak(ctx, f"Could not file ticket: {exc}")
+            return
+    finally:
+        ctx.thinking.stop()
+    ctx.queue.mark_done(task.id)
+    ctx.current_task = None
+    ctx.log.event(
+        "queue_turn",
+        task_id=task.id,
+        task_kind=task.kind,
+        topic=task.topic,
+        sent=f"linear:create:{(task.headline or '').strip()[:60]}",
+        skill_summary=summary,
+    )
+    await _speak(ctx, summary or "Filed.")
+
+
+def _build_followup_filing_prompt(task: Task) -> str:
+    """Hand the file-meeting-followup skill the task context.
+
+    The skill body in ``.claude/skills/file-meeting-followup/SKILL.md``
+    owns the team/project decision rules; this prompt just names the
+    skill and surfaces the task fields it reads from.
+    """
+    try:
+        source_json = json.dumps(task.source, default=str)
+    except (TypeError, ValueError):
+        source_json = "{}"
+    return (
+        "You are filing a meeting follow-up as a Linear backlog ticket "
+        "for the user via the voice-driven inbox orchestrator. Use the "
+        "`file-meeting-followup` skill from `.claude/skills/` and its "
+        "allowed Linear tools. The user already decided this is real "
+        "work by hitting ACT+YES — don't ask for confirmation, file "
+        "it. Pick the team (and project, if obvious) based on the "
+        "follow-up's content; the user works across several teams, so "
+        "don't default-route everything to one bucket. Report back in "
+        "one sentence; the orchestrator speaks your reply verbatim.\n"
+        "\n"
+        f"Task headline: {task.headline}\n"
+        f"Task topic: {task.topic}\n"
+        f"Task source: {source_json}\n"
+        f"Task body:\n{task.body or '(empty)'}\n"
+    )
+
+
 async def _respond_slack(ctx: "Context", task: Task, transcript: str) -> None:
     """Reply in the Slack thread the task came from via the Slack MCP."""
     mcp = ctx.slack_mcp

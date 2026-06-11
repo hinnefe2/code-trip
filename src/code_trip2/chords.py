@@ -109,12 +109,20 @@ async def handle_chord(ctx: "Context", name: str) -> None:
         else:
             await _send_stroke(ctx, _ACT_NO_CLEAR_LINE)
     elif name == "act+yes":
-        # ACT+YES in queue mode opens the active task in a browser
-        # when the task has an obvious URL (email_msg → Gmail thread).
-        # No-op in focused mode and for task kinds without a natural
-        # browser landing.
+        # ACT+YES in queue mode:
+        #   - ``meeting_followup`` → create a Linear backlog ticket
+        #     assigned to the user. The follow-up has no natural URL
+        #     to open, so this is the right place to wire it.
+        #   - everything else → open the active task in a browser
+        #     when the task has an obvious URL (email_msg → Gmail
+        #     thread; linear_issue / slack_msg → source["url"]).
+        # No-op in focused mode.
         if ctx.app_mode == dispatch.MODE_QUEUE:
-            await _open_current_task_in_browser(ctx)
+            task = ctx.current_task
+            if task is not None and task.kind == "meeting_followup":
+                await dispatch.create_linear_ticket_from_followup(ctx, task)
+            else:
+                await _open_current_task_in_browser(ctx)
     else:
         logger.warning("Unknown chord: %s", name)
 

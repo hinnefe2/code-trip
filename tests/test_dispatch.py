@@ -445,3 +445,118 @@ def test_kind_label_meeting_followup_with_no_context():
     t = Task(kind="meeting_followup", topic="", headline="x", source={})
     assert dispatch._kind_label(t) == "Meeting follow-up"
 
+
+# --- ACT+YES: create_linear_ticket_from_followup ---------------------------
+
+
+def _followup_ctx(*, agent_reply: str | Exception = "Filed in AI: Draft doc."):
+    """Context wired for the agent-driven follow-up filing path."""
+    ctx = _make_ctx(app_mode="queue")
+    mcp = create_autospec(ClaudeMCPClient, instance=True)
+    mcp.enabled = True
+    if isinstance(agent_reply, Exception):
+        mcp.run_agent = AsyncMock(side_effect=agent_reply)
+    else:
+        mcp.run_agent = AsyncMock(return_value=agent_reply)
+    ctx.agent_mcp = mcp
+    ctx.agent_allowed_tools = (
+        "mcp__claude_ai_Linear__list_teams",
+        "mcp__claude_ai_Linear__list_projects",
+        "mcp__claude_ai_Linear__save_issue",
+    )
+    return ctx, mcp
+
+
+@pytest.mark.asyncio
+async def test_create_linear_ticket_invokes_file_meeting_followup_skill():
+    ctx, mcp = _followup_ctx(
+        agent_reply="Filed in AI / Retention: Draft retention metrics doc.",
+    )
+    t = ctx.queue.add(Task(
+        kind="meeting_followup",
+        topic="planning-sync",
+        headline="Draft retention metrics doc",
+        body="From planning sync: draft retention metrics doc for review.",
+        source={"meeting": "Planning Sync"},
+    ))
+    ctx.current_task = t
+
+    await dispatch.create_linear_ticket_from_followup(ctx, t)
+
+    mcp.run_agent.assert_awaited_once()
+    call = mcp.run_agent.await_args
+    prompt = call.kwargs["prompt"]
+    # The prompt must name the skill, surface the task context the
+    # skill body references, and forbid asking for confirmation.
+    assert "file-meeting-followup" in prompt
+    assert "Draft retention metrics doc" in prompt
+    assert "planning-sync" in prompt
+    assert "Planning Sync" in prompt  # meeting from source
+    # Allowed tools propagate from Context so the agent can actually
+    # call list_teams / save_issue.
+    assert call.kwargs["allowed_tools"] == ctx.agent_allowed_tools
+
+    assert ctx.queue.get(t.id).state == "done"
+    assert ctx.current_task is None
+    ctx.tts.speak.assert_called_with(
+        "Filed in AI / Retention: Draft retention metrics doc."
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_linear_ticket_uses_default_when_agent_returns_empty():
+    """If the agent forgets to reply, the user still hears something."""
+    ctx, _mcp = _followup_ctx(agent_reply="")
+    t = ctx.queue.add(Task(kind="meeting_followup", headline="x"))
+    ctx.current_task = t
+    await dispatch.create_linear_ticket_from_followup(ctx, t)
+    ctx.tts.speak.assert_called_with("Filed.")
+    assert ctx.queue.get(t.id).state == "done"
+
+
+@pytest.mark.asyncio
+async def test_create_linear_ticket_without_agent_mcp_speaks_error_and_keeps_task():
+    ctx, _mcp = _followup_ctx()
+    ctx.agent_mcp = None
+    t = ctx.queue.add(Task(kind="meeting_followup", headline="x"))
+    ctx.current_task = t
+    await dispatch.create_linear_ticket_from_followup(ctx, t)
+    ctx.tts.speak.assert_called_with("Agent MCP is not configured.")
+    assert ctx.queue.get(t.id).state != "done"
+
+
+@pytest.mark.asyncio
+async def test_create_linear_ticket_with_disabled_mcp_speaks_error():
+    """``run_agent`` requires an enabled MCP — short-circuit before
+    calling so a disabled client doesn't crash silently."""
+    ctx, mcp = _followup_ctx()
+    mcp.enabled = False
+    t = ctx.queue.add(Task(kind="meeting_followup", headline="x"))
+    ctx.current_task = t
+    await dispatch.create_linear_ticket_from_followup(ctx, t)
+    ctx.tts.speak.assert_called_with("Agent MCP is not configured.")
+    mcp.run_agent.assert_not_called()
+    assert ctx.queue.get(t.id).state != "done"
+
+
+@pytest.mark.asyncio
+async def test_create_linear_ticket_agent_failure_keeps_task_active():
+    ctx, _mcp = _followup_ctx(agent_reply=RuntimeError("subprocess died"))
+    t = ctx.queue.add(Task(kind="meeting_followup", headline="x"))
+    ctx.current_task = t
+    await dispatch.create_linear_ticket_from_followup(ctx, t)
+    assert ctx.queue.get(t.id).state != "done"
+    spoken = ctx.tts.speak.call_args.args[0]
+    assert "subprocess died" in spoken
+
+
+@pytest.mark.asyncio
+async def test_create_linear_ticket_runs_thinking_earcon():
+    """Agent calls are slow (5–15s) — the thinking earcon must bookend
+    the run so the user doesn't think the chord did nothing."""
+    ctx, _mcp = _followup_ctx()
+    t = ctx.queue.add(Task(kind="meeting_followup", headline="x"))
+    ctx.current_task = t
+    await dispatch.create_linear_ticket_from_followup(ctx, t)
+    ctx.thinking.start.assert_called_once()
+    ctx.thinking.stop.assert_called_once()
