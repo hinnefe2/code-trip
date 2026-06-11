@@ -273,6 +273,51 @@ async def test_run_agent_extracts_last_assistant_text(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_run_agent_transcript_joins_all_assistant_blocks(monkeypatch):
+    """Regression: the screener path needs FOLLOWUP_TASK lines emitted
+    BEFORE the final tool call to survive. Real-world session: the
+    archive-gemini-meeting-notes skill emitted 5 FOLLOWUP_TASK lines in
+    one text block, called the archive tool, then emitted the summary
+    in a second block — and the parser saw only the summary."""
+    c = _mk_client()
+    followups = (
+        'FOLLOWUP_TASK: {"headline": "Draft retention doc"}\n'
+        'FOLLOWUP_TASK: {"headline": "Reply re schema"}'
+    )
+    stdout = "\n".join([
+        _assistant_text_event(followups),
+        json.dumps({"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "content": "ok"},
+        ]}}),
+        _assistant_text_event("Archived Gemini meeting notes. Spawned 2 follow-ups."),
+    ])
+    _patch_exec(monkeypatch, stdout=stdout)
+    out = await c.run_agent(prompt="archive notes", transcript=True)
+    assert "FOLLOWUP_TASK" in out
+    assert "Archived Gemini meeting notes" in out
+    # Default behavior unchanged: caller without transcript=True still
+    # sees only the final block.
+    _patch_exec(monkeypatch, stdout=stdout)
+    out_default = await c.run_agent(prompt="archive notes")
+    assert "FOLLOWUP_TASK" not in out_default
+    assert out_default == "Archived Gemini meeting notes. Spawned 2 follow-ups."
+
+
+@pytest.mark.asyncio
+async def test_run_agent_transcript_with_single_block_returns_block(monkeypatch):
+    """Skills that emit everything in one block work the same in both modes."""
+    c = _mk_client()
+    text = (
+        'FOLLOWUP_TASK: {"headline": "X"}\n'
+        "Archived."
+    )
+    stdout = _assistant_text_event(text)
+    _patch_exec(monkeypatch, stdout=stdout)
+    out = await c.run_agent(prompt="x", transcript=True)
+    assert out == text
+
+
+@pytest.mark.asyncio
 async def test_run_agent_raises_on_nonzero_exit(monkeypatch):
     c = _mk_client()
     _patch_exec(monkeypatch, stdout="", stderr="oh no", returncode=2)

@@ -169,6 +169,7 @@ class ClaudeMCPClient:
         allowed_tools: list[str] | tuple[str, ...] = (),
         timeout: float | None = None,
         max_budget_usd: float | None = None,
+        transcript: bool = False,
     ) -> str:
         """Free-form Claude invocation: no single-tool constraint.
 
@@ -188,6 +189,12 @@ class ClaudeMCPClient:
         ``--permission-mode bypassPermissions`` skips interactive
         prompts. Budget cap defaults higher than :meth:`call_tool`
         because skill flows tend to make several tool calls.
+
+        ``transcript=True`` returns all assistant text blocks joined by
+        newlines — the screener needs this to recover structured output
+        (``FOLLOWUP_TASK:`` lines) that the model emits *before* its
+        final tool call, which would otherwise be discarded. ACT+PTT
+        leaves it False so the spoken summary stays clean.
         """
         if not self._available:
             raise ClaudeMCPError("claude CLI not available")
@@ -222,17 +229,26 @@ class ClaudeMCPClient:
                 f"claude exited {returncode}: "
                 f"{stderr[:500].strip() or '(no stderr)'}"
             )
-        return self._extract_final_assistant_text(stdout)
+        return self._extract_assistant_text(stdout, transcript=transcript)
 
     @staticmethod
-    def _extract_final_assistant_text(stdout: str) -> str:
-        """Return the last assistant ``text`` content block from stream-json.
+    def _extract_assistant_text(stdout: str, *, transcript: bool = False) -> str:
+        """Pull assistant ``text`` content from a stream-json stdout.
 
-        Skill runs interleave ``tool_use`` and ``tool_result`` blocks
-        with assistant ``text`` blocks; we want the final natural-
-        language summary, which is what the user hears spoken back.
+        Default: return only the *final* assistant text block — the
+        natural-language summary the user hears spoken back. Skill
+        runs interleave ``tool_use`` and ``tool_result`` blocks with
+        assistant ``text`` blocks, so picking the last text-typed
+        block gives the user-facing summary without intermediate
+        reasoning.
+
+        ``transcript=True``: return every assistant text block joined
+        by newlines. Used by the screener so structured emissions
+        like ``FOLLOWUP_TASK: {...}`` lines — which the model often
+        prints in a separate block *before* its final tool call —
+        survive into ``parse_follow_up_tasks``.
         """
-        last_text = ""
+        blocks: list[str] = []
         for line in stdout.splitlines():
             line = line.strip()
             if not line:
@@ -253,8 +269,12 @@ class ClaudeMCPClient:
                 if isinstance(block, dict) and block.get("type") == "text":
                     txt = (block.get("text") or "").strip()
                     if txt:
-                        last_text = txt
-        return last_text
+                        blocks.append(txt)
+        if not blocks:
+            return ""
+        if transcript:
+            return "\n".join(blocks)
+        return blocks[-1]
 
     # ---- internals ------------------------------------------------------
 

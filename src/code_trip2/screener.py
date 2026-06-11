@@ -295,7 +295,14 @@ async def classify(
 async def execute(
     task: Task, skill: SkillManifest, mcp: ClaudeMCPClient,
 ) -> str:
-    """Run ``skill`` against ``task``. Returns the agent's summary.
+    """Run ``skill`` against ``task``. Returns the agent's full transcript.
+
+    ``transcript=True``: we keep every assistant text block, not just
+    the final summary, so structured emissions like ``FOLLOWUP_TASK:``
+    lines that the model prints before its archive tool call survive
+    into :func:`parse_follow_up_tasks`. The trade-off is that the
+    session log entry for ``outcome.summary`` is larger, which is fine
+    — it's also more useful when diagnosing skill behavior.
 
     Raises whatever the MCP client raises; the caller turns that into
     a ``failed`` outcome.
@@ -304,6 +311,7 @@ async def execute(
     return await mcp.run_agent(
         prompt=prompt,
         allowed_tools=skill.allowed_tools,
+        transcript=True,
     )
 
 
