@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, create_autospec
 
 import pytest
 
 from code_trip2 import dispatch, modes
+from code_trip2.earcon import Thinking
 from code_trip2.email_state import EmailState
 from code_trip2.producers.claude_mcp import ClaudeMCPClient, ClaudeMCPError
 from code_trip2.producers.email import (
@@ -18,6 +19,7 @@ from code_trip2.producers.email import (
     _parse_ts,
     _split_name_addr,
 )
+from code_trip2.session_log import SessionLogger
 from code_trip2.tasks import Task, TaskQueue
 from conftest import make_mock_tts
 
@@ -146,7 +148,7 @@ def _producer(tmp_path: Path, *, poll_interval=120.0, search_query="in:inbox cat
         email_max_results=max_results,
     )
     state = EmailState(path=tmp_path / "email-state.json")
-    mcp = MagicMock(spec=ClaudeMCPClient)
+    mcp = create_autospec(ClaudeMCPClient, instance=True)
     mcp.enabled = True
     q = TaskQueue()
     p = EmailProducer(config=cfg, queue=q, mcp=mcp, state=state)
@@ -473,15 +475,15 @@ def _ctx_with_email_mcp(mcp):
     return modes.Context(
         config=cfg,  # type: ignore[arg-type]
         tts=make_mock_tts(),
-        log=MagicMock(),
-        thinking=MagicMock(),
+        log=create_autospec(SessionLogger, instance=True),
+        thinking=create_autospec(Thinking, instance=True),
         email_mcp=mcp,
     )
 
 
 @pytest.mark.asyncio
 async def test_respond_email_creates_draft_via_mcp():
-    mcp = MagicMock()
+    mcp = create_autospec(ClaudeMCPClient, instance=True)
     mcp.call_tool = AsyncMock()
     ctx = _ctx_with_email_mcp(mcp)
     task = Task(
@@ -513,7 +515,7 @@ async def test_respond_email_creates_draft_via_mcp():
 @pytest.mark.asyncio
 async def test_respond_email_preserves_existing_re_prefix():
     """Don't double-prefix the subject when it already starts with Re:."""
-    mcp = MagicMock()
+    mcp = create_autospec(ClaudeMCPClient, instance=True)
     mcp.call_tool = AsyncMock()
     ctx = _ctx_with_email_mcp(mcp)
     task = Task(
@@ -544,7 +546,7 @@ async def test_respond_email_without_mcp_speaks_error():
 
 @pytest.mark.asyncio
 async def test_respond_email_without_sender_speaks_error():
-    mcp = MagicMock()
+    mcp = create_autospec(ClaudeMCPClient, instance=True)
     mcp.call_tool = AsyncMock()
     ctx = _ctx_with_email_mcp(mcp)
     task = Task(kind="email_msg", source={"message_id": "M1", "subject": "x"})
@@ -557,7 +559,7 @@ async def test_respond_email_without_sender_speaks_error():
 
 @pytest.mark.asyncio
 async def test_respond_email_api_error_keeps_task_active():
-    mcp = MagicMock()
+    mcp = create_autospec(ClaudeMCPClient, instance=True)
     mcp.call_tool = AsyncMock(side_effect=ClaudeMCPError("network down"))
     ctx = _ctx_with_email_mcp(mcp)
     task = Task(
@@ -590,7 +592,7 @@ async def test_respond_email_api_error_keeps_task_active():
 @pytest.mark.asyncio
 async def test_respond_email_archive_intent_calls_unlabel_thread(transcript: str):
     """Various phrasings of "archive" → unlabel_thread, not create_draft."""
-    mcp = MagicMock()
+    mcp = create_autospec(ClaudeMCPClient, instance=True)
     mcp.call_tool = AsyncMock()
     ctx = _ctx_with_email_mcp(mcp)
     task = Task(
@@ -617,7 +619,7 @@ async def test_respond_email_archive_intent_calls_unlabel_thread(transcript: str
 async def test_respond_email_archive_in_a_sentence_still_drafts():
     """The archive regex is anchored — 'archive the deploy notes' is a reply,
     not an archive command."""
-    mcp = MagicMock()
+    mcp = create_autospec(ClaudeMCPClient, instance=True)
     mcp.call_tool = AsyncMock()
     ctx = _ctx_with_email_mcp(mcp)
     task = Task(
@@ -637,7 +639,7 @@ async def test_respond_email_archive_in_a_sentence_still_drafts():
 
 @pytest.mark.asyncio
 async def test_respond_email_archive_without_thread_id_speaks_error():
-    mcp = MagicMock()
+    mcp = create_autospec(ClaudeMCPClient, instance=True)
     mcp.call_tool = AsyncMock()
     ctx = _ctx_with_email_mcp(mcp)
     task = Task(
@@ -654,7 +656,7 @@ async def test_respond_email_archive_without_thread_id_speaks_error():
 
 @pytest.mark.asyncio
 async def test_respond_email_archive_api_error_keeps_task_active():
-    mcp = MagicMock()
+    mcp = create_autospec(ClaudeMCPClient, instance=True)
     mcp.call_tool = AsyncMock(side_effect=ClaudeMCPError("network down"))
     ctx = _ctx_with_email_mcp(mcp)
     task = Task(
@@ -670,7 +672,7 @@ async def test_respond_email_archive_api_error_keeps_task_active():
 
 @pytest.mark.asyncio
 async def test_dispatch_task_response_routes_email_kind():
-    mcp = MagicMock()
+    mcp = create_autospec(ClaudeMCPClient, instance=True)
     mcp.call_tool = AsyncMock()
     ctx = _ctx_with_email_mcp(mcp)
     task = Task(

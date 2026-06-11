@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, create_autospec
 
 import pytest
 
-from code_trip2.producers.claude_mcp import ClaudeMCPError
+from code_trip2.producers.claude_mcp import ClaudeMCPClient, ClaudeMCPError
 from code_trip2.screener import (
     ScreeningOutcome,
     _next_or_stop,
@@ -62,9 +62,12 @@ def _mcp(*, agent_reply: str | Exception = "") -> Any:
     """A fake ClaudeMCPClient with ``run_agent`` mocked.
 
     Pass an Exception instance for ``agent_reply`` to make
-    ``run_agent`` raise; otherwise it returns the string.
+    ``run_agent`` raise; otherwise it returns the string. Spec'd
+    against the real class so accessing an attribute that doesn't
+    exist (or calling a method with the wrong shape) fails at test
+    time instead of silently no-op'ing.
     """
-    mcp = MagicMock()
+    mcp = create_autospec(ClaudeMCPClient, instance=True)
     if isinstance(agent_reply, Exception):
         mcp.run_agent = AsyncMock(side_effect=agent_reply)
     else:
@@ -137,7 +140,7 @@ async def test_screen_classifier_declines_forwards():
 
 @pytest.mark.asyncio
 async def test_screen_classifier_picks_then_executor_succeeds():
-    mcp = MagicMock()
+    mcp = create_autospec(ClaudeMCPClient, instance=True)
     mcp.run_agent = AsyncMock(side_effect=[
         "HANDLE: accept-invite",
         "Accepted the invite and archived the email.",
@@ -153,7 +156,7 @@ async def test_screen_classifier_picks_then_executor_succeeds():
 
 @pytest.mark.asyncio
 async def test_screen_executor_raises_returns_failed_with_annotated_body():
-    mcp = MagicMock()
+    mcp = create_autospec(ClaudeMCPClient, instance=True)
     mcp.run_agent = AsyncMock(side_effect=[
         "HANDLE: accept-invite",
         RuntimeError("MCP timeout"),
@@ -170,7 +173,7 @@ async def test_screen_executor_raises_returns_failed_with_annotated_body():
 @pytest.mark.asyncio
 async def test_screen_classifier_raises_forwards():
     """Classifier exception is fail-safe: forward, no executor call."""
-    mcp = MagicMock()
+    mcp = create_autospec(ClaudeMCPClient, instance=True)
     mcp.run_agent = AsyncMock(side_effect=ClaudeMCPError("subprocess died"))
     outcome = await screen(
         _task("email_msg"), [_manifest("accept-invite")], mcp,
@@ -182,7 +185,7 @@ async def test_screen_classifier_raises_forwards():
 
 @pytest.mark.asyncio
 async def test_screen_dry_run_logs_pick_but_forwards():
-    mcp = MagicMock()
+    mcp = create_autospec(ClaudeMCPClient, instance=True)
     mcp.run_agent = AsyncMock(return_value="HANDLE: accept-invite")
     outcome = await screen(
         _task("email_msg"),
@@ -374,7 +377,7 @@ async def test_loop_handled_outcome_does_not_add_to_queue():
 
     intake.put_nowait(_task("email_msg"))
 
-    mcp = MagicMock()
+    mcp = create_autospec(ClaudeMCPClient, instance=True)
     mcp.run_agent = AsyncMock(side_effect=[
         "HANDLE: accept-invite",
         "Accepted and archived.",
@@ -412,7 +415,7 @@ async def test_loop_failed_outcome_still_forwards_to_queue():
 
     intake.put_nowait(_task("email_msg"))
 
-    mcp = MagicMock()
+    mcp = create_autospec(ClaudeMCPClient, instance=True)
     mcp.run_agent = AsyncMock(side_effect=[
         "HANDLE: accept-invite",
         RuntimeError("boom"),
@@ -612,7 +615,7 @@ def test_parse_follow_up_tasks_tolerates_backtick_wrapping():
 
 @pytest.mark.asyncio
 async def test_screen_attaches_follow_up_tasks_from_summary():
-    mcp = MagicMock()
+    mcp = create_autospec(ClaudeMCPClient, instance=True)
     mcp.run_agent = AsyncMock(side_effect=[
         "HANDLE: archive-gemini-meeting-notes",
         (
@@ -646,7 +649,7 @@ async def test_loop_adds_follow_up_tasks_even_when_parent_handled():
 
     intake.put_nowait(_task("email_msg"))
 
-    mcp = MagicMock()
+    mcp = create_autospec(ClaudeMCPClient, instance=True)
     mcp.run_agent = AsyncMock(side_effect=[
         "HANDLE: archive-gemini-meeting-notes",
         (

@@ -3,17 +3,27 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 
 import pytest
 
 from code_trip2 import dispatch, modes
+from code_trip2.earcon import Thinking
+from code_trip2.producers.claude_mcp import ClaudeMCPClient
+from code_trip2.session_log import SessionLogger
 from code_trip2.tasks import RecentTopics, Task, TaskQueue
 from conftest import make_mock_tts
 
 
 def _make_ctx(app_mode: str = "focused") -> modes.Context:
-    """Build a Context wired up enough for dispatch tests."""
+    """Build a Context wired up enough for dispatch tests.
+
+    ``log`` and ``thinking`` are spec'd against the real classes so a
+    typo in a method name or a kwarg/positional collision (the exact
+    bug shape that hid the ``kind=task.kind`` regression for months)
+    raises ``TypeError`` at test time instead of being silently
+    swallowed by a bare :class:`MagicMock`.
+    """
     tts = make_mock_tts()
     cfg = SimpleNamespace(
         ssh_host="",
@@ -23,8 +33,8 @@ def _make_ctx(app_mode: str = "focused") -> modes.Context:
         linear_window="linear",
         terminal_apps=("kitty",),
     )
-    log = MagicMock()
-    thinking = MagicMock()
+    log = create_autospec(SessionLogger, instance=True)
+    thinking = create_autospec(Thinking, instance=True)
     ctx = modes.Context(
         config=cfg,  # type: ignore[arg-type]
         tts=tts,
@@ -314,7 +324,7 @@ async def test_queue_navigate_does_not_touch_recent_topics():
 @pytest.mark.asyncio
 async def test_handle_skill_invokes_agent_and_marks_task_done():
     ctx = _make_ctx(app_mode="queue")
-    mcp = MagicMock()
+    mcp = create_autospec(ClaudeMCPClient, instance=True)
     mcp.enabled = True
     mcp.run_agent = AsyncMock(return_value="Accepted 'Lunch' and archived the email.")
     ctx.agent_mcp = mcp
@@ -364,7 +374,7 @@ async def test_handle_skill_without_agent_mcp_speaks_error():
 @pytest.mark.asyncio
 async def test_handle_skill_agent_error_keeps_task_active():
     ctx = _make_ctx(app_mode="queue")
-    mcp = MagicMock()
+    mcp = create_autospec(ClaudeMCPClient, instance=True)
     mcp.enabled = True
     mcp.run_agent = AsyncMock(side_effect=RuntimeError("budget exceeded"))
     ctx.agent_mcp = mcp
@@ -373,6 +383,42 @@ async def test_handle_skill_agent_error_keeps_task_active():
     await dispatch.handle_skill(ctx, "accept invite")
     assert ctx.queue.get(t.id).state != "done"
     assert ctx.current_task is t
+
+
+@pytest.mark.asyncio
+async def test_handle_skill_writes_queue_turn_to_real_session_log(tmp_path):
+    """Regression: ``ctx.log.event("queue_turn", kind=task.kind, …)`` used
+    to raise ``TypeError: got multiple values for argument 'kind'`` because
+    ``SessionLogger.event(kind, **fields)`` takes ``kind`` positionally.
+
+    The error fired *after* ``mark_done`` and *after* the agent had
+    already run, so the task vanished while the side effect (Gmail
+    archive) may not have completed — and the user heard nothing because
+    the failure path bypassed the spoken summary. Wire a real
+    SessionLogger here so the same kwarg-collision can't sneak back in.
+    """
+    from code_trip2.session_log import SessionLogger
+    log = SessionLogger(tmp_path / "session.jsonl")
+    ctx = _make_ctx(app_mode="queue")
+    ctx.log = log
+    mcp = create_autospec(ClaudeMCPClient, instance=True)
+    mcp.enabled = True
+    mcp.run_agent = AsyncMock(return_value="Archived.")
+    ctx.agent_mcp = mcp
+    t = ctx.queue.add(Task(
+        kind="email_msg",
+        topic="cobalt",
+        headline="x",
+        source={"thread_id": "T1", "subject": "x"},
+    ))
+    ctx.current_task = t
+    await dispatch.handle_skill(ctx, "archive that email")
+    log.close()
+    written = (tmp_path / "session.jsonl").read_text()
+    assert '"kind": "queue_turn"' in written
+    assert '"task_kind": "email_msg"' in written
+    # And the spoken summary path completed (no crash before tts.speak).
+    ctx.tts.speak.assert_called_with("Archived.")
 
 
 def test_kind_label_meeting_followup_uses_meeting_when_available():
@@ -398,3 +444,4 @@ def test_kind_label_meeting_followup_falls_back_to_topic():
 def test_kind_label_meeting_followup_with_no_context():
     t = Task(kind="meeting_followup", topic="", headline="x", source={})
     assert dispatch._kind_label(t) == "Meeting follow-up"
+

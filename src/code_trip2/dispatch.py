@@ -121,7 +121,7 @@ async def handle_skill(ctx: "Context", transcript: str) -> None:
     ctx.log.event(
         "queue_turn",
         task_id=task.id,
-        kind=task.kind,
+        task_kind=task.kind,
         topic=task.topic,
         skill_transcript=t,
         skill_summary=summary,
@@ -399,7 +399,7 @@ async def _respond_claude(ctx: "Context", task: Task, transcript: str) -> None:
     ctx.queue.mark_done(task.id)
     ctx.current_task = None
     ctx.log.event(
-        "queue_turn", task_id=task.id, kind=task.kind, topic=task.topic, sent=transcript
+        "queue_turn", task_id=task.id, task_kind=task.kind, topic=task.topic, sent=transcript
     )
     await _speak(ctx, "Sent.")
 
@@ -452,7 +452,7 @@ async def _respond_email(ctx: "Context", task: Task, transcript: str) -> None:
     ctx.log.event(
         "queue_turn",
         task_id=task.id,
-        kind=task.kind,
+        task_kind=task.kind,
         topic=task.topic,
         sent=transcript,
     )
@@ -488,7 +488,7 @@ async def _archive_email(ctx: "Context", task: Task) -> None:
     ctx.log.event(
         "queue_turn",
         task_id=task.id,
-        kind=task.kind,
+        task_kind=task.kind,
         topic=task.topic,
         action="archive",
     )
@@ -526,7 +526,7 @@ async def _respond_linear(ctx: "Context", task: Task, transcript: str) -> None:
     ctx.log.event(
         "queue_turn",
         task_id=task.id,
-        kind=task.kind,
+        task_kind=task.kind,
         topic=task.topic,
         sent=transcript,
     )
@@ -562,7 +562,7 @@ async def _respond_slack(ctx: "Context", task: Task, transcript: str) -> None:
     ctx.log.event(
         "queue_turn",
         task_id=task.id,
-        kind=task.kind,
+        task_kind=task.kind,
         topic=task.topic,
         sent=transcript,
     )

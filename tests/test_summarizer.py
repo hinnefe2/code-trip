@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 
 import pytest
 
 from code_trip2 import modes
+from code_trip2.earcon import Thinking
+from code_trip2.session_log import SessionLogger
 from code_trip2.summarizer import Summarizer, SummarizerError
 from conftest import make_mock_tts
 
@@ -109,8 +111,8 @@ def _make_ctx_for_strip(summarizer=None):
     return modes.Context(
         config=cfg,  # type: ignore[arg-type]
         tts=tts,
-        log=MagicMock(),
-        thinking=MagicMock(),
+        log=create_autospec(SessionLogger, instance=True),
+        thinking=create_autospec(Thinking, instance=True),
         summarizer=summarizer,
     )
 

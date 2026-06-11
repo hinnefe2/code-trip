@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, create_autospec
 
 import pytest
 
 from code_trip2 import chords, modes, window
+from code_trip2.earcon import Thinking
+from code_trip2.session_log import SessionLogger
 from conftest import make_mock_tts
 
 
@@ -125,8 +127,8 @@ def _real_ctx(*, terminal_apps=("kitty",)) -> modes.Context:
         wait_timeout=1.0,
     )
     tts = make_mock_tts()
-    log = MagicMock()
-    thinking = MagicMock()
+    log = create_autospec(SessionLogger, instance=True)
+    thinking = create_autospec(Thinking, instance=True)
     return modes.Context(config=config, tts=tts, log=log, thinking=thinking)
 
 
