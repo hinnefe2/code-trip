@@ -39,6 +39,10 @@ You're being invoked on a `linear_issue` task. Your job is to send a single `/do
 
    If the `ssh` call fails (non-zero exit), let the error surface — do not retry. The screener will mark the task as `failed` and forward it to the user queue with the error annotated.
 
+5. **End your reply with one of:**
+   - `STATUS: handled` — the `ssh` call succeeded and the slash command was sent.
+   - `STATUS: declined: <one-sentence reason>` — you skipped (status wasn't "Todo") or otherwise didn't send. The user will see the task with your reason annotated. (If the `ssh` itself errored, let the exception propagate — don't emit STATUS in that case.)
+
 ## Two important things to NOT do
 
 - **Do not retry.** A failed send must surface, not get re-attempted. Retries risk sending the slash command twice into the standing Claude session, which would queue two `/do-ticket` runs.

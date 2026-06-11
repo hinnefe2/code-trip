@@ -128,6 +128,66 @@ _FOLLOWUP_DEFAULT_KIND = "meeting_followup"
 _FOLLOWUP_DEFAULT_TOPIC = "inbox"
 
 
+# Structured exit signal emitted by skills on the last (or any) line of
+# their reply: ``STATUS: handled`` if the side effect happened, or
+# ``STATUS: declined: <reason>`` if it didn't. This is the contract path
+# — when present, it overrides :func:`summary_indicates_failure`, which
+# remains a safety-net heuristic for skills that haven't yet been
+# updated to emit STATUS. Tolerant of code-fence wrapping for the same
+# reason ``_FOLLOWUP_RE`` is.
+_STATUS_RE = re.compile(
+    r"^\s*`*\s*STATUS\s*:\s*(handled|declined|skipped)\b[^\n]*`*\s*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+# Self-reported failure detection on executor summaries.
+#
+# The agent can return normally (no exception) while its prose says it
+# couldn't actually perform the action — e.g. "I cannot complete the
+# acceptance without finding the event first, so I'm skipping the
+# archive step" (accept-invite), or "Not archived — Gmail tools
+# encountered errors" (archive-gemini-meeting-notes). Without this
+# check the screener marks the task ``handled`` and the user never
+# sees it again, even though the side effect never happened.
+#
+# Patterns are deliberately conservative — they fire only on phrases
+# that strongly imply the agent itself is acknowledging non-completion.
+# False positives just mean the user sees a task they didn't strictly
+# need to (annoying), while false negatives mean silent data loss
+# (much worse). The bias is intentional.
+_FAILURE_INDICATORS: tuple[re.Pattern[str], ...] = (
+    # "I cannot" / "I can't" / "I could not" / "I couldn't"
+    re.compile(r"\bI\s+(?:cannot|can(?:['‘’])?t|could\s+not|couldn(?:['‘’])?t)\b", re.IGNORECASE),
+    # "unable to" / "I'm unable to" / "I am unable to"
+    re.compile(r"\bunable\s+to\b", re.IGNORECASE),
+    # "skipping the archive/accept/action/step/email" — paired with the
+    # action verb so we don't trip on benign uses of "skip".
+    re.compile(r"\bskipp?(?:ing|ed)\s+(?:the\s+)?(?:archive|accept(?:ance)?|action|step|email)\b", re.IGNORECASE),
+    # "I'll skip" / "I will skip"
+    re.compile(r"\bI(?:['‘’])?ll\s+skip\b", re.IGNORECASE),
+    # "not archived" / "not accepting" / "did not archive" — explicit
+    # negation of the action verb the skill was supposed to perform.
+    re.compile(r"\bnot\s+(?:archiv(?:ing|ed)|accept(?:ing|ed)|complet(?:ing|ed)|send(?:ing)|sent)\b", re.IGNORECASE),
+    re.compile(r"\bdid\s+not\s+(?:archive|accept|complete|send)\b", re.IGNORECASE),
+    # Tool-call failure phrasings
+    re.compile(r"\bencountered\s+(?:an?\s+)?errors?\b", re.IGNORECASE),
+    re.compile(r"\bauthentication\s+errors?\b", re.IGNORECASE),
+    re.compile(r"\bfailed\s+to\s+\w+", re.IGNORECASE),
+)
+
+
+def summary_indicates_failure(summary: str | None) -> bool:
+    """Heuristically decide whether the executor's summary says the
+    skill *didn't* complete its intended action.
+
+    See :data:`_FAILURE_INDICATORS` for the patterns and rationale.
+    """
+    if not summary:
+        return False
+    return any(p.search(summary) for p in _FAILURE_INDICATORS)
+
+
 def parse_classifier_reply(
     text: str, candidates: list[SkillManifest]
 ) -> SkillManifest | None:
@@ -139,6 +199,29 @@ def parse_classifier_reply(
     if not m:
         return None
     return name_to_manifest.get(m.group(1).strip())
+
+
+def parse_skill_status(
+    summary: str | None,
+) -> Literal["handled", "declined"] | None:
+    """Pull the structured ``STATUS:`` exit signal from an executor summary.
+
+    Returns ``"handled"`` or ``"declined"`` if the skill emitted one,
+    else ``None``. ``STATUS: skipped`` folds into ``declined`` — the
+    user-visible disposition is the same (task surfaces to the queue).
+    When a summary contains multiple STATUS lines (model retrying,
+    quoted earlier output, etc.), the last one wins — the skill's final
+    word should override anything it said while deciding.
+    """
+    if not summary:
+        return None
+    matches = _STATUS_RE.findall(summary)
+    if not matches:
+        return None
+    last = matches[-1].lower()
+    if last == "handled":
+        return "handled"
+    return "declined"
 
 
 def parse_follow_up_tasks(summary: str | None) -> tuple[Task, ...]:
@@ -369,6 +452,37 @@ async def screen(
     follow_ups = parse_follow_up_tasks(summary)
     for ft in follow_ups:
         ft.parent_id = task.id
+    # Disposition precedence:
+    #   1. Explicit ``STATUS:`` from the skill wins. Updated skills emit
+    #      ``STATUS: handled`` or ``STATUS: declined: <reason>``, which
+    #      is the contract. ``handled`` overrides the failure heuristic
+    #      so a skill that knows its prose is benign can opt out;
+    #      ``declined`` overrides a success-looking summary so a skill
+    #      that knows it didn't act can opt in.
+    #   2. Fall back to :func:`summary_indicates_failure` for skills
+    #      that haven't been updated to emit STATUS yet. Heuristic
+    #      stays as the safety net until all skills are converted.
+    status = parse_skill_status(summary)
+    declined = status == "declined" or (
+        status is None and summary_indicates_failure(summary)
+    )
+    if declined:
+        logger.info(
+            "Screener: %s returned a self-reported failure for task %s; "
+            "forwarding to user. Summary: %s",
+            chosen.name, task.id, summary[:200],
+        )
+        annotated = replace(
+            task,
+            body=(
+                f"{task.body or ''}\n"
+                f"[auto-handle declined ({chosen.name}): {summary.strip()[:200]}]"
+            ).strip(),
+        )
+        return ScreeningOutcome(
+            "failed", annotated, skill=chosen.name, summary=summary,
+            error="self-reported failure", follow_up_tasks=follow_ups,
+        )
     return ScreeningOutcome(
         "handled", task, skill=chosen.name, summary=summary,
         follow_up_tasks=follow_ups,

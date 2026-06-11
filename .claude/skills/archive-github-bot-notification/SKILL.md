@@ -28,6 +28,10 @@ You're being invoked on an email task that looks like a GitHub notification repo
 
 Don't ask for confirmation. When archived, return ONE sentence: `Archived GitHub bot notification: <brief subject>.`
 
+End your reply with one of:
+- `STATUS: handled` — you archived the email.
+- `STATUS: declined: <one-sentence reason>` — you didn't archive. Use this whenever you hit one of the STOP conditions (human activity, CI failure, etc.) or the tool errored. The user will see the task with your reason annotated.
+
 This skill runs in two modes:
 - **ACT+PTT (voice):** the user is holding the active task and explicitly asked to archive it. Their intent is the trigger.
 - **Auto-handle (screener):** no user instruction; you're invoked because the screener classifier picked this skill. Apply the same body-check before archiving — when in doubt, leave it.

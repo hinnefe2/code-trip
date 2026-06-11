@@ -15,8 +15,10 @@ from code_trip2.screener import (
     candidates_for,
     parse_classifier_reply,
     parse_follow_up_tasks,
+    parse_skill_status,
     run_screener_loop,
     screen,
+    summary_indicates_failure,
 )
 from code_trip2.skills import SkillManifest
 from code_trip2.tasks import Task
@@ -882,3 +884,277 @@ async def test_loop_intake_still_works_alongside_reconsider():
     assert len(added) == 1
     assert marked_done == []
     assert outcomes[0].action == "forward"
+
+
+# --- self-reported failure detection --------------------------------------
+
+
+def test_summary_indicates_failure_catches_observed_phrases():
+    """Real-world failure prose pulled from session logs the subagent
+    audited (May 27 – Jun 8, 2026). Every one of these summaries left
+    a task marked ``handled`` while the side effect didn't happen."""
+    observed = [
+        # accept-invite: couldn't find event, skipped archive
+        "I cannot complete the acceptance without finding the event first, "
+        "so I'm skipping the archive step",
+        # archive-github-bot-notification: tool failed
+        "authentication errors... unable to complete the archive",
+        # archive-gemini-meeting-notes: tool failure phrasing
+        "Not archived — Gmail tools encountered errors",
+        # accept-invite, variant phrasing
+        "I could not find the calendar event for this invitation, skipping the archive",
+        # generic agent abdication
+        "I'll skip this one — the email looks personal",
+        "Failed to archive: thread not found",
+        "I couldn't archive the email because the thread ID was missing.",
+    ]
+    for summary in observed:
+        assert summary_indicates_failure(summary), (
+            f"Should flag as failure: {summary!r}"
+        )
+
+
+def test_summary_indicates_failure_passes_clean_success_summaries():
+    """Canonical success summaries from each skill — must NOT flag as
+    failure. False positives just annoy the user; false negatives are
+    silent data loss, which is worse, but no need to be paranoid."""
+    successes = [
+        "Archived vendor update from notify@cobalt.io: credit reminder.",
+        "Accepted 'Lunch' and archived the email.",
+        "Archived GitHub bot notification: linear-code[bot] comment on PR #11086.",
+        "Archived office-hours invite \"Skip-level Q&A\" without RSVPing.",
+        "Archived RSVP-acceptance notification for \"Standup\".",
+        "Archived cancellation notification for \"Recruitment Solutions\".",
+        "Archived Gemini meeting notes: Sprint Planning. Spawned 3 follow-ups for Henry.",
+        "Sent /do-ticket ENGAGE-4010 to dev:0.",
+    ]
+    for summary in successes:
+        assert not summary_indicates_failure(summary), (
+            f"Should NOT flag as failure: {summary!r}"
+        )
+
+
+def test_summary_indicates_failure_handles_none_and_empty():
+    assert summary_indicates_failure(None) is False
+    assert summary_indicates_failure("") is False
+    assert summary_indicates_failure("   ") is False
+
+
+@pytest.mark.asyncio
+async def test_screen_downgrades_handled_to_failed_when_summary_admits_failure():
+    """End-to-end: the agent returned a normal summary saying it
+    declined to act, and the screener routes the task back to the user
+    queue (``failed``) instead of vanishing it (``handled``)."""
+    mcp = MagicMock(spec=ClaudeMCPClient)
+    mcp.run_agent = AsyncMock(side_effect=[
+        "HANDLE: accept-invite",
+        # The exact failure summary from a real May 27 session.
+        "I cannot complete the acceptance without finding the event first, "
+        "so I'm skipping the archive step.",
+    ])
+    parent = _task("email_msg", body="Original body")
+    outcome = await screen(parent, [_manifest("accept-invite")], mcp)
+    assert outcome.action == "failed"
+    assert outcome.skill == "accept-invite"
+    assert "self-reported failure" in (outcome.error or "")
+    # The task body gains an annotation so the user understands why
+    # this task reappeared instead of being silently archived.
+    assert "auto-handle declined (accept-invite)" in (outcome.task.body or "")
+    assert "Original body" in (outcome.task.body or "")
+
+
+@pytest.mark.asyncio
+async def test_screen_keeps_handled_for_clean_success_summary():
+    mcp = MagicMock(spec=ClaudeMCPClient)
+    mcp.run_agent = AsyncMock(side_effect=[
+        "HANDLE: accept-invite",
+        "Accepted 'Standup' and archived the email.",
+    ])
+    outcome = await screen(_task("email_msg"), [_manifest("accept-invite")], mcp)
+    assert outcome.action == "handled"
+
+
+@pytest.mark.asyncio
+async def test_loop_self_reported_failure_forwards_task_to_user_queue():
+    """Regression: the bug was that ``handled`` outcomes suppress the
+    task. After the fix, a self-reported-failure summary should route
+    through the ``failed`` branch, which forwards to ``add_to_queue``."""
+    intake: "asyncio.Queue[Task]" = asyncio.Queue()
+    added: list[Task] = []
+    outcomes: list[ScreeningOutcome] = []
+    stop = asyncio.Event()
+
+    intake.put_nowait(_task("email_msg"))
+
+    mcp = MagicMock(spec=ClaudeMCPClient)
+    mcp.run_agent = AsyncMock(side_effect=[
+        "HANDLE: accept-invite",
+        "Not archived — Gmail tools encountered errors.",
+    ])
+
+    async def driver() -> None:
+        while not outcomes:
+            await asyncio.sleep(0)
+        stop.set()
+
+    loop_task = asyncio.create_task(
+        run_screener_loop(
+            intake=intake,
+            manifests=(_manifest("accept-invite", kinds=("email_msg",)),),
+            mcp=mcp,
+            add_to_queue=added.append,
+            on_outcome=outcomes.append,
+            allowed_kinds=None,
+            dry_run=False,
+            stop=stop,
+        )
+    )
+    await asyncio.wait_for(asyncio.gather(driver(), loop_task), timeout=2.0)
+    assert len(added) == 1
+    assert outcomes[0].action == "failed"
+    assert "auto-handle declined" in (added[0].body or "")
+
+
+# --- STATUS exit signal --------------------------------------------------
+
+
+def test_parse_skill_status_handled():
+    assert parse_skill_status("did the thing.\nSTATUS: handled") == "handled"
+
+
+def test_parse_skill_status_declined_with_reason():
+    assert (
+        parse_skill_status("STATUS: declined: couldn't find the event")
+        == "declined"
+    )
+
+
+def test_parse_skill_status_skipped_folds_into_declined():
+    """``skipped`` is a softer phrasing but the user-visible disposition
+    is the same as ``declined`` — the task surfaces back to the queue."""
+    assert parse_skill_status("STATUS: skipped: not a vendor email") == "declined"
+
+
+def test_parse_skill_status_missing_returns_none():
+    assert parse_skill_status(None) is None
+    assert parse_skill_status("") is None
+    assert parse_skill_status("Archived office-hours invite.") is None
+
+
+def test_parse_skill_status_malformed_returns_none():
+    """No recognised verb after STATUS: → no signal."""
+    assert parse_skill_status("STATUS: ok") is None
+    assert parse_skill_status("STATUS:") is None
+    assert parse_skill_status("status maybe handled") is None
+
+
+def test_parse_skill_status_tolerates_code_fence_wrapping():
+    """LLMs sometimes wrap the line in backticks — mirror the
+    `FOLLOWUP_TASK` parser's tolerance."""
+    assert parse_skill_status("`STATUS: handled`") == "handled"
+    assert (
+        parse_skill_status("```\nSTATUS: declined: tool errored\n```")
+        == "declined"
+    )
+
+
+def test_parse_skill_status_case_insensitive():
+    assert parse_skill_status("status: Handled") == "handled"
+    assert parse_skill_status("Status: DECLINED: nope") == "declined"
+
+
+def test_parse_skill_status_last_match_wins():
+    """If the model emits two STATUS lines (e.g. quoted earlier output
+    plus a final decision), the final one is authoritative."""
+    summary = "STATUS: declined: first pass said no\nSTATUS: handled"
+    assert parse_skill_status(summary) == "handled"
+
+
+@pytest.mark.asyncio
+async def test_screen_explicit_status_handled_overrides_failure_heuristic():
+    """A summary that the heuristic would flag as failure is still
+    treated as ``handled`` when the skill explicitly says STATUS: handled.
+    Lets a skill opt out of the heuristic when it knows its prose is
+    benign (e.g. mentioning 'unable to' inside a quoted message)."""
+    mcp = create_autospec(ClaudeMCPClient, instance=True)
+    mcp.run_agent = AsyncMock(side_effect=[
+        "HANDLE: accept-invite",
+        # Heuristic would normally flag "unable to" — STATUS overrides.
+        "Sender was unable to attend, but I archived the cancellation.\n"
+        "STATUS: handled",
+    ])
+    outcome = await screen(_task("email_msg"), [_manifest("accept-invite")], mcp)
+    assert outcome.action == "handled"
+    assert outcome.skill == "accept-invite"
+
+
+@pytest.mark.asyncio
+async def test_screen_explicit_status_declined_flips_success_summary():
+    """A success-looking summary is still treated as ``failed`` when the
+    skill explicitly says STATUS: declined. Lets a skill opt into the
+    failure path when its prose looks clean but the side effect didn't
+    happen."""
+    mcp = create_autospec(ClaudeMCPClient, instance=True)
+    mcp.run_agent = AsyncMock(side_effect=[
+        "HANDLE: accept-invite",
+        # No heuristic trigger words; only the explicit signal flips it.
+        "Reviewed the invite.\nSTATUS: declined: organizer added a real note",
+    ])
+    outcome = await screen(
+        _task("email_msg", body="Original body"),
+        [_manifest("accept-invite")],
+        mcp,
+    )
+    assert outcome.action == "failed"
+    assert outcome.skill == "accept-invite"
+    assert "self-reported failure" in (outcome.error or "")
+    assert "auto-handle declined (accept-invite)" in (outcome.task.body or "")
+    assert "Original body" in (outcome.task.body or "")
+
+
+@pytest.mark.asyncio
+async def test_screen_missing_status_falls_back_to_heuristic_handled():
+    """Without STATUS, a clean summary stays ``handled`` (unchanged)."""
+    mcp = create_autospec(ClaudeMCPClient, instance=True)
+    mcp.run_agent = AsyncMock(side_effect=[
+        "HANDLE: accept-invite",
+        "Accepted 'Standup' and archived the email.",
+    ])
+    outcome = await screen(_task("email_msg"), [_manifest("accept-invite")], mcp)
+    assert outcome.action == "handled"
+
+
+@pytest.mark.asyncio
+async def test_screen_missing_status_falls_back_to_heuristic_failed():
+    """Without STATUS, a heuristic-tripping summary still flips to
+    ``failed`` — backwards-compat path for un-updated skills."""
+    mcp = create_autospec(ClaudeMCPClient, instance=True)
+    mcp.run_agent = AsyncMock(side_effect=[
+        "HANDLE: accept-invite",
+        "I cannot complete the acceptance without finding the event first, "
+        "so I'm skipping the archive step.",
+    ])
+    outcome = await screen(_task("email_msg"), [_manifest("accept-invite")], mcp)
+    assert outcome.action == "failed"
+    assert "self-reported failure" in (outcome.error or "")
+
+
+@pytest.mark.asyncio
+async def test_screen_status_handled_coexists_with_followup_task():
+    """STATUS and FOLLOWUP_TASK live in the same summary — both parse
+    independently."""
+    mcp = create_autospec(ClaudeMCPClient, instance=True)
+    mcp.run_agent = AsyncMock(side_effect=[
+        "HANDLE: archive-gemini-meeting-notes",
+        (
+            "FOLLOWUP_TASK: {\"headline\": \"Draft retention doc\"}\n"
+            "Archived Gemini meeting notes: Planning sync.\n"
+            "STATUS: handled"
+        ),
+    ])
+    outcome = await screen(
+        _task("email_msg"), [_manifest("archive-gemini-meeting-notes")], mcp,
+    )
+    assert outcome.action == "handled"
+    assert len(outcome.follow_up_tasks) == 1
+    assert outcome.follow_up_tasks[0].headline == "Draft retention doc"

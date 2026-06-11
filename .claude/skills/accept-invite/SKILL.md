@@ -55,6 +55,10 @@ Return ONE sentence: `Accepted "<event title>" and archived the email.`
 
 Don't ask for confirmation. If you can't find the calendar event in the default flow (e.g. the event is too far in the past/future to locate), say so in one sentence and skip the archive — don't guess. The office-hours and acceptance-notification flows don't need to find the event since they never RSVP.
 
+End your reply with one of:
+- `STATUS: handled` — you completed the side effect the flow specifies (accepted+archived, or archived-only for the office-hours / acceptance / cancellation flows).
+- `STATUS: declined: <one-sentence reason>` — you didn't complete it. The user will see the task with your reason annotated. Use this whenever you skipped the archive or RSVP for any reason — couldn't find the event, sender looked external, body had a substantive note, tool errored, etc.
+
 This skill runs in two modes:
 - **ACT+PTT (voice):** the user is holding the active task and has spoken an instruction. Their words are the trigger.
 - **Auto-handle (screener):** no user instruction; you're invoked because the screener classifier picked this skill. Apply the same logic — the task source contains everything you need.
