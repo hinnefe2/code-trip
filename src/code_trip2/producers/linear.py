@@ -28,7 +28,8 @@ import logging
 import time
 from typing import Callable
 
-from code_trip2._async_utils import event_or_timeout
+from code_trip2 import config as config_mod
+from code_trip2._async_utils import event_or_timeout, next_tick_delay
 from code_trip2.config import Config
 from code_trip2.linear_state import LinearState
 from code_trip2.producers.claude_mcp import ClaudeMCPClient, ClaudeMCPError
@@ -97,12 +98,25 @@ class LinearProducer:
             return
         if await event_or_timeout(self._stop, self._STARTUP_DELAY_S):
             return
+        was_active = True
         while not self._stop.is_set():
-            try:
-                await self._poll_once()
-            except Exception:
-                logger.exception("LinearProducer poll failed")
-            if await event_or_timeout(self._stop, self._config.linear_poll_interval):
+            if config_mod.polling_active(self._config):
+                if not was_active:
+                    logger.info("LinearProducer: active hours resumed; polling")
+                    was_active = True
+                try:
+                    await self._poll_once()
+                except Exception:
+                    logger.exception("LinearProducer poll failed")
+            elif was_active:
+                logger.info("LinearProducer: outside active hours; polling paused")
+                was_active = False
+            # Sleep to the next wall-clock multiple of the interval so
+            # producers with compatible intervals fire at the same
+            # instant and the MCP batcher can coalesce their calls
+            # into one claude session.
+            delay = next_tick_delay(self._config.linear_poll_interval)
+            if await event_or_timeout(self._stop, delay):
                 return
 
     async def _poll_once(self) -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 if sys.version_info >= (3, 11):
@@ -75,6 +76,15 @@ class Config:
     # not yet done."
     linear_state_types: tuple[str, ...] = ("triage", "unstarted", "started")
     linear_max_results: int = 50
+    # poll scheduling. Producers only poll between start_hour and
+    # end_hour (local time) — headless claude calls bill outside plan
+    # limits, so overnight polling is pure spend for an empty queue.
+    # Equal values disable the window (always active). batch_window is
+    # how long the MCP batcher collects concurrent calls before
+    # issuing one claude session for all of them.
+    poll_start_hour: int = 7
+    poll_end_hour: int = 19
+    mcp_batch_window: float = 2.0
     # autohandle: skill-driven silent handling of producer tasks. When
     # enabled, every task a producer emits is screened against the
     # auto-handle-eligible skills in ``.claude/skills/`` before it
@@ -193,6 +203,14 @@ def load_config(path: Path | str) -> Config:
     if "max_results" in linear_cfg:
         kw["linear_max_results"] = int(linear_cfg["max_results"])
 
+    poll_cfg = data.get("poll", {})
+    if "start_hour" in poll_cfg:
+        kw["poll_start_hour"] = int(poll_cfg["start_hour"])
+    if "end_hour" in poll_cfg:
+        kw["poll_end_hour"] = int(poll_cfg["end_hour"])
+    if "batch_window" in poll_cfg:
+        kw["mcp_batch_window"] = float(poll_cfg["batch_window"])
+
     autohandle_cfg = data.get("autohandle", {})
     if "enabled" in autohandle_cfg:
         kw["autohandle_enabled"] = bool(autohandle_cfg["enabled"])
@@ -202,3 +220,22 @@ def load_config(path: Path | str) -> Config:
         kw["autohandle_kinds"] = tuple(str(k) for k in autohandle_cfg["kinds"])
 
     return Config(**kw)
+
+
+def polling_active(cfg, now: "datetime | None" = None) -> bool:
+    """True when producer polling is inside the configured active window.
+
+    Takes the config as a plain attribute bag (``getattr`` with
+    permissive defaults) so test doubles built from SimpleNamespace —
+    which predate these fields — read as "always active" rather than
+    crashing or going time-dependent. Handles windows that cross
+    midnight (start > end); equal hours disable the window entirely.
+    """
+    start = getattr(cfg, "poll_start_hour", None)
+    end = getattr(cfg, "poll_end_hour", None)
+    if start is None or end is None or start == end:
+        return True
+    hour = (now or datetime.now()).hour
+    if start < end:
+        return start <= hour < end
+    return hour >= start or hour < end

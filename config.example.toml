@@ -70,6 +70,20 @@ state_types = ["triage", "unstarted", "started"]
 # Max issues per poll (also the ``list_issues`` ``limit`` argument).
 max_results = 50
 
+[poll]
+# Producers only poll between start_hour and end_hour (local time).
+# Headless claude calls bill outside plan limits (per-call cost even
+# while plan bars show green), so overnight polling is pure spend for
+# an empty queue. Set both to the same value to disable the window.
+start_hour = 7    # 7am
+end_hour = 19     # 7pm
+# How long (seconds) the MCP batcher collects concurrent tool calls
+# before issuing one claude session for all of them. Producers poll on
+# wall-clock-aligned ticks, so their calls land in the same window and
+# share a session; interactive calls pay at most this much extra
+# latency.
+batch_window = 2.0
+
 [autohandle]
 # Let auto-handle-eligible skills (those declaring ``auto-handle: true``
 # in their SKILL.md frontmatter) silently complete matching tasks

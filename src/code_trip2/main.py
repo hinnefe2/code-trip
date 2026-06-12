@@ -28,6 +28,7 @@ from code_trip2.producers.manual import ManualProducer
 from code_trip2.producers.slack import SlackProducer
 from code_trip2.queue_log import QueueLog
 from code_trip2.producers.claude_mcp import ClaudeMCPClient
+from code_trip2.producers.mcp_batch import BatchedMCPClient, MCPBatcher
 from code_trip2.screener import (
     AutohandleLogEntry,
     ScreeningOutcome,
@@ -125,19 +126,25 @@ async def main_async(config: Config, *, tui: bool = False, silent: bool = False)
         logger.info("TUI host detected as %r; suppressing synthesized "
                     "keystrokes that would target it.", tui_host_app)
 
-    slack_mcp = ClaudeMCPClient(server_id="claude_ai_Slack")
+    # All single-tool MCP calls funnel through one coalescing batcher:
+    # producers poll on wall-clock-aligned ticks, so their calls land
+    # inside the same collection window and run in ONE claude session
+    # instead of one each — headless claude calls bill outside plan
+    # limits, so sessions are the cost unit that matters.
+    mcp_batcher = MCPBatcher(window_s=config.mcp_batch_window)
+    slack_mcp = BatchedMCPClient(server_id="claude_ai_Slack", batcher=mcp_batcher)
     if not slack_mcp.enabled:
         logger.info(
             "Slack MCP via claude CLI not available; Slack producer will "
             "stay idle. Install claude CLI to enable."
         )
-    email_mcp = ClaudeMCPClient(server_id="claude_ai_Gmail")
+    email_mcp = BatchedMCPClient(server_id="claude_ai_Gmail", batcher=mcp_batcher)
     if not email_mcp.enabled:
         logger.info(
             "Gmail MCP via claude CLI not available; Email producer will "
             "stay idle. Install claude CLI to enable."
         )
-    linear_mcp = ClaudeMCPClient(server_id="claude_ai_Linear")
+    linear_mcp = BatchedMCPClient(server_id="claude_ai_Linear", batcher=mcp_batcher)
     if not linear_mcp.enabled:
         logger.info(
             "Linear MCP via claude CLI not available; Linear producer will "

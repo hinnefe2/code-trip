@@ -118,10 +118,18 @@ class ClaudeMCPClient:
         :class:`ClaudeMCPError` on subprocess failure, timeout, missing
         tool_result, or unparseable output.
         """
+        return await self.call_tool_id(f"mcp__{self.server_id}__{tool_name}", args)
+
+    async def call_tool_id(self, tool_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        """Same as :meth:`call_tool` but takes a fully-qualified tool id.
+
+        Used by the batch fallback path, where the server prefix comes
+        from the request rather than this client's ``server_id``.
+        """
         if not self._available:
             raise ClaudeMCPError("claude CLI not available")
 
-        tool_id = f"mcp__{self.server_id}__{tool_name}"
+        tool_name = tool_id.rsplit("__", 1)[-1]
         prompt = self._format_prompt(tool_name, args)
         # The prompt goes on stdin, not as a positional arg, because
         # ``--allowedTools`` is variadic (``<tools...>``) and will silently
@@ -353,92 +361,101 @@ class ClaudeMCPClient:
         return None
 
     def _parse_result_text(self, text: str) -> dict[str, Any]:
-        """Best-effort parse of the tool result string into a dict."""
-        text = text.strip()
-        if not text:
-            return {}
-        # Large tool results get diverted by claude --print to a file
-        # on disk; the tool_result content is then just a notice with
-        # the file path. Read the file ourselves so producers don't
-        # silently see "no results" when the real payload is huge.
-        recovered = self._recover_from_dumped_file(text)
-        if recovered is not None:
-            return recovered
-        # Direct JSON object/array.
-        try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError:
-            parsed = None
-        if isinstance(parsed, dict):
-            return parsed
-        if isinstance(parsed, list):
-            return {"items": parsed}
-        # Fish a JSON object out of stray prose.
-        m = re.search(r"\{.*\}", text, re.DOTALL)
-        if m:
-            try:
-                obj = json.loads(m.group(0))
-                if isinstance(obj, dict):
-                    return obj
-            except json.JSONDecodeError:
-                pass
-        # Last resort: return as opaque text.
-        return {"_raw": text}
-
-    # Sentinel claude --print emits when a tool result exceeds its
-    # per-tool token cap. The file is a JSON array of content blocks
-    # (``[{"type": "text", "text": "<actual payload>"}]``); the
-    # ``text`` field carries the real tool result as a JSON string.
-    _DUMPED_PATH_RE = re.compile(r"Output has been saved to (\S+\.txt)")
+        return parse_result_text(text)
 
     def _recover_from_dumped_file(self, text: str) -> dict[str, Any] | None:
-        """Read a dumped tool-result file when claude --print diverted it.
+        return _recover_from_dumped_file(text)
 
-        Returns the parsed payload, or ``None`` when the text doesn't
-        carry a dump-path sentinel (caller should fall back to its
-        normal parse path). Errors reading or parsing the file also
-        return ``None`` so the caller's default ``{"_raw": ...}``
-        still wins as a last resort.
-        """
-        m = self._DUMPED_PATH_RE.search(text)
-        if not m:
-            return None
-        path = m.group(1)
-        logger.info("claude --print diverted tool result to %s; reading", path)
+
+def parse_result_text(text: str) -> dict[str, Any]:
+    """Best-effort parse of the tool result string into a dict."""
+    text = text.strip()
+    if not text:
+        return {}
+    # Large tool results get diverted by claude --print to a file
+    # on disk; the tool_result content is then just a notice with
+    # the file path. Read the file ourselves so producers don't
+    # silently see "no results" when the real payload is huge.
+    recovered = _recover_from_dumped_file(text)
+    if recovered is not None:
+        return recovered
+    # Direct JSON object/array.
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, dict):
+        return parsed
+    if isinstance(parsed, list):
+        return {"items": parsed}
+    # Fish a JSON object out of stray prose.
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if m:
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                raw = f.read()
-        except OSError as exc:
-            logger.warning("Could not read diverted tool-result file %s: %s", path, exc)
-            return None
-        # The file is the standard MCP content-block list. Pull the
-        # text out of each block and join — usually there's just one.
-        try:
-            blocks = json.loads(raw)
+            obj = json.loads(m.group(0))
+            if isinstance(obj, dict):
+                return obj
         except json.JSONDecodeError:
-            logger.warning("Diverted file %s is not JSON; treating as opaque", path)
-            return {"_raw": raw}
-        parts: list[str] = []
-        if isinstance(blocks, list):
-            for b in blocks:
-                if isinstance(b, dict) and b.get("type") == "text":
-                    parts.append(str(b.get("text", "")))
-                elif isinstance(b, str):
-                    parts.append(b)
-        elif isinstance(blocks, dict):
-            return blocks
-        joined = "\n".join(p for p in parts if p)
-        if not joined:
-            return None
-        # Recurse on the recovered payload, but strip our sentinel-
-        # detection out of the recursion so a degenerate file that
-        # itself contains the sentinel can't loop forever.
-        try:
-            parsed = json.loads(joined)
-        except json.JSONDecodeError:
-            return {"_raw": joined}
-        if isinstance(parsed, dict):
-            return parsed
-        if isinstance(parsed, list):
-            return {"items": parsed}
+            pass
+    # Last resort: return as opaque text.
+    return {"_raw": text}
+
+
+# Sentinel claude --print emits when a tool result exceeds its
+# per-tool token cap. The file is a JSON array of content blocks
+# (``[{"type": "text", "text": "<actual payload>"}]``); the
+# ``text`` field carries the real tool result as a JSON string.
+_DUMPED_PATH_RE = re.compile(r"Output has been saved to (\S+\.txt)")
+
+
+def _recover_from_dumped_file(text: str) -> dict[str, Any] | None:
+    """Read a dumped tool-result file when claude --print diverted it.
+
+    Returns the parsed payload, or ``None`` when the text doesn't
+    carry a dump-path sentinel (caller should fall back to its
+    normal parse path). Errors reading or parsing the file also
+    return ``None`` so the caller's default ``{"_raw": ...}``
+    still wins as a last resort.
+    """
+    m = _DUMPED_PATH_RE.search(text)
+    if not m:
+        return None
+    path = m.group(1)
+    logger.info("claude --print diverted tool result to %s; reading", path)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = f.read()
+    except OSError as exc:
+        logger.warning("Could not read diverted tool-result file %s: %s", path, exc)
+        return None
+    # The file is the standard MCP content-block list. Pull the
+    # text out of each block and join — usually there's just one.
+    try:
+        blocks = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("Diverted file %s is not JSON; treating as opaque", path)
+        return {"_raw": raw}
+    parts: list[str] = []
+    if isinstance(blocks, list):
+        for b in blocks:
+            if isinstance(b, dict) and b.get("type") == "text":
+                parts.append(str(b.get("text", "")))
+            elif isinstance(b, str):
+                parts.append(b)
+    elif isinstance(blocks, dict):
+        return blocks
+    joined = "\n".join(p for p in parts if p)
+    if not joined:
+        return None
+    # Recurse on the recovered payload, but strip our sentinel-
+    # detection out of the recursion so a degenerate file that
+    # itself contains the sentinel can't loop forever.
+    try:
+        parsed = json.loads(joined)
+    except json.JSONDecodeError:
         return {"_raw": joined}
+    if isinstance(parsed, dict):
+        return parsed
+    if isinstance(parsed, list):
+        return {"items": parsed}
+    return {"_raw": joined}

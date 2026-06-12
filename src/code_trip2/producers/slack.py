@@ -32,7 +32,8 @@ import time
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Callable
 
-from code_trip2._async_utils import event_or_timeout
+from code_trip2 import config as config_mod
+from code_trip2._async_utils import event_or_timeout, next_tick_delay
 from code_trip2.config import Config
 from code_trip2.producers.claude_mcp import ClaudeMCPClient, ClaudeMCPError
 from code_trip2.slack_state import SlackState
@@ -225,15 +226,31 @@ class SlackProducer:
         # failure (auth blip, rate-limit, etc) should not permanently
         # disable the producer for the rest of the session — the task
         # stays alive and retries every poll interval.
+        while not config_mod.polling_active(self._config):
+            if await event_or_timeout(self._stop, 300.0):
+                return
         while not await self._setup_in_thread():
             if await event_or_timeout(self._stop, self._config.slack_poll_interval):
                 return
+        was_active = True
         while not self._stop.is_set():
-            try:
-                await self._poll_once()
-            except Exception:
-                logger.exception("SlackProducer poll failed")
-            if await event_or_timeout(self._stop, self._config.slack_poll_interval):
+            if config_mod.polling_active(self._config):
+                if not was_active:
+                    logger.info("SlackProducer: active hours resumed; polling")
+                    was_active = True
+                try:
+                    await self._poll_once()
+                except Exception:
+                    logger.exception("SlackProducer poll failed")
+            elif was_active:
+                logger.info("SlackProducer: outside active hours; polling paused")
+                was_active = False
+            # Sleep to the next wall-clock multiple of the interval so
+            # producers with compatible intervals fire at the same
+            # instant and the MCP batcher can coalesce their calls
+            # into one claude session.
+            delay = next_tick_delay(self._config.slack_poll_interval)
+            if await event_or_timeout(self._stop, delay):
                 return
 
     async def _setup_in_thread(self) -> bool:
@@ -454,6 +471,7 @@ class SlackProducer:
         threads, and the new-task branch isn't applicable here.
         """
         live = {STATE_PENDING, STATE_ACTIVE, STATE_SNOOZED}
+        refreshes = []
         for task in self._queue.all():
             if task.kind != "slack_msg" or task.state not in live:
                 continue
@@ -462,7 +480,12 @@ class SlackProducer:
             thread_ts = src.get("thread_ts") or ""
             if not channel_id or not thread_ts:
                 continue
-            await self._refresh_thread_task(task, channel_id, thread_ts)
+            refreshes.append(self._refresh_thread_task(task, channel_id, thread_ts))
+        if refreshes:
+            # Concurrent on purpose: each coroutine touches a distinct
+            # task, and firing them together lets the MCP batcher run
+            # all the slack_read_thread calls in one claude session.
+            await asyncio.gather(*refreshes)
 
     async def _refresh_thread_task(
         self, task: Task, channel_id: str, thread_ts: str,
