@@ -1,17 +1,16 @@
-"""Chord dispatch: NAV- and ACT-modifier combos trigger per-app actions.
+"""Chord dispatch: NAV- and ACT-modifier combos trigger actions.
 
-NAV-held chords drive the focused app:
+NAV-held chords drive the frontmost macOS app:
 
   - ``nav+yes`` — forward in the focused app's natural unit
   - ``nav+no``  — backward in the focused app's natural unit
   - ``nav+act`` — rotate to the next app in ``config.app_cycle``
   - ``nav+ptt`` — speak the frontmost app's name via TTS
 
-ACT-held chords act on the queue's cursor task (queue mode):
+ACT-held chords act on the queue's cursor task:
 
   - ``act+yes`` — per-kind "accept" (meeting_followup → Linear ticket)
-  - ``act+no``  — dismiss permanently (emails also archive); Ctrl+U in
-    focused mode
+  - ``act+no``  — dismiss permanently (emails also archive)
   - ``act+nav`` — open the task in its app (Gmail / Linear / Slack /
     the meeting-notes doc)
 
@@ -24,12 +23,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 from typing import TYPE_CHECKING
 
 from pynput import keyboard
 
-from code_trip2 import dispatch, earcon, modes, remote, window
+from code_trip2 import dispatch, earcon, modes, window
 from code_trip2.tts_client import TTSClientError
 from code_trip2.window import Chord, KeyStroke
 
@@ -38,9 +36,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
-_URL_RE = re.compile(r"https?://[^\s\)\]\}\"\'>`<]+")
-_URL_TRIM = ".,;:!?"
 _CHROME_APP = "Google Chrome"
 
 
@@ -79,24 +74,6 @@ APP_NAV: dict[str, tuple[KeyStroke, KeyStroke]] = {
 }
 
 
-# Solo taps that synthesize a keystroke into the focused app. NAV solo
-# tap is no longer in here — NAV now flips app-mode (see handle_tap).
-# ACT solo tap is also handled inline (stop playback / per-app handler).
-_TAP_YES = KeyStroke(chords=(Chord(key=keyboard.Key.enter),))
-_TAP_NO = KeyStroke(chords=(Chord(key=keyboard.Key.esc),))
-
-# Cmd+T = open new tab (focuses the URL bar by default in Chrome).
-_CHROME_NEW_TAB = KeyStroke(chords=(Chord(modifiers=(keyboard.Key.cmd,), key="t"),))
-
-# ACT+NO = Ctrl+U (clear line to start in shell / readline inputs).
-_ACT_NO_CLEAR_LINE = KeyStroke(chords=(Chord(modifiers=(keyboard.Key.ctrl,), key="u"),))
-
-TAP_STROKES: dict[str, KeyStroke] = {
-    "yes": _TAP_YES,
-    "no": _TAP_NO,
-}
-
-
 async def handle_chord(ctx: "Context", name: str) -> None:
     if name == "nav+yes":
         await _nav(ctx, forward=True)
@@ -107,33 +84,23 @@ async def handle_chord(ctx: "Context", name: str) -> None:
     elif name == "nav+ptt":
         await _speak_active_app(ctx)
     elif name == "act+no":
-        # ACT+NO is mode-dependent: in queue mode it dismisses the
-        # current task (the "permanent skip" the user reaches for when
-        # NO-tap-as-defer keeps re-surfacing the same message); for
-        # email tasks the dismissal also archives the Gmail thread. In
-        # focused mode it stays as Ctrl+U for shell input.
-        logger.info("Chord act+no fired in app_mode=%r", ctx.app_mode)
-        if ctx.app_mode == dispatch.MODE_QUEUE:
-            await dispatch.dismiss_current_task(ctx)
-        else:
-            await _send_stroke(ctx, _ACT_NO_CLEAR_LINE)
+        # ACT+NO dismisses the current task — the "permanent skip" the
+        # user reaches for when NO-tap-as-defer keeps re-surfacing the
+        # same message. For email tasks the dismissal also archives the
+        # Gmail thread.
+        await dispatch.dismiss_current_task(ctx)
     elif name == "act+yes":
-        # ACT+YES in queue mode is the "accept" action per kind. Only
-        # ``meeting_followup`` has one wired today (create a Linear
-        # backlog ticket assigned to the user); other kinds are a
-        # silent no-op. Open-in-app lives on ACT+NAV. No-op in
-        # focused mode.
-        if ctx.app_mode == dispatch.MODE_QUEUE:
-            task = ctx.current_task
-            if task is not None and task.kind == "meeting_followup":
-                await dispatch.create_linear_ticket_from_followup(ctx, task)
+        # ACT+YES is the per-kind "accept" action. Only ``meeting_followup``
+        # has one wired today (create a Linear backlog ticket assigned to
+        # the user); other kinds are a silent no-op. Open-in-app is ACT+NAV.
+        task = ctx.current_task
+        if task is not None and task.kind == "meeting_followup":
+            await dispatch.create_linear_ticket_from_followup(ctx, task)
     elif name == "act+nav":
-        # ACT+NAV in queue mode: open the active task in its app —
-        # email_msg → Gmail thread; linear_issue / slack_msg →
-        # source["url"]; meeting_followup → the meeting-notes doc.
-        # No-op in focused mode.
-        if ctx.app_mode == dispatch.MODE_QUEUE:
-            await _open_current_task_in_browser(ctx)
+        # ACT+NAV opens the active task in its app — email_msg → Gmail
+        # thread; linear_issue / slack_msg → source["url"];
+        # meeting_followup → the meeting-notes doc.
+        await _open_current_task_in_browser(ctx)
     else:
         logger.warning("Unknown chord: %s", name)
 
@@ -235,101 +202,36 @@ async def _keystroke_targets_tui_host(ctx: "Context") -> bool:
 async def handle_tap(ctx: "Context", name: str) -> None:
     """Dispatch a macropad solo tap.
 
-    Key bindings (post-revamp):
+    Key bindings:
 
-    - **NAV**: flip app-mode (queue ↔ focused). Mode-independent.
-    - **ACT**: stop TTS playback if speaking; otherwise per-app handler
-      (open URL in tmux, new tab in Chrome, etc).
-    - **YES/NO** in queue mode: drive the queue (accept/expand, skip).
-    - **YES/NO** in focused mode: synthesize Enter / Esc into the
-      focused app.
+    - **NAV**: no-op on its own — NAV is only meaningful as a held
+      modifier for the app-navigation chords.
+    - **ACT**: stop TTS playback if speaking; otherwise a no-op.
+    - **YES/NO**: drive the queue (submit the TUI input / skip task).
     - **PTT**: handled at the macropad layer, not here.
 
     Playback chunks auto-advance through ``_playback_loop``, so there's
-    no "next chunk" tap binding any more — ACT just stops playback
-    outright.
+    no "next chunk" tap binding — ACT just stops playback outright.
     """
-    # NAV solo: app-mode flip.
+    # NAV solo is inert; it only does anything held as a chord modifier.
     if name == "nav":
-        dispatch.flip_mode(ctx)
         return
 
-    # ACT solo: interrupt playback if speaking. Otherwise, if we're in
-    # focused mode, run the per-app handler (open URL / Cmd+T / etc).
-    # In queue mode with no playback it's a silent no-op — the user is
-    # away from the screen, so a focused-app keystroke would be wrong.
+    # ACT solo: interrupt playback if speaking, else nothing — the user
+    # is away from the screen, so there's no focused-app action to take.
     if name == "act":
         if modes.is_playback_active(ctx):
             modes.stop_playback(ctx)
-            return
-        if ctx.app_mode == dispatch.MODE_FOCUSED:
-            await _act_tap_app_aware(ctx)
         return
 
-    # Queue mode: YES/NO drive the queue rather than the focused app.
-    if ctx.app_mode == dispatch.MODE_QUEUE:
-        if name == "yes":
-            await dispatch.queue_yes_tap(ctx)
-            return
-        if name == "no":
-            await dispatch.queue_no_tap(ctx)
-            return
-
-    stroke = TAP_STROKES.get(name)
-    if stroke is None:
-        logger.warning("Unknown tap: %s", name)
+    if name == "yes":
+        await dispatch.queue_yes_tap(ctx)
         return
-    await _send_stroke(ctx, stroke)
-
-
-async def _act_tap_app_aware(ctx: "Context") -> bool:
-    """Per-app ACT-tap behavior. Returns True if handled (else no-op)."""
-    try:
-        app = await window.active_app()
-    except window.WindowError:
-        return False
-    if app in ctx.config.terminal_apps:
-        await _open_last_pane_url(ctx)
-        return True
-    if app == _CHROME_APP:
-        await _send_stroke(ctx, _CHROME_NEW_TAB)
-        return True
-    return False
-
-
-async def _open_last_pane_url(ctx: "Context") -> None:
-    """Capture the active tmux pane, find the most recent URL, open in Chrome."""
-    host, opts = ctx.ssh
-    try:
-        raw = await remote.capture(
-            host, opts, ctx.config.tmux_session, ctx.active_window, lines=200,
-        )
-    except remote.RemoteError as exc:
-        await _speak_error(ctx, f"Could not read pane: {exc}")
+    if name == "no":
+        await dispatch.queue_no_tap(ctx)
         return
-    text = _ANSI_RE.sub("", raw)
-    matches = _URL_RE.findall(text)
-    if not matches:
-        await _speak_error(ctx, "No URL in pane.")
-        return
-    url = matches[-1].rstrip(_URL_TRIM)
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "open", "-a", _CHROME_APP, url,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=5.0)
-        if proc.returncode != 0:
-            err = (stderr_b or b"").decode(errors="replace").strip()
-            raise RuntimeError(err or f"open exited {proc.returncode}")
-    except (asyncio.TimeoutError, OSError, RuntimeError) as exc:
-        await _speak_error(ctx, f"Could not open URL: {exc}")
-        return
-    try:
-        earcon.completion()
-    except earcon.EarconError:
-        pass
+
+    logger.warning("Unknown tap: %s", name)
 
 
 async def _nav(ctx: "Context", forward: bool) -> None:

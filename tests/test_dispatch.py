@@ -1,4 +1,4 @@
-"""Unit tests for dispatch.py: mode flip + queue-mode voice handlers."""
+"""Unit tests for dispatch.py: queue voice handlers + tap delegates."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from code_trip2.tasks import RecentTopics, Task, TaskQueue
 from conftest import make_mock_tts
 
 
-def _make_ctx(app_mode: str = "focused") -> modes.Context:
+def _make_ctx() -> modes.Context:
     """Build a Context wired up enough for dispatch tests.
 
     ``log`` and ``thinking`` are spec'd against the real classes so a
@@ -36,58 +36,42 @@ def _make_ctx(app_mode: str = "focused") -> modes.Context:
     )
     log = create_autospec(SessionLogger, instance=True)
     thinking = create_autospec(Thinking, instance=True)
-    ctx = modes.Context(
+    return modes.Context(
         config=cfg,  # type: ignore[arg-type]
         tts=tts,
         log=log,
         thinking=thinking,
     )
-    ctx.app_mode = app_mode
-    return ctx
 
 
-# --- mode flip --------------------------------------------------------------
-
-
-def test_flip_mode_toggles_and_plays_earcon_only():
-    """The two mode chimes are distinct enough to identify the mode by
-    ear; no spoken label is played on flip."""
-    ctx = _make_ctx(app_mode="focused")
-    with patch.object(dispatch, "earcon") as earcon_mock:
-        dispatch.flip_mode(ctx)
-    assert ctx.app_mode == "queue"
-    earcon_mock.mode_chime.assert_called_once_with("queue")
-    ctx.tts.speak.assert_not_called()
-
-    with patch.object(dispatch, "earcon") as earcon_mock:
-        dispatch.flip_mode(ctx)
-    assert ctx.app_mode == "focused"
-    earcon_mock.mode_chime.assert_called_once_with("focused")
-    ctx.tts.speak.assert_not_called()
-
-
-# --- queue-mode voice handling ----------------------------------------------
+# --- queue voice handling ---------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_handle_voice_focused_falls_through():
-    ctx = _make_ctx(app_mode="focused")
-    with patch.object(modes, "handle_focused_voice", new_callable=AsyncMock) as mocked:
-        await dispatch.handle_voice(ctx, "some transcript")
-    mocked.assert_awaited_once_with(ctx, "some transcript")
+async def test_handle_voice_empty_transcript_is_noop():
+    ctx = _make_ctx()
+    await dispatch.handle_voice(ctx, "   ")
+    ctx.tts.speak.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_queue_voice_status_speaks_mode():
-    ctx = _make_ctx(app_mode="queue")
-    ctx.active_window = "ticket-42"
+async def test_queue_voice_status_announces_count():
+    ctx = _make_ctx()
+    ctx.queue.add(Task(kind="claude_reply", topic="ticket-42", headline="ready"))
     await dispatch.handle_voice(ctx, "status")
-    ctx.tts.speak.assert_called_with("Queue mode. Window ticket-42.")
+    ctx.tts.speak.assert_called_with("1 pending. 1 claude reply.")
+
+
+@pytest.mark.asyncio
+async def test_queue_voice_unmatched_with_no_task_nudges():
+    ctx = _make_ctx()
+    await dispatch.handle_voice(ctx, "what is the meaning of life")
+    ctx.tts.speak.assert_called_with("Nothing active. Say next to pull a task.")
 
 
 @pytest.mark.asyncio
 async def test_queue_voice_next_announces_top_task():
-    ctx = _make_ctx(app_mode="queue")
+    ctx = _make_ctx()
     t = Task(kind="claude_reply", topic="ticket-42", headline="ready")
     ctx.queue.add(t)
     with patch.object(modes, "speak_chunked") as mocked:
@@ -98,14 +82,14 @@ async def test_queue_voice_next_announces_top_task():
 
 @pytest.mark.asyncio
 async def test_queue_voice_next_empty_speaks_empty():
-    ctx = _make_ctx(app_mode="queue")
+    ctx = _make_ctx()
     await dispatch.handle_voice(ctx, "next")
     ctx.tts.speak.assert_called_with("Queue is empty.")
 
 
 @pytest.mark.asyncio
 async def test_queue_voice_skip_defers_current():
-    ctx = _make_ctx(app_mode="queue")
+    ctx = _make_ctx()
     t = ctx.queue.add(Task(headline="x"))
     ctx.current_task = t
     ctx.queue.mark_active(t.id)
@@ -117,7 +101,7 @@ async def test_queue_voice_skip_defers_current():
 
 @pytest.mark.asyncio
 async def test_queue_voice_dismiss_marks_done():
-    ctx = _make_ctx(app_mode="queue")
+    ctx = _make_ctx()
     t = ctx.queue.add(Task(headline="x"))
     ctx.current_task = t
     await dispatch.handle_voice(ctx, "dismiss")
@@ -127,7 +111,7 @@ async def test_queue_voice_dismiss_marks_done():
 
 @pytest.mark.asyncio
 async def test_queue_voice_snooze_parses_seconds():
-    ctx = _make_ctx(app_mode="queue")
+    ctx = _make_ctx()
     t = ctx.queue.add(Task(headline="x"))
     ctx.current_task = t
     await dispatch.handle_voice(ctx, "snooze 30 seconds")
@@ -140,7 +124,7 @@ async def test_queue_voice_snooze_parses_seconds():
 
 @pytest.mark.asyncio
 async def test_queue_voice_add_manual_creates_note_task():
-    ctx = _make_ctx(app_mode="queue")
+    ctx = _make_ctx()
     await dispatch.handle_voice(ctx, "add a task call the doctor")
     pending = ctx.queue.pending()
     assert len(pending) == 1
@@ -154,7 +138,7 @@ async def test_queue_voice_add_manual_creates_note_task():
 @pytest.mark.asyncio
 async def test_queue_yes_tap_calls_submit_input():
     """YES in queue mode invokes ctx.submit_input."""
-    ctx = _make_ctx(app_mode="queue")
+    ctx = _make_ctx()
     submit = MagicMock(return_value=True)
     ctx.submit_input = submit
     await dispatch.queue_yes_tap(ctx)
@@ -164,7 +148,7 @@ async def test_queue_yes_tap_calls_submit_input():
 @pytest.mark.asyncio
 async def test_queue_yes_tap_without_submit_input_is_noop():
     """No TUI (e.g. headless OpenAI-STT mode) — YES tap is a no-op."""
-    ctx = _make_ctx(app_mode="queue")
+    ctx = _make_ctx()
     ctx.submit_input = None
     await dispatch.queue_yes_tap(ctx)  # no raise
 
@@ -172,7 +156,7 @@ async def test_queue_yes_tap_without_submit_input_is_noop():
 @pytest.mark.asyncio
 async def test_queue_yes_tap_swallows_submit_exceptions():
     """A submit_input that raises shouldn't crash the chord handler."""
-    ctx = _make_ctx(app_mode="queue")
+    ctx = _make_ctx()
     submit = MagicMock(side_effect=RuntimeError("widget gone"))
     ctx.submit_input = submit
     await dispatch.queue_yes_tap(ctx)  # no raise
@@ -180,7 +164,7 @@ async def test_queue_yes_tap_swallows_submit_exceptions():
 
 @pytest.mark.asyncio
 async def test_queue_no_tap_skips_current():
-    ctx = _make_ctx(app_mode="queue")
+    ctx = _make_ctx()
     t = ctx.queue.add(Task(headline="x"))
     ctx.current_task = t
     await dispatch.queue_no_tap(ctx)
@@ -190,7 +174,7 @@ async def test_queue_no_tap_skips_current():
 
 @pytest.mark.asyncio
 async def test_queue_no_tap_with_nothing_active_speaks():
-    ctx = _make_ctx(app_mode="queue")
+    ctx = _make_ctx()
     await dispatch.queue_no_tap(ctx)
     ctx.tts.speak.assert_called_with("Nothing active.")
 
@@ -199,7 +183,7 @@ async def test_queue_no_tap_with_nothing_active_speaks():
 async def test_dismiss_current_task_marks_done_and_stops_playback():
     """ACT+NO in queue mode: permanently drop the active task and
     interrupt any in-flight announcement."""
-    ctx = _make_ctx(app_mode="queue")
+    ctx = _make_ctx()
     t = ctx.queue.add(Task(headline="annoying msg"))
     ctx.current_task = t
     # Simulate active playback.
@@ -213,7 +197,7 @@ async def test_dismiss_current_task_marks_done_and_stops_playback():
 
 @pytest.mark.asyncio
 async def test_dismiss_current_task_with_nothing_active_speaks():
-    ctx = _make_ctx(app_mode="queue")
+    ctx = _make_ctx()
     await dispatch.dismiss_current_task(ctx)
     ctx.tts.speak.assert_called_with("Nothing active.")
 
@@ -222,7 +206,7 @@ async def test_dismiss_current_task_with_nothing_active_speaks():
 async def test_dismiss_advances_cursor_to_next_ranked_task():
     """ACT+NO mid-list: the cursor lands on the task below the
     dismissed one, not back at the top of the queue."""
-    ctx = _make_ctx(app_mode="queue")
+    ctx = _make_ctx()
     _a, b, c = _seed_three(ctx)
     ctx.current_task = b
     with patch.object(modes, "speak_chunked") as spoke:
@@ -234,7 +218,7 @@ async def test_dismiss_advances_cursor_to_next_ranked_task():
 
 @pytest.mark.asyncio
 async def test_dismiss_bottom_task_wraps_cursor_to_top():
-    ctx = _make_ctx(app_mode="queue")
+    ctx = _make_ctx()
     a, _b, c = _seed_three(ctx)
     ctx.current_task = c
     with patch.object(modes, "speak_chunked"):
@@ -247,7 +231,7 @@ async def test_dismiss_bottom_task_wraps_cursor_to_top():
 async def test_dismiss_only_task_leaves_cursor_empty():
     """No successor: cursor stays empty and the consumer's
     auto-announce owns the next move."""
-    ctx = _make_ctx(app_mode="queue")
+    ctx = _make_ctx()
     t = ctx.queue.add(Task(headline="only one"))
     ctx.current_task = t
     await dispatch.dismiss_current_task(ctx)
@@ -259,7 +243,7 @@ async def test_dismiss_only_task_leaves_cursor_empty():
 async def test_dismiss_advance_touches_recent_topics_like_announce_next():
     """The advance replaces an auto-announce, so it carries the same
     scheduler bookkeeping — unlike exploratory arrow navigation."""
-    ctx = _make_ctx(app_mode="queue")
+    ctx = _make_ctx()
     _a, b, c = _seed_three(ctx)
     ctx.current_task = b
     with patch.object(modes, "speak_chunked"):
@@ -283,7 +267,7 @@ def _seed_three(ctx) -> tuple[Task, Task, Task]:
 
 @pytest.mark.asyncio
 async def test_queue_navigate_down_from_idle_points_cursor_at_top():
-    ctx = _make_ctx(app_mode="queue")
+    ctx = _make_ctx()
     a, _b, _c = _seed_three(ctx)
     with patch.object(modes, "speak_chunked"):
         await dispatch.queue_navigate(ctx, direction=+1)
@@ -295,7 +279,7 @@ async def test_queue_navigate_down_from_idle_points_cursor_at_top():
 
 @pytest.mark.asyncio
 async def test_queue_navigate_up_from_idle_points_cursor_at_bottom():
-    ctx = _make_ctx(app_mode="queue")
+    ctx = _make_ctx()
     _a, _b, c = _seed_three(ctx)
     with patch.object(modes, "speak_chunked"):
         await dispatch.queue_navigate(ctx, direction=-1)
@@ -304,7 +288,7 @@ async def test_queue_navigate_up_from_idle_points_cursor_at_bottom():
 
 @pytest.mark.asyncio
 async def test_queue_navigate_down_moves_cursor_without_disturbing_queue():
-    ctx = _make_ctx(app_mode="queue")
+    ctx = _make_ctx()
     a, b, _c = _seed_three(ctx)
     ctx.current_task = a
     with patch.object(modes, "speak_chunked"):
@@ -319,7 +303,7 @@ async def test_queue_navigate_down_moves_cursor_without_disturbing_queue():
 
 @pytest.mark.asyncio
 async def test_queue_navigate_up_walks_backward():
-    ctx = _make_ctx(app_mode="queue")
+    ctx = _make_ctx()
     a, b, _c = _seed_three(ctx)
     ctx.current_task = b
     with patch.object(modes, "speak_chunked"):
@@ -329,7 +313,7 @@ async def test_queue_navigate_up_walks_backward():
 
 @pytest.mark.asyncio
 async def test_queue_navigate_wraps_at_end():
-    ctx = _make_ctx(app_mode="queue")
+    ctx = _make_ctx()
     a, _b, c = _seed_three(ctx)
     ctx.current_task = c
     with patch.object(modes, "speak_chunked"):
@@ -339,7 +323,7 @@ async def test_queue_navigate_wraps_at_end():
 
 @pytest.mark.asyncio
 async def test_queue_navigate_wraps_at_start():
-    ctx = _make_ctx(app_mode="queue")
+    ctx = _make_ctx()
     a, _b, c = _seed_three(ctx)
     ctx.current_task = a
     with patch.object(modes, "speak_chunked"):
@@ -349,7 +333,7 @@ async def test_queue_navigate_wraps_at_start():
 
 @pytest.mark.asyncio
 async def test_queue_navigate_on_empty_queue_speaks_empty():
-    ctx = _make_ctx(app_mode="queue")
+    ctx = _make_ctx()
     await dispatch.queue_navigate(ctx, direction=+1)
     ctx.tts.speak.assert_called_with("Queue is empty.")
     assert ctx.current_task is None
@@ -359,7 +343,7 @@ async def test_queue_navigate_on_empty_queue_speaks_empty():
 async def test_queue_navigate_does_not_touch_recent_topics():
     """Arrow browsing is exploratory — it shouldn't bias the scheduler
     the way an explicit voice ``next`` or skill engagement does."""
-    ctx = _make_ctx(app_mode="queue")
+    ctx = _make_ctx()
     _a, _b, _c = _seed_three(ctx)
     before = ctx.recent_topics.as_list()
     with patch.object(modes, "speak_chunked"):
@@ -373,7 +357,7 @@ async def test_queue_navigate_does_not_touch_recent_topics():
 
 @pytest.mark.asyncio
 async def test_handle_skill_invokes_agent_and_marks_task_done():
-    ctx = _make_ctx(app_mode="queue")
+    ctx = _make_ctx()
     mcp = create_autospec(ClaudeMCPClient, instance=True)
     mcp.enabled = True
     mcp.run_agent = AsyncMock(return_value="Accepted 'Lunch' and archived the email.")
@@ -403,7 +387,7 @@ async def test_handle_skill_invokes_agent_and_marks_task_done():
 
 @pytest.mark.asyncio
 async def test_handle_skill_with_no_active_task_speaks():
-    ctx = _make_ctx(app_mode="queue")
+    ctx = _make_ctx()
     ctx.agent_mcp = MagicMock(enabled=True)
     await dispatch.handle_skill(ctx, "do something")
     ctx.tts.speak.assert_called_with("Nothing active to act on.")
@@ -412,7 +396,7 @@ async def test_handle_skill_with_no_active_task_speaks():
 
 @pytest.mark.asyncio
 async def test_handle_skill_without_agent_mcp_speaks_error():
-    ctx = _make_ctx(app_mode="queue")
+    ctx = _make_ctx()
     ctx.agent_mcp = None
     t = ctx.queue.add(Task(headline="x"))
     ctx.current_task = t
@@ -423,7 +407,7 @@ async def test_handle_skill_without_agent_mcp_speaks_error():
 
 @pytest.mark.asyncio
 async def test_handle_skill_agent_error_keeps_task_active():
-    ctx = _make_ctx(app_mode="queue")
+    ctx = _make_ctx()
     mcp = create_autospec(ClaudeMCPClient, instance=True)
     mcp.enabled = True
     mcp.run_agent = AsyncMock(side_effect=RuntimeError("budget exceeded"))
@@ -449,7 +433,7 @@ async def test_handle_skill_writes_queue_turn_to_real_session_log(tmp_path):
     """
     from code_trip2.session_log import SessionLogger
     log = SessionLogger(tmp_path / "session.jsonl")
-    ctx = _make_ctx(app_mode="queue")
+    ctx = _make_ctx()
     ctx.log = log
     mcp = create_autospec(ClaudeMCPClient, instance=True)
     mcp.enabled = True
@@ -501,7 +485,7 @@ def test_kind_label_meeting_followup_with_no_context():
 
 def _followup_ctx(*, agent_reply: str | Exception = "Filed in AI: Draft doc."):
     """Context wired for the agent-driven follow-up filing path."""
-    ctx = _make_ctx(app_mode="queue")
+    ctx = _make_ctx()
     mcp = create_autospec(ClaudeMCPClient, instance=True)
     mcp.enabled = True
     if isinstance(agent_reply, Exception):

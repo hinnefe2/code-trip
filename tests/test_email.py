@@ -686,7 +686,6 @@ async def test_dismiss_email_task_archives_thread_and_marks_done():
     mcp = create_autospec(ClaudeMCPClient, instance=True)
     mcp.call_tool = AsyncMock()
     ctx = _ctx_with_email_mcp(mcp)
-    ctx.app_mode = dispatch.MODE_QUEUE
     task = Task(
         kind="email_msg",
         source={
@@ -715,7 +714,6 @@ async def test_dismiss_email_task_archives_thread_and_marks_done():
 async def test_dismiss_email_task_without_mcp_still_dismisses():
     """No Gmail MCP — ACT+NO must not get stuck; plain dismiss."""
     ctx = _ctx_with_email_mcp(mcp=None)
-    ctx.app_mode = dispatch.MODE_QUEUE
     task = Task(kind="email_msg", source={"thread_id": "T1"})
     ctx.queue.add(task)
     ctx.current_task = task
@@ -730,7 +728,6 @@ async def test_dismiss_email_task_without_thread_id_still_dismisses():
     mcp = create_autospec(ClaudeMCPClient, instance=True)
     mcp.call_tool = AsyncMock()
     ctx = _ctx_with_email_mcp(mcp)
-    ctx.app_mode = dispatch.MODE_QUEUE
     task = Task(kind="email_msg", source={"message_id": "M1"})
     ctx.queue.add(task)
     ctx.current_task = task
@@ -748,7 +745,6 @@ async def test_dismiss_email_task_advances_cursor_past_archive(monkeypatch):
     mcp = create_autospec(ClaudeMCPClient, instance=True)
     mcp.call_tool = AsyncMock()
     ctx = _ctx_with_email_mcp(mcp)
-    ctx.app_mode = dispatch.MODE_QUEUE
     base = _time.time() - 100
     first = Task(kind="email_msg", source={"thread_id": "T1"}, created_at=base)
     second = Task(kind="email_msg", source={"thread_id": "T2"}, created_at=base + 10)
@@ -769,7 +765,6 @@ async def test_dismiss_email_task_archive_error_returns_task_to_pending():
     mcp = create_autospec(ClaudeMCPClient, instance=True)
     mcp.call_tool = AsyncMock(side_effect=ClaudeMCPError("network down"))
     ctx = _ctx_with_email_mcp(mcp)
-    ctx.app_mode = dispatch.MODE_QUEUE
     task = Task(kind="email_msg", source={"thread_id": "T1", "sender_name": "Alice"})
     ctx.queue.add(task)
     ctx.current_task = task
@@ -795,7 +790,6 @@ async def test_dismiss_email_task_is_immediate_while_archive_in_flight():
     mcp = create_autospec(ClaudeMCPClient, instance=True)
     mcp.call_tool = AsyncMock(side_effect=slow_archive)
     ctx = _ctx_with_email_mcp(mcp)
-    ctx.app_mode = dispatch.MODE_QUEUE
     task = Task(kind="email_msg", source={"thread_id": "T1"})
     ctx.queue.add(task)
     ctx.current_task = task

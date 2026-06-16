@@ -187,7 +187,6 @@ async def main_async(config: Config, *, tui: bool = False, silent: bool = False)
         linear_mcp=linear_mcp,
         agent_mcp=agent_mcp,
         agent_allowed_tools=agent_allowed_tools,
-        app_mode=config.startup_mode if config.startup_mode in ("queue", "focused") else "focused",
     )
 
     # Task screener intake. Producers either call ``submit`` (= push

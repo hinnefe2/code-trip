@@ -1,22 +1,13 @@
-"""Top-level voice dispatch + the queue / focused-app mode flip.
+"""Top-level voice dispatch against the task queue.
 
-The orchestrator runs in one of two **app modes**:
+Voice operates against the task queue: globals are queue ops (next /
+skip / dismiss / snooze / what's in the queue), and PTT input with an
+active task dispatches against that task's ``kind`` (reply to Claude /
+Slack, draft or archive an email, comment on a Linear issue).
 
-- ``focused`` — today's behavior. Voice routes via ``modes.handle_focused_voice``
-  (its globals, voice phrases, and focused-app-aware dispatch).
-- ``queue`` — voice operates against the task queue. Globals are queue
-  ops (next / skip / dismiss / snooze / what's in the queue). PTT input
-  with an active task dispatches against that task's ``kind``.
-
-The flip is triggered by the ACT solo tap (see ``chords.handle_tap``).
-Each flip plays a distinct mode chime; the two chimes are tuned to
-sound clearly different so the direction of the flip is audible
-without a spoken label.
-
-Auto-announce: when in queue mode with no active task, a background
-consumer thread pulls the highest-scoring pending task and announces it.
-The consumer wakes on any queue mutation and on a short timer (for
-``ready_at`` tasks).
+Auto-announce: when there's no active task, a background consumer pulls
+the highest-scoring pending task and announces it. The consumer wakes
+on any queue mutation and on a short timer (for ``ready_at`` tasks).
 """
 
 from __future__ import annotations
@@ -38,41 +29,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# --- mode flip -------------------------------------------------------------
-
-
-MODE_QUEUE = "queue"
-MODE_FOCUSED = "focused"
-
-
-def flip_mode(ctx: "Context") -> None:
-    """Toggle between queue and focused app-modes.
-
-    Only an earcon is played — the two mode chimes are distinct enough
-    that a spoken label would be redundant and noisy.
-    """
-    new = MODE_QUEUE if ctx.app_mode != MODE_QUEUE else MODE_FOCUSED
-    ctx.app_mode = new
-    logger.info("App mode → %s", new)
-    try:
-        earcon.mode_chime(new)
-    except earcon.EarconError:
-        pass
-    ctx.log.event("app_mode", mode=new)
-
-
 # --- top-level voice -------------------------------------------------------
 
 
 async def handle_voice(ctx: "Context", transcript: str) -> None:
-    """Route a PTT transcript: queue mode first, else fall through to focused."""
+    """Route a PTT transcript against the task queue."""
     t = transcript.strip()
     if not t:
         return
-    if ctx.app_mode == MODE_QUEUE:
-        await _handle_queue_voice(ctx, t)
-    else:
-        await modes.handle_focused_voice(ctx, t)
+    await _handle_queue_voice(ctx, t)
 
 
 async def handle_skill(ctx: "Context", transcript: str) -> None:
@@ -180,7 +145,7 @@ async def _handle_queue_voice(ctx: "Context", t: str) -> None:
             await _speak(ctx, "Nothing to repeat.")
         return
     if low.startswith("status"):
-        await _speak(ctx, f"Queue mode. Window {ctx.active_window}.")
+        await _announce_count(ctx)
         return
 
     # Queue ops.
@@ -215,9 +180,10 @@ async def _handle_queue_voice(ctx: "Context", t: str) -> None:
         await _dispatch_task_response(ctx, ctx.current_task, t)
         return
 
-    # No active task: fall through to focused-mode voice phrases (window
-    # switching etc. is still useful from queue mode for setup).
-    await modes.handle_focused_voice(ctx, t)
+    # No command matched and nothing's active — there's nothing to act
+    # on. Nudge the user toward pulling a task rather than dropping the
+    # transcript silently.
+    await _speak(ctx, "Nothing active. Say next to pull a task.")
 
 
 # --- queue ops -------------------------------------------------------------
@@ -929,8 +895,6 @@ class QueueConsumer:
 
     async def _maybe_announce(self) -> None:
         ctx = self._ctx
-        if ctx.app_mode != MODE_QUEUE:
-            return
         if ctx.current_task is not None:
             return
         if modes.is_playback_active(ctx):

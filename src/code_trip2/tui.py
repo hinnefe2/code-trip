@@ -108,17 +108,13 @@ _STATE_COLOR = {
 
 
 def _header(ctx: "Context") -> Panel:
-    mode_color = "cyan" if ctx.app_mode == "queue" else "blue"
-    mode_str = Text(ctx.app_mode.upper(), style=f"bold {mode_color}")
     win_str = Text(ctx.active_window or "(no window)", style="white")
     summ_ok = ctx.summarizer is not None and ctx.summarizer.enabled
     summ_color = "green" if summ_ok else "yellow"
     summ_model = getattr(ctx.summarizer, "_model", "off") if summ_ok else "off"
     summ_str = Text(summ_model, style=summ_color)
     line = Text.assemble(
-        "mode ",
-        mode_str,
-        "   window ",
+        "window ",
         win_str,
         "   summarizer ",
         summ_str,
@@ -248,49 +244,32 @@ def _queue_table(ctx: "Context") -> Panel:
 
 
 def _keymap_panel(ctx: "Context") -> Panel:
-    """Mode-aware macropad reference, rendered as a grid.
+    """Macropad reference, rendered as a grid.
 
     Columns are the five physical keys; rows are the chord prefixes
     (none / NAV / ACT). Each cell shows what that key does under that
     prefix, or "—" when the combination is unbound (or is itself the
     held modifier).
 
-    - **Queue mode** (away from screen, audio-driven): solo YES/NO
-      drive the queue, ACT stops audio, NAV flips back to focused.
-      ``ACT+NO`` dismisses the current task. ``ACT+NO`` Ctrl+U is
-      omitted — it's purely a shell-input affordance.
-    - **Focused mode** (at the screen): solo YES/NO synthesize
-      Enter/Esc, ACT does per-app navigation, NAV flips to queue.
-      ``ACT+NO`` is the Ctrl+U "clear line" binding.
+    Solo YES/NO drive the queue, ACT stops audio, NAV alone is inert.
+    NAV-held chords navigate the frontmost macOS app; ACT-held chords
+    act on the cursor task (accept / dismiss / open-in-app).
     """
-    if ctx.app_mode == "queue":
-        bindings: dict[tuple[str | None, str], str] = {
-            (None, "TALK"): "hold to talk",
-            (None, "YES"): "submit (Enter)",
-            (None, "NO"): "skip task",
-            (None, "NAV"): "→ focused",
-            (None, "ACT"): "stop audio",
-            ("NAV", "TALK"): "speak app",
-            ("NAV", "YES"): "next",
-            ("NAV", "NO"): "prev",
-            ("NAV", "ACT"): "cycle app",
-            ("ACT", "TALK"): "skill mode",
-            ("ACT", "YES"): "open in app",
-            ("ACT", "NO"): "dismiss task",
-        }
-    else:
-        bindings = {
-            (None, "TALK"): "hold to talk",
-            (None, "YES"): "Enter",
-            (None, "NO"): "Esc",
-            (None, "NAV"): "→ queue",
-            (None, "ACT"): "per-app",
-            ("NAV", "TALK"): "speak app",
-            ("NAV", "YES"): "next",
-            ("NAV", "NO"): "prev",
-            ("NAV", "ACT"): "cycle app",
-            ("ACT", "NO"): "Ctrl+U (clear line)",
-        }
+    bindings: dict[tuple[str | None, str], str] = {
+        (None, "TALK"): "hold to talk",
+        (None, "YES"): "submit (Enter)",
+        (None, "NO"): "skip task",
+        (None, "NAV"): "—",
+        (None, "ACT"): "stop audio",
+        ("NAV", "TALK"): "speak app",
+        ("NAV", "YES"): "next",
+        ("NAV", "NO"): "prev",
+        ("NAV", "ACT"): "cycle app",
+        ("ACT", "TALK"): "skill mode",
+        ("ACT", "NAV"): "open in app",
+        ("ACT", "YES"): "accept",
+        ("ACT", "NO"): "dismiss task",
+    }
 
     columns = ("NAV", "ACT", "NO", "YES", "TALK")
     rows: tuple[str | None, ...] = (None, "NAV", "ACT")
@@ -592,15 +571,13 @@ class CodeTripApp(App):
         await self._queue_arrow(+1)
 
     async def _queue_arrow(self, direction: int) -> None:
-        """Forward up/down to dispatch.queue_navigate, queue-mode only.
+        """Forward up/down to dispatch.queue_navigate.
 
         Local import mirrors :meth:`_dispatch_transcript` — keeps tui
         importable in tests that stub the dispatch module.
         """
         from code_trip2 import dispatch
 
-        if self.ctx.app_mode != dispatch.MODE_QUEUE:
-            return
         await dispatch.queue_navigate(self.ctx, direction=direction)
 
     # --- thread-safe entry from the pynput listener -----------------------

@@ -27,7 +27,6 @@ from conftest import make_mock_tts
 
 def _make_ctx(
     *,
-    app_mode="queue",
     summarizer_enabled=False,
     autohandle_enabled=False,
     autohandle_kinds=(),
@@ -53,7 +52,6 @@ def _make_ctx(
         thinking=MagicMock(),
         summarizer=summarizer,
     )
-    ctx.app_mode = app_mode
     ctx.active_window = "ticket-42"
     return ctx
 
@@ -83,17 +81,15 @@ def test_truncate_handles_newlines_and_caps():
 # --- panel builders -------------------------------------------------------
 
 
-def test_header_renders_mode_and_window():
-    ctx = _make_ctx(app_mode="queue")
+def test_header_renders_window():
+    ctx = _make_ctx()
     out = _render(tui._header(ctx))
-    assert "QUEUE" in out
     assert "ticket-42" in out
 
 
-def test_header_focused_mode_shows_summarizer_model():
-    ctx = _make_ctx(app_mode="focused", summarizer_enabled=True)
+def test_header_shows_summarizer_model():
+    ctx = _make_ctx(summarizer_enabled=True)
     out = _render(tui._header(ctx))
-    assert "FOCUSED" in out
     assert "gpt-4o-mini" in out
 
 
@@ -290,38 +286,19 @@ def test_queue_table_marker_follows_cursor():
     assert "▶" not in top_line
 
 
-def test_keymap_queue_mode_shows_queue_relevant_keys():
-    ctx = _make_ctx(app_mode="queue")
+def test_keymap_shows_queue_relevant_keys():
+    ctx = _make_ctx()
     out = _render(tui._keymap_panel(ctx))
     assert "Macropad" in out
-    assert "submit" in out                 # YES = Enter / submit Input
+    assert "submit" in out                 # YES = submit Input
     assert "skip task" in out
-    assert "→ focused" in out
     assert "stop audio" in out
     assert "NAV+" in out
     assert "ACT+" in out
     assert "dismiss" in out
+    assert "open in app" in out
     assert "Ctrl+U" not in out
     assert "clear line" not in out
-
-
-def test_keymap_focused_mode_shows_full_chord_set():
-    ctx = _make_ctx(app_mode="focused")
-    out = _render(tui._keymap_panel(ctx))
-    assert "Macropad" in out
-    assert "Enter" in out
-    assert "Esc" in out
-    assert "→ queue" in out
-    assert "per-app" in out
-    assert "NAV+" in out
-    assert "ACT+" in out
-    assert "Ctrl+U" in out
-
-
-def test_keymap_panel_height_same_in_both_modes():
-    queue_ctx = _make_ctx(app_mode="queue")
-    focused_ctx = _make_ctx(app_mode="focused")
-    assert tui._keymap_panel_size(queue_ctx) == tui._keymap_panel_size(focused_ctx)
 
 
 def test_producers_panel_uses_supervisor_status():
@@ -546,18 +523,6 @@ async def test_send_stroke_fires_when_active_app_lookup_errors(monkeypatch):
     with patch("code_trip2.chords.window.send_keystroke", new_callable=AsyncMock) as send:
         await chords._send_stroke(ctx, _FAKE_STROKE)
     send.assert_awaited_once_with(_FAKE_STROKE)
-
-
-@pytest.mark.asyncio
-async def test_yes_tap_suppressed_in_focused_mode_when_tui_host_focused(monkeypatch):
-    """End-to-end: a YES tap in focused mode should not synthesize Enter
-    when the user is looking at the TUI host terminal."""
-    ctx = _stroke_ctx(tui_host_app="kitty")
-    ctx.app_mode = "focused"
-    monkeypatch.setattr("code_trip2.chords.window.active_app", AsyncMock(return_value="kitty"))
-    with patch("code_trip2.chords.window.send_keystroke", new_callable=AsyncMock) as send:
-        await chords.handle_tap(ctx, "yes")
-    send.assert_not_called()
 
 
 # --- CodeTripApp via Pilot ------------------------------------------------

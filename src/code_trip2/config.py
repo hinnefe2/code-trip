@@ -53,8 +53,6 @@ class Config:
     # summarizer (cloud LLM that turns raw Claude pane output into spoken text)
     summarizer_model: str = "gpt-4o-mini"
     summarizer_max_chars: int = 600
-    # task-queue
-    startup_mode: str = "focused"           # "queue" | "focused"
     # slack (via the claude.ai Slack MCP — auth piggy-backs on claude CLI)
     slack_poll_interval: float = 60.0
     # Channels to watch for *every* new message (not just @-mentions).
@@ -171,11 +169,6 @@ def load_config(path: Path | str) -> Config:
         kw["summarizer_model"] = summarizer["model"]
     if "max_chars" in summarizer:
         kw["summarizer_max_chars"] = summarizer["max_chars"]
-
-    # task queue
-    queue_cfg = data.get("queue", {})
-    if "startup_mode" in queue_cfg:
-        kw["startup_mode"] = queue_cfg["startup_mode"]
 
     slack_cfg = data.get("slack", {})
     if "poll_interval" in slack_cfg:

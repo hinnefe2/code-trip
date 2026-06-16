@@ -436,7 +436,7 @@ def _ctx(
         playback_queue=list(queue or []),
         ssh=(ssh_host, ssh_options),
         active_window=active_window,
-        app_mode="focused",
+        current_task=None,
     )
 
 
@@ -541,69 +541,73 @@ async def test_chord_ptt_speaks_active_app(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_tap_yes_sends_enter(monkeypatch):
+async def test_tap_yes_submits_queue_input(monkeypatch):
+    """YES tap always submits the TUI input via queue_yes_tap."""
+    from code_trip2 import dispatch
     ctx = _ctx()
+    submitted: list = []
+
+    async def fake_yes_tap(c):
+        submitted.append(c)
+
+    monkeypatch.setattr(dispatch, "queue_yes_tap", fake_yes_tap)
     sent: list[KeyStroke] = []
     monkeypatch.setattr(window, "send_keystroke", AsyncMock(side_effect=lambda s: sent.append(s)))
 
     await chords.handle_tap(ctx, "yes")
-    assert sent == [chords._TAP_YES]
-    assert sent[0].chords[0].key == keyboard.Key.enter
-
-
-@pytest.mark.asyncio
-async def test_tap_no_sends_escape(monkeypatch):
-    ctx = _ctx()
-    sent: list[KeyStroke] = []
-    monkeypatch.setattr(window, "send_keystroke", AsyncMock(side_effect=lambda s: sent.append(s)))
-
-    await chords.handle_tap(ctx, "no")
-    assert sent == [chords._TAP_NO]
-    assert sent[0].chords[0].key == keyboard.Key.esc
-
-
-# --- NAV solo tap: app-mode flip ----------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_tap_nav_flips_mode(monkeypatch):
-    """NAV solo tap toggles the app-mode (queue ↔ focused) regardless
-    of focused app or playback state."""
-    from code_trip2 import dispatch
-    ctx = _ctx()
-    ctx.app_mode = "focused"
-    sent: list[KeyStroke] = []
-    monkeypatch.setattr(window, "send_keystroke", AsyncMock(side_effect=lambda s: sent.append(s)))
-    flipped: list = []
-    monkeypatch.setattr(dispatch, "flip_mode", lambda c: flipped.append(c))
-
-    await chords.handle_tap(ctx, "nav")
-
-    assert flipped == [ctx]
+    assert submitted == [ctx]
     assert sent == []  # no synthesized keystroke
 
 
 @pytest.mark.asyncio
-async def test_tap_nav_during_playback_still_flips_mode(monkeypatch):
-    """The 'advance playback' meaning that used to live on NAV-during-
-    playback is gone — chunks auto-advance now, NAV is just mode flip."""
+async def test_tap_no_skips_task(monkeypatch):
+    """NO tap always skips the current task via queue_no_tap."""
+    from code_trip2 import dispatch
+    ctx = _ctx()
+    skipped: list = []
+
+    async def fake_no_tap(c):
+        skipped.append(c)
+
+    monkeypatch.setattr(dispatch, "queue_no_tap", fake_no_tap)
+    sent: list[KeyStroke] = []
+    monkeypatch.setattr(window, "send_keystroke", AsyncMock(side_effect=lambda s: sent.append(s)))
+
+    await chords.handle_tap(ctx, "no")
+    assert skipped == [ctx]
+    assert sent == []
+
+
+# --- NAV solo tap: inert -------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tap_nav_is_noop(monkeypatch):
+    """NAV solo tap does nothing — it's only meaningful held as a chord
+    modifier. No keystroke, no queue op, playback untouched."""
     from code_trip2 import dispatch
     ctx = _ctx(queue=["chunk a", "chunk b"])
-    flipped: list = []
-    monkeypatch.setattr(dispatch, "flip_mode", lambda c: flipped.append(c))
+    sent: list[KeyStroke] = []
+    monkeypatch.setattr(window, "send_keystroke", AsyncMock(side_effect=lambda s: sent.append(s)))
+    yes = AsyncMock()
+    no = AsyncMock()
+    monkeypatch.setattr(dispatch, "queue_yes_tap", yes)
+    monkeypatch.setattr(dispatch, "queue_no_tap", no)
 
     await chords.handle_tap(ctx, "nav")
 
-    assert flipped == [ctx]
+    assert sent == []
     ctx.tts.stop.assert_not_called()
+    yes.assert_not_called()
+    no.assert_not_called()
 
 
-# --- ACT solo tap: stop audio / per-app handler -------------------------
+# --- ACT solo tap: stop audio -------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_tap_act_during_playback_stops_audio(monkeypatch):
-    """In any mode, ACT-tap while TTS is speaking interrupts playback."""
+    """ACT-tap while TTS is speaking interrupts playback."""
     ctx = _ctx(queue=["chunk a"])  # playback_queue non-empty → is_playing
     monkeypatch.setattr(window, "active_app", AsyncMock(return_value="kitty"))
 
@@ -613,11 +617,9 @@ async def test_tap_act_during_playback_stops_audio(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_tap_act_in_queue_mode_no_playback_is_noop(monkeypatch):
-    """User is away from the screen, no audio playing — ACT does nothing
-    rather than firing focused-app behavior."""
+async def test_tap_act_no_playback_is_noop(monkeypatch):
+    """No audio playing — ACT does nothing (no focused-app behavior)."""
     ctx = _ctx()
-    ctx.app_mode = "queue"
     sent: list[KeyStroke] = []
     monkeypatch.setattr(window, "send_keystroke", AsyncMock(side_effect=lambda s: sent.append(s)))
     opened = _patch_open_subprocess(monkeypatch)
@@ -630,105 +632,11 @@ async def test_tap_act_in_queue_mode_no_playback_is_noop(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_tap_act_in_focused_mode_chrome_opens_new_tab(monkeypatch):
-    ctx = _ctx()
-    ctx.app_mode = "focused"
-    sent: list[KeyStroke] = []
-    monkeypatch.setattr(window, "active_app", AsyncMock(return_value="Google Chrome"))
-    monkeypatch.setattr(window, "send_keystroke", AsyncMock(side_effect=lambda s: sent.append(s)))
-
-    await chords.handle_tap(ctx, "act")
-
-    assert sent == [chords._CHROME_NEW_TAB]
-    assert sent[0].chords[0].key == "t"
-    assert sent[0].chords[0].modifiers == (keyboard.Key.cmd,)
-
-
-@pytest.mark.asyncio
-async def test_tap_act_in_focused_mode_terminal_opens_last_pane_url(monkeypatch):
-    ctx = _ctx()
-    ctx.app_mode = "focused"
-    monkeypatch.setattr(window, "active_app", AsyncMock(return_value="kitty"))
-    pane = (
-        "Earlier output https://old.example.com/x referenced.\n"
-        "Final URL is https://github.com/owner/repo/pull/42 here.\n"
-        ">\n"
-    )
-    monkeypatch.setattr(chords.remote, "capture", AsyncMock(return_value=pane))
-    opened = _patch_open_subprocess(monkeypatch)
-    monkeypatch.setattr(chords.earcon, "completion", lambda: None)
-
-    await chords.handle_tap(ctx, "act")
-
-    assert opened == [["open", "-a", "Google Chrome", "https://github.com/owner/repo/pull/42"]]
-
-
-@pytest.mark.asyncio
-async def test_tap_act_in_focused_mode_terminal_strips_trailing_punctuation(monkeypatch):
-    ctx = _ctx()
-    ctx.app_mode = "focused"
-    monkeypatch.setattr(window, "active_app", AsyncMock(return_value="kitty"))
-    monkeypatch.setattr(
-        chords.remote, "capture", AsyncMock(return_value="see https://example.com/path."),
-    )
-    opened = _patch_open_subprocess(monkeypatch)
-    monkeypatch.setattr(chords.earcon, "completion", lambda: None)
-
-    await chords.handle_tap(ctx, "act")
-
-    assert opened[0][-1] == "https://example.com/path"
-
-
-@pytest.mark.asyncio
-async def test_tap_act_in_focused_mode_terminal_no_url_speaks_error(monkeypatch):
-    ctx = _ctx()
-    ctx.app_mode = "focused"
-    monkeypatch.setattr(window, "active_app", AsyncMock(return_value="kitty"))
-    monkeypatch.setattr(chords.remote, "capture", AsyncMock(return_value="no urls here"))
-    monkeypatch.setattr(chords.earcon, "error", lambda: None)
-
-    await chords.handle_tap(ctx, "act")
-
-    ctx.tts.speak.assert_called_once()
-    assert "url" in ctx.tts.speak.call_args.args[0].lower()
-
-
-@pytest.mark.asyncio
-async def test_tap_act_in_focused_mode_in_other_app_is_silent(monkeypatch):
-    """Frontmost app isn't terminal or Chrome and there's no playback;
-    ACT is a silent no-op (no Down arrow fallback any more)."""
-    ctx = _ctx()
-    ctx.app_mode = "focused"
-    sent: list[KeyStroke] = []
-    monkeypatch.setattr(window, "active_app", AsyncMock(return_value="TextEdit"))
-    monkeypatch.setattr(window, "send_keystroke", AsyncMock(side_effect=lambda s: sent.append(s)))
-
-    await chords.handle_tap(ctx, "act")
-
-    assert sent == []
-
-
-@pytest.mark.asyncio
-async def test_chord_act_no_in_focused_mode_sends_ctrl_u(monkeypatch):
-    ctx = _ctx()
-    ctx.app_mode = "focused"
-    sent: list[KeyStroke] = []
-    monkeypatch.setattr(window, "send_keystroke", AsyncMock(side_effect=lambda s: sent.append(s)))
-
-    await chords.handle_chord(ctx, "act+no")
-    assert sent == [chords._ACT_NO_CLEAR_LINE]
-    stroke = sent[0].chords[0]
-    assert stroke.key == "u"
-    assert stroke.modifiers == (keyboard.Key.ctrl,)
-
-
-@pytest.mark.asyncio
-async def test_chord_act_no_in_queue_mode_dismisses_task(monkeypatch):
-    """ACT+NO in queue mode dismisses the current task (mark done) —
-    the 'permanent' counterpart to NO-tap's 5-min defer."""
+async def test_chord_act_no_dismisses_task(monkeypatch):
+    """ACT+NO dismisses the current task (mark done) — the 'permanent'
+    counterpart to NO-tap's 5-min defer."""
     from code_trip2 import dispatch
     ctx = _ctx()
-    ctx.app_mode = "queue"
     dismissed: list = []
 
     async def fake_dismiss(c):
@@ -741,7 +649,7 @@ async def test_chord_act_no_in_queue_mode_dismisses_task(monkeypatch):
     await chords.handle_chord(ctx, "act+no")
 
     assert dismissed == [ctx]
-    assert sent == []  # no Ctrl+U leaking into the focused app
+    assert sent == []
 
 
 # --- act+nav (open in app) -------------------------------------------
@@ -764,7 +672,6 @@ async def test_chord_act_nav_queue_mode_opens_gmail_thread(monkeypatch):
     opened = _patch_open_subprocess(monkeypatch)
     monkeypatch.setattr(chords.earcon, "completion", lambda: None)
     ctx = _ctx()
-    ctx.app_mode = "queue"
     ctx.current_task = _email_task(thread_id="THR456")
 
     await chords.handle_chord(ctx, "act+nav")
@@ -782,7 +689,6 @@ async def test_chord_act_nav_no_active_task_speaks_error(monkeypatch):
     opened = _patch_open_subprocess(monkeypatch)
     monkeypatch.setattr(chords.earcon, "error", lambda: None)
     ctx = _ctx()
-    ctx.app_mode = "queue"
     ctx.current_task = None
 
     await chords.handle_chord(ctx, "act+nav")
@@ -799,7 +705,6 @@ async def test_chord_act_nav_non_email_task_speaks_error(monkeypatch):
     opened = _patch_open_subprocess(monkeypatch)
     monkeypatch.setattr(chords.earcon, "error", lambda: None)
     ctx = _ctx()
-    ctx.app_mode = "queue"
     ctx.current_task = Task(kind="slack_msg", topic="general", headline="hi")
 
     await chords.handle_chord(ctx, "act+nav")
@@ -814,27 +719,12 @@ async def test_chord_act_nav_missing_thread_id_speaks_error(monkeypatch):
     opened = _patch_open_subprocess(monkeypatch)
     monkeypatch.setattr(chords.earcon, "error", lambda: None)
     ctx = _ctx()
-    ctx.app_mode = "queue"
     ctx.current_task = _email_task(thread_id="")
 
     await chords.handle_chord(ctx, "act+nav")
 
     assert opened == []
     ctx.tts.speak.assert_called_once()
-
-
-@pytest.mark.asyncio
-async def test_chord_act_nav_in_focused_mode_is_noop(monkeypatch):
-    """Focused mode has no active-task concept — chord is silently inert."""
-    opened = _patch_open_subprocess(monkeypatch)
-    ctx = _ctx()
-    ctx.app_mode = "focused"
-    ctx.current_task = _email_task()
-
-    await chords.handle_chord(ctx, "act+nav")
-
-    assert opened == []
-    ctx.tts.speak.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -850,7 +740,6 @@ async def test_chord_act_nav_open_subprocess_failure_speaks_error(monkeypatch):
 
     monkeypatch.setattr(chords.asyncio, "create_subprocess_exec", fail_exec)
     ctx = _ctx()
-    ctx.app_mode = "queue"
     ctx.current_task = _email_task()
 
     await chords.handle_chord(ctx, "act+nav")
@@ -871,7 +760,6 @@ async def test_chord_act_nav_slack_opens_permalink_in_chrome(monkeypatch):
     opened = _patch_open_subprocess(monkeypatch)
     monkeypatch.setattr(chords.earcon, "completion", lambda: None)
     ctx = _ctx()
-    ctx.app_mode = "queue"
     permalink = (
         "https://picnichealth.slack.com/archives/C09019R7RK2/p1779911327920139"
         "?thread_ts=1779906646.864539&cid=C09019R7RK2"
@@ -896,7 +784,6 @@ async def test_chord_act_nav_linear_goes_to_chrome(monkeypatch):
     opened = _patch_open_subprocess(monkeypatch)
     monkeypatch.setattr(chords.earcon, "completion", lambda: None)
     ctx = _ctx()
-    ctx.app_mode = "queue"
     url = "https://linear.app/picnichealth/issue/AI-7/help"
     ctx.current_task = Task(
         kind="linear_issue",
@@ -952,7 +839,6 @@ async def test_chord_act_yes_on_meeting_followup_routes_to_linear_create(monkeyp
     )
 
     ctx = _ctx()
-    ctx.app_mode = "queue"
     ctx.current_task = Task(
         kind="meeting_followup", topic="planning-sync", headline="Draft doc",
     )
@@ -977,7 +863,6 @@ async def test_chord_act_yes_on_email_is_silent_noop(monkeypatch):
     )
 
     ctx = _ctx()
-    ctx.app_mode = "queue"
     ctx.current_task = _email_task(thread_id="THR789")
 
     await chords.handle_chord(ctx, "act+yes")
@@ -999,7 +884,6 @@ async def test_chord_act_nav_meeting_followup_opens_notes_doc(monkeypatch):
     opened = _patch_open_subprocess(monkeypatch)
     monkeypatch.setattr(chords.earcon, "completion", lambda: None)
     ctx = _ctx()
-    ctx.app_mode = "queue"
     doc = "https://docs.google.com/document/d/abc123/edit"
     ctx.current_task = Task(
         kind="meeting_followup",
@@ -1022,7 +906,6 @@ async def test_chord_act_nav_meeting_followup_falls_back_to_gmail_thread(monkeyp
     opened = _patch_open_subprocess(monkeypatch)
     monkeypatch.setattr(chords.earcon, "completion", lambda: None)
     ctx = _ctx()
-    ctx.app_mode = "queue"
     ctx.current_task = Task(
         kind="meeting_followup",
         topic="planning-sync",
@@ -1045,7 +928,6 @@ async def test_chord_act_nav_meeting_followup_without_any_url_speaks_error(monke
     opened = _patch_open_subprocess(monkeypatch)
     monkeypatch.setattr(chords.earcon, "error", lambda: None)
     ctx = _ctx()
-    ctx.app_mode = "queue"
     ctx.current_task = Task(
         kind="meeting_followup", topic="x", headline="y", source={"meeting": "M"},
     )
