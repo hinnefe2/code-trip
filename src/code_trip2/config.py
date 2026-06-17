@@ -83,6 +83,11 @@ class Config:
     poll_start_hour: int = 7
     poll_end_hour: int = 19
     mcp_batch_window: float = 2.0
+    # Runtime override (the ``--after-hours`` CLI flag): when true, the
+    # active-hours window is ignored and producers poll around the
+    # clock. Not a TOML key — set per-run so late-night work gets picked
+    # up without permanently disabling the overnight cost saving.
+    poll_ignore_active_hours: bool = False
     # autohandle: skill-driven silent handling of producer tasks. When
     # enabled, every task a producer emits is screened against the
     # auto-handle-eligible skills in ``.claude/skills/`` before it
@@ -224,6 +229,8 @@ def polling_active(cfg, now: "datetime | None" = None) -> bool:
     crashing or going time-dependent. Handles windows that cross
     midnight (start > end); equal hours disable the window entirely.
     """
+    if getattr(cfg, "poll_ignore_active_hours", False):
+        return True
     start = getattr(cfg, "poll_start_hour", None)
     end = getattr(cfg, "poll_end_hour", None)
     if start is None or end is None or start == end:

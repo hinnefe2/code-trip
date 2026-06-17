@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import faulthandler
 import logging
 import signal
@@ -477,6 +478,15 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Disable all audio output (TTS speech + earcon beeps).",
     )
+    parser.add_argument(
+        "--after-hours",
+        action="store_true",
+        help=(
+            "Ignore the [poll] active-hours window and poll around the "
+            "clock. Use for late-night work that would otherwise wait "
+            "until the window reopens."
+        ),
+    )
     args = parser.parse_args(argv)
 
     if args.tui:
@@ -515,6 +525,8 @@ def main(argv: list[str] | None = None) -> int:
         pass
 
     config = load_config(args.config)
+    if args.after_hours:
+        config = dataclasses.replace(config, poll_ignore_active_hours=True)
     run(config, tui=args.tui, silent=args.silent)
     return 0
 
