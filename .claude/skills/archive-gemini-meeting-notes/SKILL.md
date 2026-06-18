@@ -6,6 +6,8 @@ auto-handle-kinds:
   - email_msg
 allowed-tools:
   - mcp__claude_ai_Gmail__unlabel_thread
+last-updated-by: Henry Hinnefeld
+last-updated-date: 2026-06-11
 ---
 
 # Archive Gemini meeting-notes email

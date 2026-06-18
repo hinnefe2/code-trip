@@ -4,6 +4,8 @@ description: Pick this skill ONLY when source.messages shows that Henry (the use
 dismiss: true
 dismiss-kinds:
   - slack_msg
+last-updated-by: Henry Hinnefeld
+last-updated-date: 2026-06-11
 ---
 
 # Mark a Slack thread done because Henry has wrapped it

@@ -6,6 +6,8 @@ auto-handle-kinds:
   - linear_issue
 allowed-tools:
   - Bash
+last-updated-by: Henry Hinnefeld
+last-updated-date: 2026-06-11
 ---
 
 # Trigger the remote /do-ticket skill for a "Todo" Linear ticket

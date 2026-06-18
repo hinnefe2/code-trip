@@ -6,6 +6,8 @@ allowed-tools:
   - mcp__claude_ai_Linear__list_teams
   - mcp__claude_ai_Linear__list_projects
   - mcp__claude_ai_Linear__save_issue
+last-updated-by: Henry Hinnefeld
+last-updated-date: 2026-06-11
 ---
 
 # File a meeting follow-up as a Linear backlog ticket

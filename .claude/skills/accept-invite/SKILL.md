@@ -9,6 +9,8 @@ allowed-tools:
   - mcp__claude_ai_Google_Calendar__respond_to_event
   - mcp__claude_ai_Gmail__get_thread
   - mcp__claude_ai_Gmail__unlabel_thread
+last-updated-by: Henry Hinnefeld
+last-updated-date: 2026-06-11
 ---
 
 # Handle calendar auto-email
