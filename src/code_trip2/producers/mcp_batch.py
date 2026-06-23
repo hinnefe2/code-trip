@@ -188,6 +188,23 @@ class MCPBatcher:
                     p.future.set_exception(
                         ClaudeMCPError(f"batch execution crashed: {exc}")
                     )
+        finally:
+            # Calls that arrived while ``_execute`` was in flight piled up
+            # in ``_pending`` with no flush scheduled (``call_tool`` only
+            # arms a new task when the current one is done, and we — the
+            # current task — are still running here). Without this re-arm
+            # they'd hang until the next unrelated ``call_tool``: invisible
+            # for producers (the next poll tick sweeps them up) but a
+            # fire-and-forget background archive at the tail of a rapid
+            # ACT+NO sweep would sit in the inbox for a full poll interval,
+            # looking like archiving is broken. Overwriting ``_flush_task``
+            # with the successor is safe — this task is about to return, so
+            # a concurrent ``call_tool`` correctly sees a live (not-done)
+            # task and won't double-schedule.
+            if self._pending:
+                self._flush_task = asyncio.create_task(
+                    self._flush_after_window(), name="mcp-batch-flush",
+                )
 
     async def _execute(self, batch: list[_Pending]) -> None:
         if len(batch) == 1:

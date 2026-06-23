@@ -266,6 +266,50 @@ async def test_batch_prompt_lists_every_call_with_exact_args(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_call_enqueued_during_inflight_batch_still_flushes(monkeypatch):
+    """A call that arrives while a batch is mid-execution must still get
+    flushed, without waiting for an unrelated later ``call_tool`` to
+    re-arm the timer. Regression: fire-and-forget background archives at
+    the tail of a rapid ACT+NO sweep would otherwise hang in ``_pending``
+    for a full poll interval, looking like archiving was broken.
+    """
+    b = MCPBatcher(window_s=0.01)
+    b._client._available = True
+    gate = asyncio.Event()
+    n = {"count": 0}
+
+    async def fake_run(cmd, *, input_, timeout, what):
+        n["count"] += 1
+        if n["count"] == 1:
+            # First (A's) batch hangs in flight until released, giving the
+            # test a window to enqueue B with no other caller behind it.
+            await gate.wait()
+            return (_stream(
+                _tool_use_event("u1", "list_issues", {"k": "A"}),
+                _tool_result_event("u1", {"r": "A"}),
+            ), "", 0)
+        return (_stream(
+            _tool_use_event("u2", "list_issues", {"k": "B"}),
+            _tool_result_event("u2", {"r": "B"}),
+        ), "", 0)
+
+    monkeypatch.setattr(mb, "_run_subprocess", fake_run)
+    monkeypatch.setattr(cm, "_run_subprocess", fake_run)
+    linear = BatchedMCPClient(server_id="claude_ai_Linear", batcher=b)
+
+    task_a = asyncio.create_task(linear.call_tool("list_issues", {"k": "A"}))
+    await asyncio.sleep(0.05)  # flush fires; A's _execute now blocked on gate
+    task_b = asyncio.create_task(linear.call_tool("list_issues", {"k": "B"}))
+    await asyncio.sleep(0.05)  # B parks in _pending — no further call_tool comes
+    gate.set()
+
+    r_a = await asyncio.wait_for(task_a, timeout=1.0)
+    r_b = await asyncio.wait_for(task_b, timeout=1.0)  # resolves via re-arm
+    assert r_a == {"r": "A"}
+    assert r_b == {"r": "B"}
+
+
+@pytest.mark.asyncio
 async def test_disabled_batcher_raises(monkeypatch):
     b = MCPBatcher()
     b._client._available = False
