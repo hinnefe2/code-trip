@@ -1,26 +1,25 @@
 ---
 name: archive-vendor-updates
-description: Archive mass marketing-style emails from vendors / SaaS companies / services the user uses — feature announcements ("Introducing X", "What's new in Y"), product newsletters and digests, webinar / virtual-event invitations, "tips and tricks" / how-to-use-our-product emails, sales/promotional offers, release notes broadcasts. These emails are sent to many recipients, have no personalized content, and typically come from a `noreply@`, `marketing@`, `news@`, `updates@`, `team@`, `hello@`, or similar bulk sender. SKIP (so the user sees it) ANY of: a personal email from a real human at a vendor (sales rep, support engineer, founder reaching out individually), an account / billing / security notification (password reset, MFA prompt, login alert, payment receipt, invoice, subscription change, usage warning, security advisory the user must act on), a calendar invitation (those go to accept-invite), a delivery receipt or shipping notification, a thread the user has been replying in, an email addressed only to the user with content that responds to something the user did. When unsure whether an email is bulk marketing or an actionable account notice, forward.
+description: Archive mass marketing-style emails AND unsolicited cold sales outreach. Two archive cases. (1) Bulk product-update / marketing email from a vendor or service — feature announcements ("Introducing X", "What's new in Y"), product newsletters and digests, webinar / virtual-event invitations, "tips and tricks" / how-to emails, sales / promotional offers, release-notes broadcasts — typically sent to many recipients with no personalized content, from a `noreply@`, `marketing@`, `news@`, `updates@`, `team@`, `hello@`, or similar bulk sender. (2) Cold B2B sales / prospecting outreach pitching a product, tool, or service — even when sent from a person-named address (e.g. `shane@vendor.ai`) and addressed to the user by name — when it reads as a generic template with a sales call-to-action (book a demo, hop on a call, start a trial, reply to learn more) and makes no reference to the user's actual projects or any prior relationship. SKIP (so the user sees it) ANY of: a genuine personalized human email that references the user's specific work / company by real detail, continues an existing relationship or thread, is a warm introduction, or responds to something the user actually did; an account / billing / security notification (password reset, MFA prompt, login alert, payment receipt, invoice, subscription change, usage warning, security advisory the user must act on); a calendar invitation (those go to accept-invite); a delivery receipt or shipping notification; a thread the user has been replying in. The tell for cold-sales-vs-genuine is specificity: a pitch that would read identically to a thousand other recipients is cold outreach (archive); a note that only makes sense sent to THIS user is genuine (forward). When unsure, forward.
 auto-handle: true
 auto-handle-kinds:
   - email_msg
 allowed-tools:
   - mcp__claude_ai_Gmail__unlabel_thread
 last-updated-by: Henry Hinnefeld
-last-updated-date: 2026-06-11
+last-updated-date: 2026-06-24
 ---
 
-# Archive vendor update / marketing email
+# Archive vendor update / marketing / cold-sales email
 
-You're being invoked on an email task that looks like a mass marketing or product-update email from a vendor. Archive it.
+You're being invoked on an email task that looks like either a mass marketing / product-update email or an unsolicited cold sales pitch. Archive it.
 
-1. **Sanity-check the body.** Confirm:
-   - Sender address looks like a bulk / no-reply sender (e.g. `noreply@`, `marketing@`, `news@`, `updates@`, `team@`, `hello@`, `community@`, `events@`, `info@`).
-   - Body has the shape of broadcast content: a product / feature announcement, a webinar or event invitation, a newsletter digest, a "tips and tricks" / how-to email, a sales / promotional offer, a release-notes broadcast.
-   - The email is clearly sent to many recipients — no personalized references to the user's specific work, no question for the user, no requested action with a deadline.
+1. **Confirm it's one of the two archive shapes.** Either:
+   - **Bulk marketing / product update:** from a bulk sender (`noreply@`, `marketing@`, `news@`, `updates@`, `team@`, `hello@`, `community@`, `events@`, `info@`), with broadcast content — a product / feature announcement, a webinar or event invitation, a newsletter digest, a "tips and tricks" / how-to email, a sales / promotional offer, a release-notes broadcast — clearly sent to many recipients with no personalized reference to the user's specific work.
+   - **Cold sales / prospecting outreach:** an unsolicited pitch for a product, tool, or service — even from a person-named address (e.g. `shane@vendor.ai`) and even addressed "Hi <Name>," — that reads as a generic template, references nothing about the user's actual projects or any prior relationship, and pushes a sales call-to-action (book a demo, hop on a call, start a trial, reply to learn more).
 
    STOP and do not archive if you see ANY of:
-   - A personal email from a real human (sales rep, support engineer, founder, account manager, etc.) — even if hosted on a vendor's domain. Look for first-person voice, a specific reference to the user, and a real reply-to address.
+   - A **genuine personal email** from a real human that references the user's specific work / company situation by real detail, continues an existing relationship or thread, is a warm introduction, or responds to something the user actually did. The tell for cold-sales-vs-genuine is **specificity**: a generic pitch that would read identically to a thousand other recipients is cold outreach (archive); a note that only makes sense sent to *this* user is genuine (skip). When the two are genuinely hard to tell apart, skip.
    - An account / billing / security notification: password reset, MFA prompt, login from a new device, payment receipt, invoice, subscription change, plan upgrade required, usage limit warning, security advisory the user must act on.
    - A calendar invitation (subject `Invitation:` + body `You have been invited by`). Forward — accept-invite handles those.
    - A shipping notification, delivery receipt, or order status update.
@@ -30,7 +29,7 @@ You're being invoked on an email task that looks like a mass marketing or produc
 
 2. **Archive the email.** Use `mcp__claude_ai_Gmail__unlabel_thread` with `threadId=<the email's thread_id from the task source>` and `labelIds=["INBOX"]`. The tool's required argument is **`threadId` (camelCase)** — the task source's field is `thread_id` (snake_case), so rename when passing. Passing `thread_id` makes the MCP reject with a misleading "Invalid label" error.
 
-Don't ask for confirmation. When archived, return ONE sentence: `Archived vendor update from <sender>: <brief subject>.`
+Don't ask for confirmation. When archived, return ONE sentence: `Archived <vendor update | cold sales outreach> from <sender>: <brief subject>.`
 
 End your reply with one of:
 - `STATUS: handled` — you archived the email.
