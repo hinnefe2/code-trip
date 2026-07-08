@@ -240,6 +240,9 @@ class EmailProducer:
         # cost on every interval.
         self._first_poll = False
 
+        if len(self._recent_keys) > 500:
+            self._recent_keys = set(sorted(self._recent_keys)[-250:])
+
     # Page size for the reconcile query. Generous so the whole
     # action-needed inbox fits in one page — reconcile only retracts when
     # it's sure the listing is complete (see ``reconcile_inbox``), so a
@@ -322,9 +325,6 @@ class EmailProducer:
                 retired,
             )
         return retired
-
-        if len(self._recent_keys) > 500:
-            self._recent_keys = set(sorted(self._recent_keys)[-250:])
 
     def _after_param(self, last_ts: int | None) -> str:
         """Gmail's ``after:`` operator accepts a unix timestamp.
