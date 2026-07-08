@@ -1,18 +1,19 @@
 ---
 name: file-meeting-followup
-description: Convert a meeting_followup task into a Linear backlog ticket assigned to the user. Used by the ACT+YES chord — the user has decided the follow-up is real work that needs tracking. The skill picks the right team (and project, when an obvious match exists) based on the follow-up's content and the user's Linear workspace.
+description: Convert a meeting_followup task into a Linear backlog ticket assigned to the user. Used by the ACT+YES chord — the user has decided the follow-up is real work that needs tracking. The skill always files into a project — defaulting to the project the user has been working in most recently (inferred from their most-recently-updated assigned issues) and overriding only when the follow-up's content clearly matches a different project — and picks the team to match.
 auto-handle: false
 allowed-tools:
+  - mcp__claude_ai_Linear__list_issues
   - mcp__claude_ai_Linear__list_teams
   - mcp__claude_ai_Linear__list_projects
   - mcp__claude_ai_Linear__save_issue
 last-updated-by: Henry Hinnefeld
-last-updated-date: 2026-06-11
+last-updated-date: 2026-06-24
 ---
 
 # File a meeting follow-up as a Linear backlog ticket
 
-You're being invoked on a `meeting_followup` task that the user has decided is real work. Create a Linear issue for it. The user is working across several different teams / projects, so the routing decision is the whole point of this skill — don't just dump everything into one default bucket.
+You're being invoked on a `meeting_followup` task that the user has decided is real work. Create a Linear issue for it, **always inside a project**. The default home is the project the user has been working in most recently; only override that when the follow-up's content clearly belongs somewhere else. The routing decision is the whole point of this skill — don't just dump everything into one fixed bucket, but don't leave the ticket project-less either.
 
 1. **Read the follow-up.**
    - `task.headline` is the proposed ticket title (a short imperative).
@@ -20,26 +21,28 @@ You're being invoked on a `meeting_followup` task that the user has decided is r
    - `task.source.meeting` names the meeting it came from.
    - `task.source.topic` is a short slug the producer assigned (often the meeting title kebab-cased).
 
-2. **Pick the team.**
-   - Call `mcp__claude_ai_Linear__list_teams` (no `query` argument — we want the whole workspace so the match is informed).
-   - Choose the team whose name most plausibly owns this work, based on the meeting title and the follow-up body. Look for word overlap with the meeting name, headline, or any project/domain language in the body (e.g. a "Planning Sync" follow-up about retention metrics → a team named something like "Retention", "Analytics", or "Data"; a follow-up about portal infrastructure → "Platform" or "Infra").
-   - If no team's name is a clear match, pick the team that looks like the user's primary engineering team (a generic name like "AI", "Engineering", "Platform"). Avoid teams whose name implies a different function (Marketing, Sales, Design) unless the follow-up obviously belongs there.
-   - Never invent a team — only use IDs/names that came back from `list_teams`.
+2. **Find the recently-active project (the default home).**
+   - Call `mcp__claude_ai_Linear__list_issues` with `assignee="me"` and `limit=20`. It defaults to `orderBy="updatedAt"`, so the issues come back most-recently-touched first — that's the user's current center of gravity.
+   - Walk the list from the top and take the **first issue that has a project**; that issue's `project` is the recently-active project, and that same issue's `team` is the team to file under (the pair is known-valid together). Remember both.
+   - If none of the returned issues has a project, fall back to `mcp__claude_ai_Linear__list_projects` with `member="me"` (default `orderBy="updatedAt"`) and take the top project, plus a team it belongs to. If that also comes back empty, you have no recent signal — go to step 3 and rely entirely on a content match.
 
-3. **Optionally pick a project.**
-   - Call `mcp__claude_ai_Linear__list_projects` (no `query`, no team filter — pull what's available; if the list is long, the relevant project usually has the meeting/topic word in its name).
-   - Pick a project ONLY when its name clearly matches the meeting title, the follow-up body, or a domain word from the headline. If nothing matches clearly, leave the issue project-less — better than wrong routing.
+3. **Check for a clear content override.**
+   - Decide whether the follow-up obviously belongs to a *different* project than the recently-active one — i.e. the meeting title, headline, or a domain word in the body clearly names another project (e.g. a "Billing revamp" follow-up when you've recently been in "Onboarding").
+   - Only override on a clear match. To find the override target, call `mcp__claude_ai_Linear__list_projects` (no filter) and pick the project whose name plainly matches; use a team that project belongs to. If you're not confident, do NOT override — keep the recently-active project from step 2.
+   - Never invent a team or project — only use names/IDs returned by the list tools. If you need a team name and only have a project, `mcp__claude_ai_Linear__list_teams` lists the workspace's teams.
 
 4. **Create the issue.** Call `mcp__claude_ai_Linear__save_issue` with:
-   - `team`: the team name or ID from step 2.
-   - `project`: from step 3 if you picked one; omit otherwise.
+   - `project`: the project chosen in step 3 (override) or step 2 (recently-active default). Include a project whenever you have one — only omit it in the rare case where steps 2 and 3 both came up empty.
+   - `team`: the team paired with that project. (`team` is required by `save_issue`; make sure it's a team the project belongs to.)
    - `title`: the task headline verbatim.
-   - `description`: the task body. If the team/project you chose wasn't an obvious match (you fell back to a generic team or guessed from weak signal), append a final line `_(Team inferred — reassign if wrong.)_` so the user notices on their next Linear pass.
+   - `description`: the task body. Append a final note when your routing was a guess rather than a clear signal:
+     - `_(Filed in your recent project — move if it belongs elsewhere.)_` when you used the step-2 default without a content match.
+     - `_(Project/team inferred — reassign if wrong.)_` when you had to fall back to a weak guess.
    - `assignee`: `"me"`.
    - `state`: `"Backlog"`.
 
 5. **Return** one sentence. The orchestrator speaks this verbatim:
-   - `Filed in <team>: <title>.` if you didn't pick a project.
-   - `Filed in <team> / <project>: <title>.` if you did.
+   - `Filed in <team> / <project>: <title>.` — the normal case (a project was set).
+   - `Filed in <team>: <title>.` — only when no project could be determined at all.
 
-Don't ask for confirmation. The user already chose to file this via ACT+YES; your job is to route it well and report what you did.
+Don't ask for confirmation. The user already chose to file this via ACT+YES; your job is to route it well — into a project — and report what you did.
