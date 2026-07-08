@@ -666,6 +666,33 @@ async def test_screen_attaches_follow_up_tasks_from_summary():
     assert spawned.topic == "docs"
     # Spawned tasks reference the parent so the queue log can show lineage.
     assert spawned.parent_id == parent.id
+    # And carry a stable dedup key anchored on the parent's thread id, so a
+    # re-screen of the same email doesn't respawn a duplicate follow-up.
+    assert spawned.dedup_key == "followup:abc:send doc to anna"
+
+
+@pytest.mark.asyncio
+async def test_screen_dedup_key_survives_parent_id_change():
+    """The follow-up's dedup key anchors on the parent's thread id (stable),
+    not its task id (a fresh uuid each poll), so two screens of the same
+    meeting-notes email produce the *same* key even though parent ids differ."""
+    def _run():
+        mcp = create_autospec(ClaudeMCPClient, instance=True)
+        mcp.run_agent = AsyncMock(side_effect=[
+            "HANDLE: archive-gemini-meeting-notes",
+            (
+                "FOLLOWUP_TASK: {\"headline\": \"Send doc to Anna\"}\n"
+                "Archived Gemini meeting notes: Planning sync."
+            ),
+        ])
+        return mcp
+
+    src = {"thread_id": "thread-xyz"}
+    out1 = await screen(_task("email_msg", source=src), [_manifest("archive-gemini-meeting-notes")], _run())
+    out2 = await screen(_task("email_msg", source=src), [_manifest("archive-gemini-meeting-notes")], _run())
+    a, b = out1.follow_up_tasks[0], out2.follow_up_tasks[0]
+    assert a.parent_id != b.parent_id  # fresh uuid each screen
+    assert a.dedup_key == b.dedup_key == "followup:thread-xyz:send doc to anna"
 
 
 @pytest.mark.asyncio

@@ -32,7 +32,10 @@ def test_task_defaults_unique_ids():
 
 
 def test_task_roundtrip_dict():
-    t = Task(kind="claude_reply", topic="ticket-42", headline="ready", body="ok")
+    t = Task(
+        kind="claude_reply", topic="ticket-42", headline="ready", body="ok",
+        dedup_key="followup:abc:ready",
+    )
     d = t.to_dict()
     back = Task.from_dict(d)
     assert back.id == t.id
@@ -41,6 +44,9 @@ def test_task_roundtrip_dict():
     assert back.headline == "ready"
     assert back.body == "ok"
     assert back.state == STATE_PENDING
+    # dedup_key survives the log round-trip, so a done follow-up replayed on
+    # restart can still suppress a re-emitted duplicate.
+    assert back.dedup_key == "followup:abc:ready"
 
 
 # --- RecentTopics ------------------------------------------------------------
@@ -126,6 +132,33 @@ def test_queue_add_and_pending():
     q = TaskQueue()
     t = q.add(Task(headline="x"))
     assert q.pending() == [t]
+
+
+def test_queue_add_dedups_by_dedup_key_across_states():
+    """A re-emitted task with a known dedup_key is suppressed — even after
+    the original was marked done (the ACT+YES-filed-then-respawned bug)."""
+    q = TaskQueue()
+    first = q.add(Task(headline="Send doc to Anna", dedup_key="followup:abc:send doc"))
+    q.mark_done(first.id)  # filed via ACT+YES -> done
+
+    # Parent email re-screens and mints a fresh follow-up (new uuid, same key).
+    dup = Task(headline="Send doc to Anna", dedup_key="followup:abc:send doc")
+    returned = q.add(dup)
+
+    assert returned is first              # add returned the existing task
+    assert dup.id not in {t.id for t in q.all()}  # the duplicate never entered
+    assert len(q.all()) == 1
+    assert q.pending() == []              # original stays done; nothing resurfaced
+
+
+def test_queue_add_without_dedup_key_is_never_deduped():
+    """Tasks with no dedup_key (the default) are added unconditionally, even
+    when headline/topic collide — only an explicit key triggers suppression."""
+    q = TaskQueue()
+    a = q.add(Task(headline="same", topic="t"))
+    b = q.add(Task(headline="same", topic="t"))
+    assert a.id != b.id
+    assert len(q.all()) == 2
 
 
 def test_queue_ranked_orders_by_score():

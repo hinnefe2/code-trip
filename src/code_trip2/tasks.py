@@ -78,6 +78,15 @@ class Task:
     # in the queue. The key is a free-form string by convention namespaced
     # as ``<system>:<identifier>``.
     subject_key: str | None = None
+    # Stable identity for suppressing re-emitted duplicates. Unlike
+    # ``id`` (a fresh uuid every time the task is minted), this is
+    # derived from durable content so the *same* logical task produces
+    # the *same* key across re-emits and restarts. :meth:`TaskQueue.add`
+    # drops a task whose ``dedup_key`` already exists in any state. Set
+    # for spawned ``meeting_followup`` tasks (the Gemini-notes archiver
+    # re-spawns one every time its parent email is re-screened); ``None``
+    # for everything else, which keeps ``add`` a no-op for them.
+    dedup_key: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -93,6 +102,7 @@ class Task:
             "state": self.state,
             "parent_id": self.parent_id,
             "subject_key": self.subject_key,
+            "dedup_key": self.dedup_key,
         }
 
     @classmethod
@@ -110,6 +120,7 @@ class Task:
             state=d.get("state", STATE_PENDING),
             parent_id=d.get("parent_id"),
             subject_key=d.get("subject_key"),
+            dedup_key=d.get("dedup_key"),
         )
 
 
@@ -242,11 +253,33 @@ class TaskQueue:
     # ----- mutations ------------------------------------------------------
 
     def add(self, task: Task) -> Task:
-        """Add a task, applying per-topic backpressure if needed."""
+        """Add a task, applying per-topic backpressure if needed.
+
+        If the task carries a ``dedup_key`` and another task with the
+        same key already exists in *any* state (pending, done, dropped,
+        …), the add is suppressed and the existing task is returned
+        unchanged — no new entry, no ``add`` event. This stops a
+        re-emitted ``meeting_followup`` from resurrecting after the user
+        already filed it (ACT+YES → done) or dismissed it: the archiver
+        re-spawns a fresh follow-up (new uuid) every time its parent
+        email is re-screened, and matching the stable key catches it
+        even though the uuid differs. Durable kinds are replayed on
+        restart, so the done original is still present to match against.
+        """
+        if task.dedup_key is not None:
+            existing = self._find_by_dedup_key(task.dedup_key)
+            if existing is not None:
+                return existing
         self._tasks[task.id] = task
         self._enforce_topic_cap(task.topic)
         self._fire("add", task)
         return task
+
+    def _find_by_dedup_key(self, key: str) -> Task | None:
+        for t in self._tasks.values():
+            if t.dedup_key == key:
+                return t
+        return None
 
     def _enforce_topic_cap(self, topic: str) -> None:
         """Drop oldest pending tasks for ``topic`` beyond the soft cap.

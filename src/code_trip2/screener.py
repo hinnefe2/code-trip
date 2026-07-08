@@ -224,6 +224,20 @@ def parse_skill_status(
     return "declined"
 
 
+def follow_up_dedup_key(anchor: str, headline: str) -> str:
+    """Stable identity for a spawned follow-up task.
+
+    A follow-up's ``id`` is a fresh uuid on every emit, so re-screening
+    the parent email (e.g. archiving failed and it resurfaced, or a wide
+    re-poll refetched it) mints duplicates. Anchoring on the parent's
+    Gmail thread id plus the normalized headline yields a key that
+    survives re-screens and restarts, letting :meth:`TaskQueue.add`
+    suppress the duplicate even after the original was filed or dismissed.
+    """
+    norm = " ".join((headline or "").lower().split())
+    return f"followup:{anchor}:{norm}"
+
+
 def parse_follow_up_tasks(summary: str | None) -> tuple[Task, ...]:
     """Pull spawned tasks from an executor's summary.
 
@@ -450,8 +464,15 @@ async def screen(
             "failed", annotated, skill=chosen.name, error=str(exc),
         )
     follow_ups = parse_follow_up_tasks(summary)
+    # Anchor the dedup key on the parent's Gmail thread id (stable across
+    # re-screens) rather than its task id (a fresh uuid each poll), so a
+    # follow-up the user already filed or dismissed isn't respawned when
+    # the parent meeting-notes email gets re-screened. Falls back to the
+    # parent task id for non-email sources.
+    anchor = (task.source or {}).get("thread_id") or task.id
     for ft in follow_ups:
         ft.parent_id = task.id
+        ft.dedup_key = follow_up_dedup_key(anchor, ft.headline)
     # Disposition precedence:
     #   1. Explicit ``STATUS:`` from the skill wins. Updated skills emit
     #      ``STATUS: handled`` or ``STATUS: declined: <reason>``, which
