@@ -1311,23 +1311,27 @@ async def test_collapse_branch_fires_reconsider_when_user_replies(tmp_path: Path
 
 
 @pytest.mark.asyncio
-async def test_collapse_branch_does_not_fire_reconsider_on_non_self_reply(tmp_path: Path):
-    """A follow-up reply from someone other than Henry should NOT
-    trigger reconsider — the thread isn't wrapped, it's growing."""
+async def test_collapse_branch_fires_reconsider_on_any_new_reply(tmp_path: Path):
+    """Broadened behavior: any new activity in a tracked thread fires
+    reconsider — even a reply from someone other than Henry. Someone else
+    answering can resolve the thread; the dismiss skill's own guardrails
+    (last message is Henry's + wrapped) still gate the actual dismissal."""
     seen: list[Task] = []
-    p, _q, mcp, _state = _producer(tmp_path, reconsider=seen.append)
+    p, q, mcp, _state = _producer(tmp_path, reconsider=seen.append)
     p._user_id = "UME"
     mcp.call_tool.return_value = {
         "results": _thread_fixture("1716050000.000000", "1716050000.000000", "first"),
     }
     await p._poll_once()
+    [task] = q.all()
+    assert seen == []  # new-task branch never fires reconsider
     mcp.call_tool.return_value = {
         "results": _thread_fixture(
             "1716050000.000000", "1716050100.000000", "another reply", sender="Bob",
         )
     }
     await p._poll_once()
-    assert seen == []
+    assert seen == [task]  # non-self reply now DOES fire reconsider
 
 
 @pytest.mark.asyncio

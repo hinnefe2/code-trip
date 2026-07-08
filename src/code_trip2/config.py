@@ -83,6 +83,11 @@ class Config:
     poll_start_hour: int = 7
     poll_end_hour: int = 19
     mcp_batch_window: float = 2.0
+    # reconcile: how often (seconds) the ReconcileProducer re-checks
+    # already-queued tasks against their source and retires ones handled
+    # elsewhere (e.g. an email archived/read in Gmail). Independent of the
+    # additive producer polls; respects the same active-hours window.
+    reconcile_interval: float = 300.0
     # Runtime override (the ``--after-hours`` CLI flag): when true, the
     # active-hours window is ignored and producers poll around the
     # clock. Not a TOML key — set per-run so late-night work gets picked
@@ -208,6 +213,10 @@ def load_config(path: Path | str) -> Config:
         kw["poll_end_hour"] = int(poll_cfg["end_hour"])
     if "batch_window" in poll_cfg:
         kw["mcp_batch_window"] = float(poll_cfg["batch_window"])
+
+    reconcile_cfg = data.get("reconcile", {})
+    if "interval" in reconcile_cfg:
+        kw["reconcile_interval"] = float(reconcile_cfg["interval"])
 
     autohandle_cfg = data.get("autohandle", {})
     if "enabled" in autohandle_cfg:

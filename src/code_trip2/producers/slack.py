@@ -570,13 +570,15 @@ class SlackProducer:
             source=new_source,
             created_at=time.time(),
         )
-        # Fire reconsider if Henry just replied — the screener can then
-        # judge "thread wrapped?". Mirrors the collapse path in
-        # :meth:`_emit_task`.
-        if (
-            any(e["is_self"] for e in new_entries)
-            and self._reconsider is not None
-        ):
+        # Fire reconsider on ANY new activity in a thread we're tracking —
+        # not just Henry's own replies. Someone else answering, or the
+        # thread otherwise moving on, can make it no-longer-need-Henry;
+        # the dismiss-resolved-slack-thread skill's own guardrails (last
+        # message is Henry's + wrapped) still gate the actual dismissal,
+        # so over-asking here is safe. Mirrors the collapse path in
+        # :meth:`_emit_task`. (Reached only when ``new_entries`` is
+        # non-empty — see the early return above.)
+        if self._reconsider is not None:
             try:
                 self._reconsider(task)
             except Exception:
@@ -757,10 +759,11 @@ class SlackProducer:
                 source=new_source,
                 created_at=time.time(),
             )
-            # Henry just replied in a thread we're tracking — give the
-            # screener a chance to mark it done. Skill judges "wrapped
-            # or not"; producer only decides whether to ask.
-            if is_self and self._reconsider is not None:
+            # Any new message in a thread we're tracking — give the
+            # screener a chance to mark it done, whether or not it was
+            # Henry who posted. Skill judges "wrapped or not"; producer
+            # only decides whether to ask.
+            if self._reconsider is not None:
                 try:
                     self._reconsider(existing)
                 except Exception:

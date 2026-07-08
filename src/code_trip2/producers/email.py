@@ -31,7 +31,7 @@ from code_trip2.config import Config
 from code_trip2.email_state import EmailState
 from code_trip2.producers.claude_mcp import ClaudeMCPClient, ClaudeMCPError
 from code_trip2.producers.slack import _previous_workday_5pm_unix
-from code_trip2.tasks import Task, TaskQueue
+from code_trip2.tasks import STATE_PENDING, Task, TaskQueue
 
 if TYPE_CHECKING:
     pass
@@ -239,6 +239,89 @@ class EmailProducer:
         # no results, flip the flag so we don't keep paying the wider
         # cost on every interval.
         self._first_poll = False
+
+    # Page size for the reconcile query. Generous so the whole
+    # action-needed inbox fits in one page — reconcile only retracts when
+    # it's sure the listing is complete (see ``reconcile_inbox``), so a
+    # bigger page means fewer skipped cycles, not more false retracts.
+    _RECONCILE_PAGE_SIZE = 200
+
+    async def reconcile_inbox(self) -> int:
+        """Retire pending email tasks whose thread has left the inbox.
+
+        Re-runs the producer's own action-needed query (the configured
+        ``email_search_query`` — "unread Primary, not from me" by
+        default) and marks done any pending ``email_msg`` task whose
+        thread no longer matches. This is what makes work done *outside*
+        the orchestrator show up here: archiving, reading, or replying to
+        a mail in Gmail drops its thread out of the unread-inbox view, so
+        the stale task clears itself instead of the user hand-dismissing.
+
+        Driven by :class:`ReconcileProducer` on a timer, separate from the
+        additive poll loop. Two safety rails:
+
+        * **Snapshot before the await.** The pending set is captured
+          before the network call, so a brand-new mail that arrives
+          mid-fetch (absent from the listing) can't be mistaken for
+          archived and retracted.
+        * **Only retract on a complete listing.** If the query hit the
+          page-size cap the inbox may be truncated, so we skip retraction
+          that cycle rather than risk retiring a task whose thread was
+          simply on a later page. ACTIVE tasks are never touched
+          (``pending()`` excludes them) — same rule the Linear retire
+          path uses for a ticket the user is mid-conversation on.
+
+        Returns the number of tasks retired.
+        """
+        if self._mcp is None or not self._mcp.enabled:
+            return 0
+        candidates = [
+            (t.id, (t.source or {}).get("thread_id"))
+            for t in self._queue.pending()
+            if t.kind == "email_msg" and (t.source or {}).get("thread_id")
+        ]
+        if not candidates:
+            return 0
+        query = (self._config.email_search_query or "").strip()
+        self.is_polling = True
+        try:
+            result = await self._mcp.call_tool(
+                "search_threads",
+                {"query": query, "pageSize": self._RECONCILE_PAGE_SIZE},
+            )
+        except ClaudeMCPError as exc:
+            logger.warning("EmailProducer: reconcile search failed: %s", exc)
+            return 0
+        finally:
+            self.is_polling = False
+
+        threads = self._extract_threads(result)
+        if len(threads) >= self._RECONCILE_PAGE_SIZE:
+            logger.warning(
+                "EmailProducer: reconcile listing hit the %d-thread page cap; "
+                "skipping retraction this cycle to avoid false retires.",
+                self._RECONCILE_PAGE_SIZE,
+            )
+            return 0
+        current = {th.get("thread_id") for th in threads if th.get("thread_id")}
+        retired = 0
+        for task_id, thread_id in candidates:
+            if thread_id in current:
+                continue
+            # Re-check state: the user may have acted on it during the
+            # await, or it may have been retired by a concurrent path.
+            t = self._queue.get(task_id)
+            if t is None or t.state != STATE_PENDING:
+                continue
+            self._queue.mark_done(task_id)
+            retired += 1
+        if retired:
+            logger.info(
+                "EmailProducer: reconcile retired %d task(s) whose thread "
+                "left the inbox (archived / read / replied elsewhere).",
+                retired,
+            )
+        return retired
 
         if len(self._recent_keys) > 500:
             self._recent_keys = set(sorted(self._recent_keys)[-250:])

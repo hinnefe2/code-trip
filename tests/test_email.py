@@ -206,6 +206,85 @@ async def test_producer_first_poll_flag_flips_after_one_call(tmp_path: Path):
     assert "after:" in second_call.args[1]["query"]
 
 
+def _email_task(thread_id: str, headline: str = "x") -> Task:
+    return Task(kind="email_msg", topic="email-x", headline=headline,
+                source={"thread_id": thread_id})
+
+
+@pytest.mark.asyncio
+async def test_reconcile_retires_threads_no_longer_in_inbox(tmp_path: Path):
+    """A pending email task whose thread has left the inbox is marked done;
+    one still in the inbox stays pending."""
+    p, q, mcp, _state = _producer(tmp_path)
+    kept = q.add(_email_task("T1", "still here"))
+    gone = q.add(_email_task("T2", "archived elsewhere"))
+    # Reconcile query reports only T1 is still in the action-needed view.
+    mcp.call_tool.return_value = {"threads": [{"id": "T1"}]}
+
+    retired = await p.reconcile_inbox()
+
+    assert retired == 1
+    assert q.get(kept.id).state == "pending"
+    assert q.get(gone.id).state == "done"
+    # Uses the configured action-needed query, no after: floor.
+    call = mcp.call_tool.call_args
+    assert call.args[0] == "search_threads"
+    assert "after:" not in call.args[1]["query"]
+    assert "is:unread" in call.args[1]["query"]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_skips_retraction_when_listing_truncated(tmp_path: Path):
+    """If the listing hits the page cap it may be truncated, so reconcile
+    retires nothing rather than risk retiring a task on a later page."""
+    p, q, mcp, _state = _producer(tmp_path)
+    p._RECONCILE_PAGE_SIZE = 1  # force the truncation guard
+    task = q.add(_email_task("T2"))
+    mcp.call_tool.return_value = {"threads": [{"id": "T1"}]}  # 1 == cap
+
+    retired = await p.reconcile_inbox()
+
+    assert retired == 0
+    assert q.get(task.id).state == "pending"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_never_touches_active_tasks(tmp_path: Path):
+    """A task the user is mid-conversation on (ACTIVE) is never retired,
+    even when its thread has left the inbox."""
+    p, q, mcp, _state = _producer(tmp_path)
+    active = q.add(_email_task("T9", "mid convo"))
+    q.mark_active(active.id)
+    mcp.call_tool.return_value = {"threads": []}  # inbox empty
+
+    retired = await p.reconcile_inbox()
+
+    assert retired == 0
+    assert q.get(active.id).state == "active"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_no_candidates_makes_no_call(tmp_path: Path):
+    """No pending email tasks → no network call, no work."""
+    p, _q, mcp, _state = _producer(tmp_path)
+    retired = await p.reconcile_inbox()
+    assert retired == 0
+    mcp.call_tool.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_search_failure_retires_nothing(tmp_path: Path):
+    """A failed reconcile query is a no-op — never a mass-retract."""
+    p, q, mcp, _state = _producer(tmp_path)
+    task = q.add(_email_task("T2"))
+    mcp.call_tool.side_effect = ClaudeMCPError("boom")
+
+    retired = await p.reconcile_inbox()
+
+    assert retired == 0
+    assert q.get(task.id).state == "pending"
+
+
 @pytest.mark.asyncio
 async def test_producer_emits_task_from_structured_threads(tmp_path: Path):
     p, q, mcp, state = _producer(tmp_path)

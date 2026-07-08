@@ -26,6 +26,7 @@ from code_trip2.producers.claude import ClaudeProducer
 from code_trip2.producers.email import EmailProducer
 from code_trip2.producers.linear import LinearProducer
 from code_trip2.producers.manual import ManualProducer
+from code_trip2.producers.reconcile import ReconcileProducer
 from code_trip2.producers.slack import SlackProducer
 from code_trip2.queue_log import QueueLog
 from code_trip2.producers.claude_mcp import ClaudeMCPClient
@@ -271,15 +272,27 @@ async def main_async(config: Config, *, tui: bool = False, silent: bool = False)
         config=config, queue=queue, mcp=slack_mcp, state=SlackState(),
         reconsider=submit_to_reconsider,
     ))
-    supervisor.add(EmailProducer(
+    email_producer = EmailProducer(
         config=config, queue=queue, mcp=email_mcp,
         state=EmailState(), intake=submit_to_intake,
-    ))
+    )
+    supervisor.add(email_producer)
     supervisor.add(LinearProducer(
         config=config, queue=queue, mcp=linear_mcp,
         state=LinearState(), intake=submit_to_intake,
     ))
     supervisor.add(ManualProducer())
+
+    # Reconcile sweep: walks the standing queue on a timer and retires
+    # tasks handled outside the orchestrator. LinearProducer already
+    # retires closed tickets on its own poll, so the gap this closes is
+    # email — an archived/read/replied mail whose task would otherwise
+    # linger. Only wire the email reconciler when the Gmail MCP is live.
+    reconcilers = []
+    if email_mcp is not None and getattr(email_mcp, "enabled", False):
+        reconcilers.append(email_producer.reconcile_inbox)
+    if reconcilers:
+        supervisor.add(ReconcileProducer(config=config, reconcilers=reconcilers))
 
     consumer = QueueConsumer(ctx)
     consumer.attach()
