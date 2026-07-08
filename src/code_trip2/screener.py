@@ -1,24 +1,30 @@
 """Task screener: auto-handle producer output via skill agents.
 
-Producers push Tasks into an intake queue instead of calling
-:meth:`TaskQueue.add` directly. The screener loop drains the intake
-queue and for each task:
+Screenable tasks enter :class:`TaskQueue` immediately in the
+``screening`` state (see ``main.py``'s ``submit`` gate) and their ids
+land on the screener's work queue. Because the task is *resident* in
+the queue the whole time, a producer re-sighting the same object during
+a screening backlog collapses into it via ``upsert`` instead of minting
+a duplicate. For each ``(task_id, mode)`` work item the loop:
 
 1. Filters skill manifests to those declaring ``auto-handle: true`` and
    listing this task's ``kind`` under ``auto-handle-kinds``. No
-   candidates → forward to the user-facing queue (no LLM cost).
+   candidates → release to ``pending`` (no LLM cost).
 2. Asks Claude (Haiku, no tools) which candidate, if any, can fully
-   handle the task. Unsure → ``NONE`` → forward.
+   handle the task. Unsure → ``NONE`` → release to ``pending``.
 3. If a skill was named, runs it via ``run_agent`` with that skill's
-   tool list. The task never enters the user-facing queue; the outcome
-   is reported via ``on_outcome`` for logging.
+   tool list. The outcome becomes a state transition on the resident
+   task: handled → done, dismissed → dropped, forward/failed →
+   pending. ``mode="reconsider"`` items are already user-visible
+   tasks being re-judged; only a dismiss verdict does anything (marks
+   them done).
 
 All decision logic lives in plain functions returning a
 :class:`ScreeningOutcome`. The loop function is the only thing with
 lifecycle, and it's just a coroutine waiting on two awaitables.
 
-Fail-safe principle: every error path forwards the task to the user
-queue. A misbehaving screener must never silently lose work.
+Fail-safe principle: every error path releases the task to ``pending``.
+A misbehaving screener must never silently lose work.
 """
 
 from __future__ import annotations
@@ -32,7 +38,14 @@ from typing import Callable, Iterable, Literal
 
 from code_trip2.producers.claude_mcp import ClaudeMCPClient, ClaudeMCPError
 from code_trip2.skills import SkillManifest
-from code_trip2.tasks import Task
+from code_trip2.tasks import (
+    STATE_DONE,
+    STATE_DROPPED,
+    STATE_PENDING,
+    STATE_SCREENING,
+    Task,
+    TaskQueue,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,9 +82,9 @@ class ScreeningOutcome:
     dry_run_nominated: bool = False
     # New tasks the skill chose to spawn (e.g. the meeting-notes archiver
     # turning a "Henry: investigate X" action item into a meeting_followup
-    # task). The screener routes these through ``add_to_queue`` regardless
-    # of the action on the original task — handling the parent and
-    # spawning children are independent decisions.
+    # task). The screener routes these through ``submit_follow_up``
+    # regardless of the action on the original task — handling the parent
+    # and spawning children are independent decisions.
     follow_up_tasks: tuple[Task, ...] = ()
 
 
@@ -224,15 +237,16 @@ def parse_skill_status(
     return "declined"
 
 
-def follow_up_dedup_key(anchor: str, headline: str) -> str:
+def follow_up_origin_key(anchor: str, headline: str) -> str:
     """Stable identity for a spawned follow-up task.
 
     A follow-up's ``id`` is a fresh uuid on every emit, so re-screening
     the parent email (e.g. archiving failed and it resurfaced, or a wide
     re-poll refetched it) mints duplicates. Anchoring on the parent's
     Gmail thread id plus the normalized headline yields a key that
-    survives re-screens and restarts, letting :meth:`TaskQueue.add`
-    suppress the duplicate even after the original was filed or dismissed.
+    survives re-screens and restarts, letting
+    ``TaskQueue.upsert(if_terminal="skip")`` suppress the duplicate even
+    after the original was filed or dismissed.
     """
     norm = " ".join((headline or "").lower().split())
     return f"followup:{anchor}:{norm}"
@@ -464,7 +478,7 @@ async def screen(
             "failed", annotated, skill=chosen.name, error=str(exc),
         )
     follow_ups = parse_follow_up_tasks(summary)
-    # Anchor the dedup key on the parent's Gmail thread id (stable across
+    # Anchor the origin key on the parent's Gmail thread id (stable across
     # re-screens) rather than its task id (a fresh uuid each poll), so a
     # follow-up the user already filed or dismissed isn't respawned when
     # the parent meeting-notes email gets re-screened. Falls back to the
@@ -472,7 +486,7 @@ async def screen(
     anchor = (task.source or {}).get("thread_id") or task.id
     for ft in follow_ups:
         ft.parent_id = task.id
-        ft.dedup_key = follow_up_dedup_key(anchor, ft.headline)
+        ft.origin_key = follow_up_origin_key(anchor, ft.headline)
     # Disposition precedence:
     #   1. Explicit ``STATUS:`` from the skill wins. Updated skills emit
     #      ``STATUS: handled`` or ``STATUS: declined: <reason>``, which
@@ -514,78 +528,75 @@ async def screen(
 
 
 async def _next_or_stop(
-    intake: "asyncio.Queue[Task]",
+    work: "asyncio.Queue[tuple[str, str]]",
     stop: asyncio.Event,
-    reconsider_intake: "asyncio.Queue[Task] | None" = None,
-) -> tuple[Task, bool] | None:
-    """Block on the next task from either intake queue, or the stop event.
+) -> tuple[str, str] | None:
+    """Block on the next ``(task_id, mode)`` work item, or the stop event.
 
-    Returns ``(task, is_reconsider)`` — ``is_reconsider`` is True when
-    the task arrived via ``reconsider_intake`` (already in the user
-    queue, screener may mark it done). Returns ``None`` when stop fires
-    before any task arrives. Cancels whichever awaitables lost the
-    race so none leaks.
+    Returns ``None`` when stop fires before any item arrives. Cancels
+    whichever awaitable lost the race so none leaks.
     """
-    intake_getter = asyncio.create_task(intake.get())
+    getter = asyncio.create_task(work.get())
     stopper = asyncio.create_task(stop.wait())
-    waiters: list[asyncio.Task] = [intake_getter, stopper]
-    reconsider_getter: asyncio.Task | None = None
-    if reconsider_intake is not None:
-        reconsider_getter = asyncio.create_task(reconsider_intake.get())
-        waiters.append(reconsider_getter)
     try:
         done, pending = await asyncio.wait(
-            set(waiters), return_when=asyncio.FIRST_COMPLETED,
+            {getter, stopper}, return_when=asyncio.FIRST_COMPLETED,
         )
         for p in pending:
             p.cancel()
-        if intake_getter in done:
-            return (intake_getter.result(), False)
-        if reconsider_getter is not None and reconsider_getter in done:
-            return (reconsider_getter.result(), True)
+        if getter in done:
+            return getter.result()
         return None
     finally:
-        for t in waiters:
+        for t in (getter, stopper):
             if not t.done():
                 t.cancel()
 
 
 async def run_screener_loop(
     *,
-    intake: "asyncio.Queue[Task]",
+    work: "asyncio.Queue[tuple[str, str]]",
+    queue: TaskQueue,
     manifests: tuple[SkillManifest, ...],
     mcp: ClaudeMCPClient,
-    add_to_queue: Callable[[Task], None],
     on_outcome: Callable[[ScreeningOutcome], None],
     allowed_kinds: frozenset[str] | None,
     dry_run: bool,
     stop: asyncio.Event,
-    reconsider_intake: "asyncio.Queue[Task] | None" = None,
-    mark_existing_done: Callable[[str], None] | None = None,
+    submit_follow_up: Callable[[Task], None] | None = None,
 ) -> None:
-    """Drain the intake queue, screen each task, dispatch the outcome.
+    """Drain the work queue, screen each task, apply the state transition.
+
+    Work items are ``(task_id, mode)``, mode ∈ {"intake", "reconsider"}.
+    The task is already resident in ``queue`` — intake items in the
+    ``screening`` state (put there by the submit gate), reconsider items
+    in whatever user-visible state they hold.
 
     Serial: one in-flight screen at a time. Producer poll intervals are
     much longer than a single classify+execute round, so this is
-    fine. If a screen run blocks (slow MCP), tasks queue up; that's
-    backpressure, not data loss.
+    fine. If a screen run blocks (slow MCP), work items queue up; that's
+    backpressure, not data loss — and because the tasks are resident,
+    re-sightings during the backlog collapse into them instead of
+    duplicating.
 
     ``allowed_kinds`` is a config gate. ``None`` means "no extra
     restriction beyond what manifests opt into"; a frozenset further
     restricts. An empty frozenset effectively disables auto-handling
-    without changing the call sites that feed the intake queue.
+    without changing the call sites that feed the work queue.
 
-    ``reconsider_intake`` is a second queue carrying tasks that already
-    live in the user-facing queue — the screener re-judges them and,
-    if a dismiss skill picks, marks the existing task done via
-    ``mark_existing_done``. Other outcomes are no-ops in reconsider
-    mode (the task is already in the user's queue; nothing to add).
+    Intake transitions only apply while the task is still ``screening``
+    — if some other path retired it mid-screen (user action, a resolve
+    sweep), the verdict is stale and dropped.
     """
     while not stop.is_set():
-        nxt = await _next_or_stop(intake, stop, reconsider_intake)
+        nxt = await _next_or_stop(work, stop)
         if nxt is None:
             return
-        task, is_reconsider = nxt
+        task_id, mode = nxt
+        task = queue.get(task_id)
+        if task is None:
+            logger.warning("Screener: task %s vanished before screening", task_id)
+            continue
         if allowed_kinds is not None and task.kind not in allowed_kinds:
             outcome = ScreeningOutcome("forward", task)
         else:
@@ -602,40 +613,38 @@ async def run_screener_loop(
             on_outcome(outcome)
         except Exception:
             logger.exception("on_outcome callback raised; continuing")
-        if is_reconsider:
-            # Reconsider mode: the task is already in the user queue.
-            # Only ``dismissed`` does anything — mark the existing
-            # task done. Everything else (forward, handled, failed)
-            # leaves the task where it is. Follow-up tasks still need
-            # enqueueing if some future skill spawns them under
-            # reconsider.
-            if outcome.action == "dismissed" and mark_existing_done is not None:
-                try:
-                    mark_existing_done(outcome.task.id)
-                except Exception:
-                    logger.exception(
-                        "mark_existing_done failed for task %s",
-                        outcome.task.id,
-                    )
+        if mode == "reconsider":
+            # Reconsider mode: the task is already user-visible. Only
+            # ``dismissed`` does anything — mark the existing task
+            # done. Everything else (forward, handled, failed) leaves
+            # the task where it is.
+            if outcome.action == "dismissed":
+                queue.mark_done(task_id)
         else:
-            # Intake mode: only ``forward`` and ``failed`` outcomes
-            # surface the original task to the user. ``handled``
-            # (executor ran) and ``dismissed`` (classifier said not
-            # worth surfacing) both suppress it.
-            if outcome.action in ("forward", "failed"):
-                try:
-                    add_to_queue(outcome.task)
-                except Exception:
-                    logger.exception(
-                        "add_to_queue failed for task %s", outcome.task.id,
-                    )
+            current = queue.get(task_id)
+            if current is not None and current.state == STATE_SCREENING:
+                if outcome.action == "failed":
+                    # ``screen`` annotated a copy's body (it never
+                    # mutates its input); copy the annotation onto the
+                    # resident task before releasing it.
+                    queue.update_task(task_id, body=outcome.task.body)
+                    queue.set_state(task_id, STATE_PENDING)
+                elif outcome.action == "forward":
+                    queue.set_state(task_id, STATE_PENDING)
+                elif outcome.action == "handled":
+                    queue.set_state(task_id, STATE_DONE)
+                elif outcome.action == "dismissed":
+                    queue.set_state(task_id, STATE_DROPPED)
         # Follow-up tasks ride along independently — a handled
         # meeting-notes email can still spawn a meeting_followup the
         # user needs to see. Same applies in reconsider mode.
         for ft in outcome.follow_up_tasks:
             try:
-                add_to_queue(ft)
+                if submit_follow_up is not None:
+                    submit_follow_up(ft)
+                else:
+                    queue.upsert(ft, if_terminal="skip")
             except Exception:
                 logger.exception(
-                    "add_to_queue failed for follow-up task %s", ft.id,
+                    "follow-up submit failed for task %s", ft.id,
                 )

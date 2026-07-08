@@ -208,7 +208,8 @@ async def test_producer_first_poll_flag_flips_after_one_call(tmp_path: Path):
 
 def _email_task(thread_id: str, headline: str = "x") -> Task:
     return Task(kind="email_msg", topic="email-x", headline=headline,
-                source={"thread_id": thread_id})
+                source={"thread_id": thread_id},
+                origin_key=f"email:{thread_id}")
 
 
 @pytest.mark.asyncio

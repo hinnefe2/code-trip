@@ -21,7 +21,14 @@ from code_trip2.screener import (
     summary_indicates_failure,
 )
 from code_trip2.skills import SkillManifest
-from code_trip2.tasks import Task
+from code_trip2.tasks import (
+    STATE_DONE,
+    STATE_DROPPED,
+    STATE_PENDING,
+    STATE_SCREENING,
+    Task,
+    TaskQueue,
+)
 
 
 # --- fixtures --------------------------------------------------------------
@@ -75,6 +82,22 @@ def _mcp(*, agent_reply: str | Exception = "") -> Any:
     else:
         mcp.run_agent = AsyncMock(return_value=agent_reply)
     return mcp
+
+
+def _loop_env(
+    *tasks: Task, mode: str = "intake",
+) -> tuple["asyncio.Queue[tuple[str, str]]", TaskQueue]:
+    """Park ``tasks`` in a real TaskQueue the way main.py's submit gate
+    would (``screening`` state for intake items; whatever they already
+    hold for reconsider) and enqueue their work items."""
+    work: "asyncio.Queue[tuple[str, str]]" = asyncio.Queue()
+    q = TaskQueue()
+    for t in tasks:
+        if mode == "intake":
+            t.state = STATE_SCREENING
+        q.add(t)
+        work.put_nowait((t.id, mode))
+    return work, q
 
 
 # --- pure helpers ----------------------------------------------------------
@@ -283,14 +306,13 @@ async def test_screen_mixed_candidates_classifier_chooses_dismiss():
 
 
 @pytest.mark.asyncio
-async def test_loop_dismissed_outcome_does_not_add_to_queue():
-    """``dismissed`` outcomes suppress the task just like ``handled``."""
-    intake: "asyncio.Queue[Task]" = asyncio.Queue()
-    added: list[Task] = []
+async def test_loop_dismissed_outcome_drops_task():
+    """``dismissed`` outcomes suppress the task just like ``handled`` —
+    the resident task transitions to dropped, never pending."""
+    task = _task("slack_msg")
+    work, q = _loop_env(task)
     outcomes: list[ScreeningOutcome] = []
     stop = asyncio.Event()
-
-    intake.put_nowait(_task("slack_msg"))
 
     mcp = _mcp(agent_reply="DISMISS: drop-standups")
 
@@ -301,10 +323,10 @@ async def test_loop_dismissed_outcome_does_not_add_to_queue():
 
     loop_task = asyncio.create_task(
         run_screener_loop(
-            intake=intake,
+            work=work,
+            queue=q,
             manifests=(_dismiss_manifest("drop-standups"),),
             mcp=mcp,
-            add_to_queue=added.append,
             on_outcome=outcomes.append,
             allowed_kinds=None,
             dry_run=False,
@@ -312,7 +334,8 @@ async def test_loop_dismissed_outcome_does_not_add_to_queue():
         )
     )
     await asyncio.wait_for(asyncio.gather(driver(), loop_task), timeout=2.0)
-    assert added == []  # dismissed, not forwarded
+    assert q.pending() == []  # dismissed, not surfaced
+    assert q.get(task.id).state == STATE_DROPPED
     assert [o.action for o in outcomes] == ["dismissed"]
 
 
@@ -337,26 +360,24 @@ def test_candidates_for_includes_dismiss_skills():
 
 @pytest.mark.asyncio
 async def test_loop_forwards_when_no_candidates():
-    intake: "asyncio.Queue[Task]" = asyncio.Queue()
-    added: list[Task] = []
+    task = _task("note")
+    work, q = _loop_env(task)
     outcomes: list[ScreeningOutcome] = []
     stop = asyncio.Event()
 
-    intake.put_nowait(_task("note"))
-
     async def driver() -> None:
         # Let one task drain, then stop the loop.
-        while not added and not outcomes:
+        while not outcomes:
             await asyncio.sleep(0)
         stop.set()
 
     mcp = _mcp(agent_reply="HANDLE: should-not-run")
     loop_task = asyncio.create_task(
         run_screener_loop(
-            intake=intake,
+            work=work,
+            queue=q,
             manifests=(_manifest("only-email", kinds=("email_msg",)),),
             mcp=mcp,
-            add_to_queue=added.append,
             on_outcome=outcomes.append,
             allowed_kinds=None,
             dry_run=False,
@@ -364,20 +385,18 @@ async def test_loop_forwards_when_no_candidates():
         )
     )
     await asyncio.wait_for(asyncio.gather(driver(), loop_task), timeout=2.0)
-    assert len(added) == 1
-    assert added[0].kind == "note"
+    assert q.pending() == [task]  # released to the user queue
+    assert q.get(task.id).state == STATE_PENDING
     assert [o.action for o in outcomes] == ["forward"]
     mcp.run_agent.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_loop_handled_outcome_does_not_add_to_queue():
-    intake: "asyncio.Queue[Task]" = asyncio.Queue()
-    added: list[Task] = []
+async def test_loop_handled_outcome_marks_task_done():
+    task = _task("email_msg")
+    work, q = _loop_env(task)
     outcomes: list[ScreeningOutcome] = []
     stop = asyncio.Event()
-
-    intake.put_nowait(_task("email_msg"))
 
     mcp = create_autospec(ClaudeMCPClient, instance=True)
     mcp.run_agent = AsyncMock(side_effect=[
@@ -392,10 +411,10 @@ async def test_loop_handled_outcome_does_not_add_to_queue():
 
     loop_task = asyncio.create_task(
         run_screener_loop(
-            intake=intake,
+            work=work,
+            queue=q,
             manifests=(_manifest("accept-invite", kinds=("email_msg",)),),
             mcp=mcp,
-            add_to_queue=added.append,
             on_outcome=outcomes.append,
             allowed_kinds=None,
             dry_run=False,
@@ -403,19 +422,18 @@ async def test_loop_handled_outcome_does_not_add_to_queue():
         )
     )
     await asyncio.wait_for(asyncio.gather(driver(), loop_task), timeout=2.0)
-    assert added == []  # handled, not forwarded
+    assert q.pending() == []  # handled, not surfaced
+    assert q.get(task.id).state == STATE_DONE
     assert [o.action for o in outcomes] == ["handled"]
     assert outcomes[0].skill == "accept-invite"
 
 
 @pytest.mark.asyncio
-async def test_loop_failed_outcome_still_forwards_to_queue():
-    intake: "asyncio.Queue[Task]" = asyncio.Queue()
-    added: list[Task] = []
+async def test_loop_failed_outcome_still_surfaces_task():
+    task = _task("email_msg")
+    work, q = _loop_env(task)
     outcomes: list[ScreeningOutcome] = []
     stop = asyncio.Event()
-
-    intake.put_nowait(_task("email_msg"))
 
     mcp = create_autospec(ClaudeMCPClient, instance=True)
     mcp.run_agent = AsyncMock(side_effect=[
@@ -430,10 +448,10 @@ async def test_loop_failed_outcome_still_forwards_to_queue():
 
     loop_task = asyncio.create_task(
         run_screener_loop(
-            intake=intake,
+            work=work,
+            queue=q,
             manifests=(_manifest("accept-invite", kinds=("email_msg",)),),
             mcp=mcp,
-            add_to_queue=added.append,
             on_outcome=outcomes.append,
             allowed_kinds=None,
             dry_run=False,
@@ -441,20 +459,19 @@ async def test_loop_failed_outcome_still_forwards_to_queue():
         )
     )
     await asyncio.wait_for(asyncio.gather(driver(), loop_task), timeout=2.0)
-    assert len(added) == 1
-    assert "auto-handle attempted" in (added[0].body or "")
+    assert q.pending() == [task]
+    # The error annotation lands on the resident task's body.
+    assert "auto-handle attempted" in (q.get(task.id).body or "")
     assert outcomes[0].action == "failed"
 
 
 @pytest.mark.asyncio
 async def test_loop_allowed_kinds_gate_short_circuits():
     """Even if a skill opts into a kind, allowed_kinds gates execution."""
-    intake: "asyncio.Queue[Task]" = asyncio.Queue()
-    added: list[Task] = []
+    task = _task("slack_msg")
+    work, q = _loop_env(task)
     outcomes: list[ScreeningOutcome] = []
     stop = asyncio.Event()
-
-    intake.put_nowait(_task("slack_msg"))
 
     mcp = _mcp(agent_reply="HANDLE: handle-slack")
 
@@ -465,10 +482,10 @@ async def test_loop_allowed_kinds_gate_short_circuits():
 
     loop_task = asyncio.create_task(
         run_screener_loop(
-            intake=intake,
+            work=work,
+            queue=q,
             manifests=(_manifest("handle-slack", kinds=("slack_msg",)),),
             mcp=mcp,
-            add_to_queue=added.append,
             on_outcome=outcomes.append,
             allowed_kinds=frozenset({"email_msg"}),  # slack_msg NOT allowed
             dry_run=False,
@@ -476,28 +493,27 @@ async def test_loop_allowed_kinds_gate_short_circuits():
         )
     )
     await asyncio.wait_for(asyncio.gather(driver(), loop_task), timeout=2.0)
-    assert len(added) == 1
-    assert added[0].kind == "slack_msg"
+    assert q.pending() == [task]
     assert outcomes[0].action == "forward"
     mcp.run_agent.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_loop_exits_on_stop_event_without_pending_task():
-    intake: "asyncio.Queue[Task]" = asyncio.Queue()
+    work, q = _loop_env()
     stop = asyncio.Event()
 
     async def driver() -> None:
-        # Loop is idle (nothing in intake); set stop and ensure it exits.
+        # Loop is idle (nothing queued); set stop and ensure it exits.
         await asyncio.sleep(0.01)
         stop.set()
 
     loop_task = asyncio.create_task(
         run_screener_loop(
-            intake=intake,
+            work=work,
+            queue=q,
             manifests=(),
             mcp=_mcp(),
-            add_to_queue=lambda _t: None,
             on_outcome=lambda _o: None,
             allowed_kinds=None,
             dry_run=False,
@@ -511,27 +527,24 @@ async def test_loop_exits_on_stop_event_without_pending_task():
 @pytest.mark.asyncio
 async def test_loop_on_outcome_exception_does_not_crash_loop():
     """A buggy logger shouldn't take down screening."""
-    intake: "asyncio.Queue[Task]" = asyncio.Queue()
-    added: list[Task] = []
+    a, b = _task("note"), _task("note")
+    work, q = _loop_env(a, b)
     stop = asyncio.Event()
-
-    intake.put_nowait(_task("note"))
-    intake.put_nowait(_task("note"))
 
     def explosive_outcome(_o: ScreeningOutcome) -> None:
         raise RuntimeError("logger broken")
 
     async def driver() -> None:
-        while len(added) < 2:
+        while len(q.pending()) < 2:
             await asyncio.sleep(0)
         stop.set()
 
     loop_task = asyncio.create_task(
         run_screener_loop(
-            intake=intake,
+            work=work,
+            queue=q,
             manifests=(),
             mcp=_mcp(),
-            add_to_queue=added.append,
             on_outcome=explosive_outcome,
             allowed_kinds=None,
             dry_run=False,
@@ -539,25 +552,64 @@ async def test_loop_on_outcome_exception_does_not_crash_loop():
         )
     )
     await asyncio.wait_for(asyncio.gather(driver(), loop_task), timeout=2.0)
-    assert len(added) == 2  # both tasks still made it through
+    assert len(q.pending()) == 2  # both tasks still made it through
+
+
+@pytest.mark.asyncio
+async def test_loop_stale_verdict_does_not_override_user_action():
+    """If the task left the screening state mid-screen (user acted, a
+    resolve sweep retired it), the screener's verdict is stale and must
+    not clobber the newer state."""
+    task = _task("email_msg")
+    work, q = _loop_env(task)
+    outcomes: list[ScreeningOutcome] = []
+    stop = asyncio.Event()
+
+    mcp = create_autospec(ClaudeMCPClient, instance=True)
+
+    async def classify_then_yield(*_a, **_k):
+        # Simulate the user retiring the task while the classifier runs.
+        q.mark_done(task.id)
+        return "NONE"
+
+    mcp.run_agent = AsyncMock(side_effect=classify_then_yield)
+
+    async def driver() -> None:
+        while not outcomes:
+            await asyncio.sleep(0)
+        stop.set()
+
+    loop_task = asyncio.create_task(
+        run_screener_loop(
+            work=work,
+            queue=q,
+            manifests=(_manifest("accept-invite", kinds=("email_msg",)),),
+            mcp=mcp,
+            on_outcome=outcomes.append,
+            allowed_kinds=None,
+            dry_run=False,
+            stop=stop,
+        )
+    )
+    await asyncio.wait_for(asyncio.gather(driver(), loop_task), timeout=2.0)
+    assert q.get(task.id).state == STATE_DONE  # user's action stands
 
 
 # --- _next_or_stop --------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_next_or_stop_returns_task_when_available():
-    q: "asyncio.Queue[Task]" = asyncio.Queue()
+async def test_next_or_stop_returns_work_item_when_available():
+    q: "asyncio.Queue[tuple[str, str]]" = asyncio.Queue()
     stop = asyncio.Event()
-    task = _task("note")
-    q.put_nowait(task)
+    q.put_nowait(("task-1", "intake"))
     out = await _next_or_stop(q, stop)
-    assert out == (task, False)
+    assert out == ("task-1", "intake")
 
 
 @pytest.mark.asyncio
 async def test_next_or_stop_returns_none_when_stop_fires_first():
-    q: "asyncio.Queue[Task]" = asyncio.Queue()
+    q: "asyncio.Queue[tuple[str, str]]" = asyncio.Queue()
     stop = asyncio.Event()
 
     async def setter():
@@ -567,34 +619,6 @@ async def test_next_or_stop_returns_none_when_stop_fires_first():
     asyncio.create_task(setter())
     out = await asyncio.wait_for(_next_or_stop(q, stop), timeout=1.0)
     assert out is None
-
-
-@pytest.mark.asyncio
-async def test_next_or_stop_tags_reconsider_task():
-    """A task arriving via the reconsider queue gets is_reconsider=True."""
-    intake: "asyncio.Queue[Task]" = asyncio.Queue()
-    reconsider: "asyncio.Queue[Task]" = asyncio.Queue()
-    stop = asyncio.Event()
-    task = _task("slack_msg")
-    reconsider.put_nowait(task)
-    out = await _next_or_stop(intake, stop, reconsider)
-    assert out == (task, True)
-
-
-@pytest.mark.asyncio
-async def test_next_or_stop_prefers_either_intake_when_both_have_tasks():
-    """When both queues have items, the call returns one (either) but
-    tags it correctly."""
-    intake: "asyncio.Queue[Task]" = asyncio.Queue()
-    reconsider: "asyncio.Queue[Task]" = asyncio.Queue()
-    stop = asyncio.Event()
-    intake.put_nowait(_task("note"))
-    reconsider.put_nowait(_task("slack_msg"))
-    out = await _next_or_stop(intake, stop, reconsider)
-    # Whichever wins, the tag matches its queue.
-    assert out is not None
-    task, is_reconsider = out
-    assert is_reconsider == (task.kind == "slack_msg")
 
 
 # --- follow-up tasks ------------------------------------------------------
@@ -666,14 +690,14 @@ async def test_screen_attaches_follow_up_tasks_from_summary():
     assert spawned.topic == "docs"
     # Spawned tasks reference the parent so the queue log can show lineage.
     assert spawned.parent_id == parent.id
-    # And carry a stable dedup key anchored on the parent's thread id, so a
+    # And carry a stable origin key anchored on the parent's thread id, so a
     # re-screen of the same email doesn't respawn a duplicate follow-up.
-    assert spawned.dedup_key == "followup:abc:send doc to anna"
+    assert spawned.origin_key == "followup:abc:send doc to anna"
 
 
 @pytest.mark.asyncio
-async def test_screen_dedup_key_survives_parent_id_change():
-    """The follow-up's dedup key anchors on the parent's thread id (stable),
+async def test_screen_origin_key_survives_parent_id_change():
+    """The follow-up's origin key anchors on the parent's thread id (stable),
     not its task id (a fresh uuid each poll), so two screens of the same
     meeting-notes email produce the *same* key even though parent ids differ."""
     def _run():
@@ -692,19 +716,18 @@ async def test_screen_dedup_key_survives_parent_id_change():
     out2 = await screen(_task("email_msg", source=src), [_manifest("archive-gemini-meeting-notes")], _run())
     a, b = out1.follow_up_tasks[0], out2.follow_up_tasks[0]
     assert a.parent_id != b.parent_id  # fresh uuid each screen
-    assert a.dedup_key == b.dedup_key == "followup:thread-xyz:send doc to anna"
+    assert a.origin_key == b.origin_key == "followup:thread-xyz:send doc to anna"
 
 
 @pytest.mark.asyncio
 async def test_loop_adds_follow_up_tasks_even_when_parent_handled():
     """A handled meeting-notes email suppresses the parent but still
     needs to enqueue the spawned meeting_followup tasks."""
-    intake: "asyncio.Queue[Task]" = asyncio.Queue()
-    added: list[Task] = []
+    parent = _task("email_msg")
+    work, q = _loop_env(parent)
+    submitted: list[Task] = []
     outcomes: list[ScreeningOutcome] = []
     stop = asyncio.Event()
-
-    intake.put_nowait(_task("email_msg"))
 
     mcp = create_autospec(ClaudeMCPClient, instance=True)
     mcp.run_agent = AsyncMock(side_effect=[
@@ -721,14 +744,76 @@ async def test_loop_adds_follow_up_tasks_even_when_parent_handled():
             await asyncio.sleep(0)
         stop.set()
 
+    def submit_follow_up(t: Task) -> None:
+        submitted.append(t)
+        q.upsert(t, if_terminal="skip")
+
     loop_task = asyncio.create_task(
         run_screener_loop(
-            intake=intake,
+            work=work,
+            queue=q,
             manifests=(_manifest(
                 "archive-gemini-meeting-notes", kinds=("email_msg",),
             ),),
             mcp=mcp,
-            add_to_queue=added.append,
+            on_outcome=outcomes.append,
+            allowed_kinds=None,
+            dry_run=False,
+            stop=stop,
+            submit_follow_up=submit_follow_up,
+        )
+    )
+    await asyncio.wait_for(asyncio.gather(driver(), loop_task), timeout=2.0)
+    # Parent was handled (suppressed); both follow-ups routed through
+    # the submit gate and now pending.
+    assert q.get(parent.id).state == STATE_DONE
+    assert [t.kind for t in submitted] == ["meeting_followup", "meeting_followup"]
+    assert sorted(t.headline for t in q.pending()) == [
+        "Draft retention doc", "Reply re schema",
+    ]
+    assert outcomes[0].action == "handled"
+    assert len(outcomes[0].follow_up_tasks) == 2
+
+
+@pytest.mark.asyncio
+async def test_loop_follow_ups_default_to_terminal_skip_upsert():
+    """Without an explicit submit_follow_up, follow-ups land via
+    ``queue.upsert(if_terminal="skip")`` — a respawned follow-up whose
+    original was already filed stays gone."""
+    parent = _task("email_msg")
+    work, q = _loop_env(parent)
+    # The user already filed this follow-up (terminal record present).
+    filed = q.add(Task(
+        kind="meeting_followup",
+        headline="Draft retention doc",
+        origin_key="followup:abc:draft retention doc",
+    ))
+    q.mark_done(filed.id)
+    outcomes: list[ScreeningOutcome] = []
+    stop = asyncio.Event()
+
+    mcp = create_autospec(ClaudeMCPClient, instance=True)
+    mcp.run_agent = AsyncMock(side_effect=[
+        "HANDLE: archive-gemini-meeting-notes",
+        (
+            "FOLLOWUP_TASK: {\"headline\": \"Draft retention doc\"}\n"
+            "Archived Gemini meeting notes: Planning sync."
+        ),
+    ])
+
+    async def driver() -> None:
+        while not outcomes:
+            await asyncio.sleep(0)
+        stop.set()
+
+    loop_task = asyncio.create_task(
+        run_screener_loop(
+            work=work,
+            queue=q,
+            manifests=(_manifest(
+                "archive-gemini-meeting-notes", kinds=("email_msg",),
+            ),),
+            mcp=mcp,
             on_outcome=outcomes.append,
             allowed_kinds=None,
             dry_run=False,
@@ -736,32 +821,22 @@ async def test_loop_adds_follow_up_tasks_even_when_parent_handled():
         )
     )
     await asyncio.wait_for(asyncio.gather(driver(), loop_task), timeout=2.0)
-    # Parent was handled (suppressed); both follow-ups enqueued.
-    assert [t.kind for t in added] == ["meeting_followup", "meeting_followup"]
-    assert [t.headline for t in added] == [
-        "Draft retention doc", "Reply re schema",
-    ]
-    assert outcomes[0].action == "handled"
-    assert len(outcomes[0].follow_up_tasks) == 2
+    assert q.pending() == []  # respawned follow-up suppressed
+    assert q.get(filed.id).state == STATE_DONE
 
 
 # --- reconsider path ------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_loop_reconsider_dismissed_calls_mark_existing_done():
-    """The interesting case: a task already in the user queue arrives
-    via the reconsider intake, the classifier picks a dismiss skill, and
-    the loop marks the *existing* task done (not add_to_queue)."""
-    intake: "asyncio.Queue[Task]" = asyncio.Queue()
-    reconsider: "asyncio.Queue[Task]" = asyncio.Queue()
-    added: list[Task] = []
-    marked_done: list[str] = []
+async def test_loop_reconsider_dismissed_marks_existing_done():
+    """The interesting case: a task already visible in the user queue
+    arrives with mode="reconsider", the classifier picks a dismiss
+    skill, and the loop marks the *existing* task done."""
+    task = _task("slack_msg")
+    work, q = _loop_env(task, mode="reconsider")
     outcomes: list[ScreeningOutcome] = []
     stop = asyncio.Event()
-
-    task = _task("slack_msg")
-    reconsider.put_nowait(task)
 
     mcp = _mcp(agent_reply="DISMISS: dismiss-resolved-slack-thread")
 
@@ -772,36 +847,29 @@ async def test_loop_reconsider_dismissed_calls_mark_existing_done():
 
     loop_task = asyncio.create_task(
         run_screener_loop(
-            intake=intake,
+            work=work,
+            queue=q,
             manifests=(_dismiss_manifest("dismiss-resolved-slack-thread"),),
             mcp=mcp,
-            add_to_queue=added.append,
             on_outcome=outcomes.append,
             allowed_kinds=None,
             dry_run=False,
             stop=stop,
-            reconsider_intake=reconsider,
-            mark_existing_done=marked_done.append,
         )
     )
     await asyncio.wait_for(asyncio.gather(driver(), loop_task), timeout=2.0)
-    assert added == []  # task already in queue; not re-added
-    assert marked_done == [task.id]
+    assert q.get(task.id).state == STATE_DONE
     assert outcomes[0].action == "dismissed"
 
 
 @pytest.mark.asyncio
 async def test_loop_reconsider_classifier_declines_is_noop():
-    """Classifier says NONE on a reconsider task → no mark_existing_done,
-    no add_to_queue. Task stays where it is in the user queue."""
-    intake: "asyncio.Queue[Task]" = asyncio.Queue()
-    reconsider: "asyncio.Queue[Task]" = asyncio.Queue()
-    added: list[Task] = []
-    marked_done: list[str] = []
+    """Classifier says NONE on a reconsider task → task stays where it
+    is in the user queue."""
+    task = _task("slack_msg")
+    work, q = _loop_env(task, mode="reconsider")
     outcomes: list[ScreeningOutcome] = []
     stop = asyncio.Event()
-
-    reconsider.put_nowait(_task("slack_msg"))
 
     mcp = _mcp(agent_reply="NONE")
 
@@ -812,21 +880,18 @@ async def test_loop_reconsider_classifier_declines_is_noop():
 
     loop_task = asyncio.create_task(
         run_screener_loop(
-            intake=intake,
+            work=work,
+            queue=q,
             manifests=(_dismiss_manifest("dismiss-resolved-slack-thread"),),
             mcp=mcp,
-            add_to_queue=added.append,
             on_outcome=outcomes.append,
             allowed_kinds=None,
             dry_run=False,
             stop=stop,
-            reconsider_intake=reconsider,
-            mark_existing_done=marked_done.append,
         )
     )
     await asyncio.wait_for(asyncio.gather(driver(), loop_task), timeout=2.0)
-    assert added == []
-    assert marked_done == []
+    assert q.get(task.id).state == STATE_PENDING
     assert outcomes[0].action == "forward"
 
 
@@ -834,14 +899,10 @@ async def test_loop_reconsider_classifier_declines_is_noop():
 async def test_loop_reconsider_dry_run_logs_pick_but_does_not_mark_done():
     """Dry-run is a hard gate even for reconsider — the user can validate
     the dismiss judgement before letting it actually fire."""
-    intake: "asyncio.Queue[Task]" = asyncio.Queue()
-    reconsider: "asyncio.Queue[Task]" = asyncio.Queue()
-    added: list[Task] = []
-    marked_done: list[str] = []
+    task = _task("slack_msg")
+    work, q = _loop_env(task, mode="reconsider")
     outcomes: list[ScreeningOutcome] = []
     stop = asyncio.Event()
-
-    reconsider.put_nowait(_task("slack_msg"))
 
     mcp = _mcp(agent_reply="DISMISS: dismiss-resolved-slack-thread")
 
@@ -852,23 +913,20 @@ async def test_loop_reconsider_dry_run_logs_pick_but_does_not_mark_done():
 
     loop_task = asyncio.create_task(
         run_screener_loop(
-            intake=intake,
+            work=work,
+            queue=q,
             manifests=(_dismiss_manifest("dismiss-resolved-slack-thread"),),
             mcp=mcp,
-            add_to_queue=added.append,
             on_outcome=outcomes.append,
             allowed_kinds=None,
             dry_run=True,
             stop=stop,
-            reconsider_intake=reconsider,
-            mark_existing_done=marked_done.append,
         )
     )
     await asyncio.wait_for(asyncio.gather(driver(), loop_task), timeout=2.0)
-    # Dry-run forwards (no dismiss), but in reconsider mode forward is a
+    # Dry-run forwards (no dismiss), and in reconsider mode forward is a
     # no-op. The pick is captured in the outcome for visibility.
-    assert added == []
-    assert marked_done == []
+    assert q.get(task.id).state == STATE_PENDING
     assert outcomes[0].action == "forward"
     assert outcomes[0].dry_run_nominated is True
     assert outcomes[0].skill == "dismiss-resolved-slack-thread"
@@ -876,41 +934,37 @@ async def test_loop_reconsider_dry_run_logs_pick_but_does_not_mark_done():
 
 @pytest.mark.asyncio
 async def test_loop_intake_still_works_alongside_reconsider():
-    """Adding the reconsider parameter must not regress the normal
-    intake disposition — a regular intake task still gets forwarded
-    when no skill applies."""
-    intake: "asyncio.Queue[Task]" = asyncio.Queue()
-    reconsider: "asyncio.Queue[Task]" = asyncio.Queue()
-    added: list[Task] = []
-    marked_done: list[str] = []
+    """Intake and reconsider items share one work queue — a regular
+    intake task still gets released to pending when no skill applies,
+    and a reconsider item on the same queue is judged independently."""
+    intake_task = _task("note")
+    work, q = _loop_env(intake_task)
+    reconsider_task = q.add(_task("slack_msg"))
+    work.put_nowait((reconsider_task.id, "reconsider"))
     outcomes: list[ScreeningOutcome] = []
     stop = asyncio.Event()
 
-    intake.put_nowait(_task("note"))
-
     async def driver() -> None:
-        while not outcomes:
+        while len(outcomes) < 2:
             await asyncio.sleep(0)
         stop.set()
 
     loop_task = asyncio.create_task(
         run_screener_loop(
-            intake=intake,
+            work=work,
+            queue=q,
             manifests=(),
             mcp=_mcp(),
-            add_to_queue=added.append,
             on_outcome=outcomes.append,
             allowed_kinds=None,
             dry_run=False,
             stop=stop,
-            reconsider_intake=reconsider,
-            mark_existing_done=marked_done.append,
         )
     )
     await asyncio.wait_for(asyncio.gather(driver(), loop_task), timeout=2.0)
-    assert len(added) == 1
-    assert marked_done == []
-    assert outcomes[0].action == "forward"
+    assert q.get(intake_task.id).state == STATE_PENDING
+    assert q.get(reconsider_task.id).state == STATE_PENDING  # untouched
+    assert [o.action for o in outcomes] == ["forward", "forward"]
 
 
 # --- self-reported failure detection --------------------------------------
@@ -1002,16 +1056,14 @@ async def test_screen_keeps_handled_for_clean_success_summary():
 
 
 @pytest.mark.asyncio
-async def test_loop_self_reported_failure_forwards_task_to_user_queue():
+async def test_loop_self_reported_failure_surfaces_task_to_user_queue():
     """Regression: the bug was that ``handled`` outcomes suppress the
     task. After the fix, a self-reported-failure summary should route
-    through the ``failed`` branch, which forwards to ``add_to_queue``."""
-    intake: "asyncio.Queue[Task]" = asyncio.Queue()
-    added: list[Task] = []
+    through the ``failed`` branch, which releases to pending."""
+    task = _task("email_msg")
+    work, q = _loop_env(task)
     outcomes: list[ScreeningOutcome] = []
     stop = asyncio.Event()
-
-    intake.put_nowait(_task("email_msg"))
 
     mcp = MagicMock(spec=ClaudeMCPClient)
     mcp.run_agent = AsyncMock(side_effect=[
@@ -1026,10 +1078,10 @@ async def test_loop_self_reported_failure_forwards_task_to_user_queue():
 
     loop_task = asyncio.create_task(
         run_screener_loop(
-            intake=intake,
+            work=work,
+            queue=q,
             manifests=(_manifest("accept-invite", kinds=("email_msg",)),),
             mcp=mcp,
-            add_to_queue=added.append,
             on_outcome=outcomes.append,
             allowed_kinds=None,
             dry_run=False,
@@ -1037,9 +1089,9 @@ async def test_loop_self_reported_failure_forwards_task_to_user_queue():
         )
     )
     await asyncio.wait_for(asyncio.gather(driver(), loop_task), timeout=2.0)
-    assert len(added) == 1
+    assert q.pending() == [task]
     assert outcomes[0].action == "failed"
-    assert "auto-handle declined" in (added[0].body or "")
+    assert "auto-handle declined" in (q.get(task.id).body or "")
 
 
 # --- STATUS exit signal --------------------------------------------------

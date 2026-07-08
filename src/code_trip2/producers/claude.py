@@ -19,18 +19,13 @@ import logging
 import re
 import shlex
 import time
+from typing import Callable
 
 from code_trip2 import remote
 from code_trip2._async_utils import event_or_timeout
 from code_trip2.config import Config
 from code_trip2.summarizer import Summarizer, SummarizerError
-from code_trip2.tasks import (
-    STATE_ACTIVE,
-    STATE_PENDING,
-    STATE_SNOOZED,
-    Task,
-    TaskQueue,
-)
+from code_trip2.tasks import Task, TaskQueue
 
 logger = logging.getLogger(__name__)
 
@@ -54,11 +49,17 @@ class ClaudeProducer:
         config: Config,
         queue: TaskQueue,
         summarizer: Summarizer | None = None,
+        submit: "Callable[[Task], Task] | None" = None,
         poll_interval: float = 1.5,
     ) -> None:
         self._config = config
         self._queue = queue
         self._summarizer = summarizer
+        # ``submit`` is the pipeline entry point (main.py's screening
+        # gate). It lands the task via ``queue.upsert``, so a second
+        # Stop event for a window that already has a live task rewrites
+        # it instead of stacking duplicates.
+        self._submit: "Callable[[Task], Task]" = submit or queue.upsert
         self._poll = poll_interval
         self._stop = asyncio.Event()
         self._seen: set[str] = set()
@@ -142,22 +143,6 @@ class ClaudeProducer:
         body = await self._summarize_pane(window, last_user_msg, host, opts)
         source = {"window": window, "finished_at": finished_at}
 
-        # Collapse: only one pending claude_reply per window. A long
-        # remote session that hits Stop multiple times (or a /do-ticket
-        # run that stops, then resumes after a follow-up) should keep
-        # rewriting the same queue task rather than stacking duplicates.
-        # Same pattern as LinearProducer._find_pending_issue_task.
-        existing = self._find_pending_window_task(window)
-        if existing is not None:
-            self._queue.update_task(
-                existing.id,
-                headline=headline,
-                body=body,
-                source=source,
-                created_at=time.time(),
-            )
-            return
-
         subject_key = (
             f"linear:{window.upper()}"
             if _TICKET_WINDOW_RE.match(window)
@@ -171,29 +156,9 @@ class ClaudeProducer:
             source=source,
             created_at=time.time(),
             subject_key=subject_key,
+            origin_key=f"claude:{window}",
         )
-        self._queue.add(task)
-
-    def _find_pending_window_task(self, window: str) -> Task | None:
-        """Locate a live claude_reply for the given window.
-
-        "Live" spans PENDING + ACTIVE + SNOOZED — a second Stop event
-        for a window the user is currently viewing should refresh
-        their open task rather than spawn a sibling in the queue.
-        DONE / DROPPED bail out so a closed-out reply that revives
-        later starts fresh.
-        """
-        if not window:
-            return None
-        live = {STATE_PENDING, STATE_ACTIVE, STATE_SNOOZED}
-        for task in self._queue.all():
-            if task.kind != "claude_reply":
-                continue
-            if task.state not in live:
-                continue
-            if (task.source or {}).get("window") == window:
-                return task
-        return None
+        self._submit(task)
 
     async def _summarize_pane(
         self,

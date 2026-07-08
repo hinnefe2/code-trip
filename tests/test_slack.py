@@ -1449,6 +1449,7 @@ def _seed_thread_task(
             "url": "",
             "messages": [entry],
         },
+        origin_key=f"slack:{channel_id}:{thread_ts}",
     )
     q.add(t)
     return t

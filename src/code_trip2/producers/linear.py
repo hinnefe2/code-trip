@@ -13,9 +13,9 @@ subsequent polls pass the last seen ``updatedAt`` so we only get
 recently-changed issues.
 
 Topic is the lowercase issue identifier (``ai-1389``) so one ticket
-maps to one queue task. Repeat sightings of the same identifier
-collapse into the existing task — same pattern as Slack/email thread
-collapse.
+maps to one queue task. Repeat sightings of the same identifier carry
+the same ``origin_key`` and collapse into the existing live task via
+:meth:`TaskQueue.upsert` — same rule as every other producer.
 
 **Reply path**: :func:`dispatch._respond_linear` posts the transcript
 as a comment on the issue via ``save_comment``.
@@ -33,13 +33,7 @@ from code_trip2._async_utils import event_or_timeout, next_tick_delay
 from code_trip2.config import Config
 from code_trip2.linear_state import LinearState
 from code_trip2.producers.claude_mcp import ClaudeMCPClient, ClaudeMCPError
-from code_trip2.tasks import (
-    STATE_ACTIVE,
-    STATE_PENDING,
-    STATE_SNOOZED,
-    Task,
-    TaskQueue,
-)
+from code_trip2.tasks import Task, TaskQueue
 
 logger = logging.getLogger(__name__)
 
@@ -59,22 +53,18 @@ class LinearProducer:
         queue: TaskQueue,
         mcp: ClaudeMCPClient | None = None,
         state: LinearState | None = None,
-        intake: Callable[[Task], None] | None = None,
+        submit: Callable[[Task], Task] | None = None,
     ) -> None:
         self._config = config
         self._queue = queue
         self._mcp = mcp
         self._state = state or LinearState()
-        # ``intake`` routes new tasks through the screener (or directly
-        # to the queue when no screener is configured). Existing-task
-        # updates skip intake — they mutate an already-visible task.
-        self._intake: Callable[[Task], None] = intake or queue.add
+        # ``submit`` is the pipeline entry point (main.py's screening
+        # gate). It lands the task via ``queue.upsert``, so a
+        # re-sighting of an issue that already has a live task —
+        # including one still being screened — updates it in place.
+        self._submit: Callable[[Task], Task] = submit or queue.upsert
         self._stop = asyncio.Event()
-        # Per-session dedup keyed by issue identifier (e.g. ``AI-1389``).
-        # Cross-restart dedup is Linear itself: ``main.py`` drops replayed
-        # ``linear_issue`` tasks and the first poll re-populates from the
-        # current Linear state.
-        self._recent_keys: set[str] = set()
         # First poll of the session uses a wide query (no ``updatedAt``
         # floor) so all currently-active issues surface, regardless of
         # when they last changed. Subsequent polls revert to the
@@ -139,12 +129,22 @@ class LinearProducer:
         emitted = 0
         skipped = 0
         retired = 0
-        max_ts_seen = self._state.last_updated_at() or ""
+        last_cursor = self._state.last_updated_at() or ""
+        max_ts_seen = last_cursor
         for issue in issues:
             identifier = issue.get("identifier") or ""
             status_type = issue.get("statusType") or ""
             updated_at = issue.get("updatedAt") or ""
             if not identifier:
+                continue
+            # The incremental ``updatedAt`` filter is inclusive, so the
+            # boundary issue comes back every poll. Strict client-side
+            # guard (mirrors the email producer's ``ts <= last_ts``
+            # check) so an unchanged re-return is never re-processed —
+            # without this the boundary ticket's task gets its
+            # created_at refreshed each poll and never ages up.
+            if not wide_poll and last_cursor and updated_at and updated_at <= last_cursor:
+                skipped += 1
                 continue
             # Track max ts even for filtered issues so the cursor
             # advances past them and we don't keep re-pulling on
@@ -169,7 +169,6 @@ class LinearProducer:
                 emitted += 1
             except Exception:
                 logger.exception("Failed to emit Linear task for %s", identifier)
-            self._recent_keys.add(identifier)
 
         if max_ts_seen and max_ts_seen != (self._state.last_updated_at() or ""):
             self._state.set_last_updated_at(max_ts_seen)
@@ -184,9 +183,6 @@ class LinearProducer:
         # no results, flip the flag so we don't keep paying the wider
         # cost on every interval.
         self._first_poll = False
-
-        if len(self._recent_keys) > 500:
-            self._recent_keys = set(sorted(self._recent_keys)[-250:])
 
     async def _wide_pull(self, allowed: frozenset[str]) -> list[dict] | None:
         """Initial sync: one MCP call per state in the allow-list.
@@ -320,23 +316,6 @@ class LinearProducer:
             "priority": priority,
         }
 
-        # Same collapse rule as Slack/email: one live task per issue
-        # identifier. Updates to title/description/status replace the
-        # existing task's body rather than stacking duplicates. "Live"
-        # spans PENDING + ACTIVE + SNOOZED so a Linear update that
-        # lands while the user is viewing the ticket (ACTIVE) refreshes
-        # the open panel instead of spawning a sibling in the queue.
-        existing = self._find_live_issue_task(identifier)
-        if existing is not None:
-            self._queue.update_task(
-                existing.id,
-                headline=headline,
-                body=body,
-                source=source,
-                created_at=time.time(),
-            )
-            return
-
         task = Task(
             kind="linear_issue",
             topic=topic_key,
@@ -345,55 +324,25 @@ class LinearProducer:
             source=source,
             created_at=time.time(),
             subject_key=f"linear:{identifier.upper()}",
+            origin_key=_origin_key(identifier),
         )
-        self._intake(task)
-
-    def _find_pending_issue_task(self, identifier: str) -> Task | None:
-        """Pending-only lookup used by the retire path.
-
-        ``_mark_closed_task`` deliberately leaves ACTIVE tasks alone —
-        if the user is mid-conversation with a ticket that just got
-        closed in Linear, yanking it out from under them would be
-        worse than letting the stale state linger until they finish.
-        """
-        if not identifier:
-            return None
-        for task in self._queue.pending():
-            if task.kind != "linear_issue":
-                continue
-            if (task.source or {}).get("identifier") == identifier:
-                return task
-        return None
-
-    def _find_live_issue_task(self, identifier: str) -> Task | None:
-        """Live-state lookup used by the collapse path in ``_emit_task``.
-
-        Scans PENDING + ACTIVE + SNOOZED — see the comment in
-        ``_emit_task`` for why. DONE / DROPPED are skipped so a
-        dismissed ticket whose status flips back into the active set
-        starts a fresh task.
-        """
-        if not identifier:
-            return None
-        live = {STATE_PENDING, STATE_ACTIVE, STATE_SNOOZED}
-        for task in self._queue.all():
-            if task.kind != "linear_issue":
-                continue
-            if task.state not in live:
-                continue
-            if (task.source or {}).get("identifier") == identifier:
-                return task
-        return None
+        self._submit(task)
 
     def _mark_closed_task(self, identifier: str) -> bool:
         """Retire a queue task for a ticket that's left the active set.
 
-        Returns True when a pending task existed and was marked done;
-        False when there was nothing to clean up (the common case —
-        most filtered issues never had a queue task).
+        Returns True when a pending/snoozed task existed and was marked
+        done; False when there was nothing to clean up (the common case
+        — most filtered issues never had a queue task). ACTIVE tasks
+        are deliberately left alone — if the user is mid-conversation
+        with a ticket that just got closed in Linear, yanking it out
+        from under them would be worse than letting the stale state
+        linger until they finish.
         """
-        existing = self._find_pending_issue_task(identifier)
-        if existing is None:
+        if not identifier:
             return False
-        self._queue.mark_done(existing.id)
-        return True
+        return self._queue.resolve_by_origin(_origin_key(identifier)) is not None
+
+
+def _origin_key(identifier: str) -> str:
+    return f"linear:{identifier.upper()}"

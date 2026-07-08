@@ -109,14 +109,19 @@ class QueueLog:
         applies events in order, and drops anything older than 24 hours
         by ``created_at`` — *unless* the task's kind is in
         :data:`_DURABLE_KINDS`. Tasks marked done/dropped during the
-        replay window are not returned — they're terminal.
+        replay window are not returned — they're terminal — *except*
+        durable kinds carrying an ``origin_key``, whose terminal
+        records ARE returned so ``TaskQueue.upsert(if_terminal="skip")``
+        can suppress a respawned follow-up across restarts (they stay
+        terminal, so they never surface). Key-less durable tasks
+        (voice notes) can't be re-spawned, so their terminal records
+        stay filtered.
 
-        Tasks left in ``active`` state at shutdown are demoted back to
-        ``pending``. The active state only means anything while the
-        orchestrator is running and ``ctx.current_task`` points at it;
-        across a restart there's no one "holding" the task, so leaving
-        it active makes it invisible to both ``TaskQueue.pending()``
-        and the TUI's current-task panel.
+        Tasks left in ``active`` or ``screening`` state at shutdown are
+        demoted back to ``pending``. Neither state means anything
+        across a restart: no one is "holding" an active task, and
+        re-screening on boot risks double side effects (e.g. a second
+        RSVP), so surfacing to the user is the fail-safe.
         """
         cutoff = time.time() - _REPLAY_WINDOW_S
         state: dict[str, Task] = {}
@@ -148,12 +153,15 @@ class QueueLog:
                 logger.warning("Could not read %s for replay", path, exc_info=True)
         out: list[Task] = []
         for t in state.values():
-            if t.state == "active":
+            if t.state in ("active", "screening"):
                 t.state = "pending"
                 out.append(t)
             elif t.state in ("pending", "snoozed"):
                 out.append(t)
-            # done / dropped are terminal — skip.
+            elif t.kind in _DURABLE_KINDS and t.origin_key:
+                # Terminal durable record: loaded (still terminal) so
+                # origin-key suppression survives the restart.
+                out.append(t)
         return out
 
     def _queue_files(self) -> list[Path]:

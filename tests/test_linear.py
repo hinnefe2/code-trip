@@ -423,8 +423,9 @@ async def test_producer_is_polling_true_while_call_in_flight(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_producer_routes_through_intake(tmp_path: Path):
-    """Producer emits via the injected intake (so the screener gets first look)."""
+async def test_producer_routes_through_submit(tmp_path: Path):
+    """Producer emits via the injected submit gate (so the screener gets
+    first look)."""
     cfg = SimpleNamespace(
         linear_poll_interval=180.0,
         linear_state_types=("started",),
@@ -443,16 +444,111 @@ async def test_producer_routes_through_intake(tmp_path: Path):
         }]
     })
     q = TaskQueue()
-    intake_called: list[Task] = []
+    submitted: list[Task] = []
+
+    def fake_submit(t: Task) -> Task:
+        submitted.append(t)
+        return t
+
     p = LinearProducer(
         config=cfg, queue=q, mcp=mcp, state=state,
-        intake=intake_called.append,
+        submit=fake_submit,
     )
     await p._poll_once()
-    assert len(intake_called) == 1
-    assert intake_called[0].source["identifier"] == "AI-99"
-    # And the intake bypasses queue.add (the test intake just appends).
+    assert len(submitted) == 1
+    assert submitted[0].source["identifier"] == "AI-99"
+    assert submitted[0].origin_key == "linear:AI-99"
+    # And submit bypasses queue.upsert (the test submit just appends).
     assert q.all() == []
+
+
+@pytest.mark.asyncio
+async def test_producer_boundary_issue_not_reprocessed(tmp_path: Path):
+    """Regression (TRI-240 aggravator): Linear's ``updatedAt`` filter is
+    inclusive, so the cursor-boundary issue comes back on every
+    incremental poll. The strict client-side guard must skip it — no
+    re-emit, no created_at refresh."""
+    p, q, mcp, state = _producer(tmp_path, state_types=("started",))
+    p._first_poll = False
+    state.set_last_updated_at("2026-05-28T10:00:00.000Z")
+    boundary = {
+        "id": "TRI-240",
+        "title": "Boundary ticket",
+        "statusType": "started",
+        "url": "u",
+        "updatedAt": "2026-05-28T10:00:00.000Z",  # == cursor
+    }
+    mcp.call_tool.return_value = {"issues": [boundary]}
+    await p._poll_once()
+    assert q.all() == []  # unchanged re-return: never processed
+
+    # A genuinely newer update does come through.
+    mcp.call_tool.return_value = {
+        "issues": [{**boundary, "updatedAt": "2026-05-28T11:00:00.000Z"}]
+    }
+    await p._poll_once()
+    [task] = q.pending()
+    assert task.source["identifier"] == "TRI-240"
+
+
+@pytest.mark.asyncio
+async def test_producer_reemission_during_screening_backlog_yields_one_task(
+    tmp_path: Path,
+):
+    """THE TRI-240 regression: the issue is emitted while the screener
+    is backlogged (task parked in the ``screening`` state), then
+    re-emitted before screening finishes. With the task resident in the
+    queue from the first moment, the re-emission must collapse into it —
+    exactly one task, ever."""
+    from code_trip2.tasks import STATE_PENDING, STATE_SCREENING
+
+    q = TaskQueue()
+    screener_work: list[str] = []
+
+    # Minimal stand-in for main.py's submit gate: park in screening,
+    # upsert, queue the id only if the task actually entered.
+    def submit(task: Task) -> Task:
+        task.state = STATE_SCREENING
+        resident = q.upsert(task)
+        if resident is task:
+            screener_work.append(task.id)
+        return resident
+
+    cfg = SimpleNamespace(
+        linear_poll_interval=180.0,
+        linear_state_types=("started",),
+        linear_max_results=50,
+    )
+    state = LinearState(path=tmp_path / "linear-state.json")
+    mcp = MagicMock(spec=ClaudeMCPClient)
+    mcp.enabled = True
+    p = LinearProducer(config=cfg, queue=q, mcp=mcp, state=state, submit=submit)
+
+    issue = {
+        "id": "TRI-240",
+        "title": "Triplicated ticket",
+        "statusType": "started",
+        "url": "u",
+        "updatedAt": "2026-05-28T10:00:00.000Z",
+    }
+    mcp.call_tool = AsyncMock(return_value={"issues": [issue]})
+    await p._poll_once()  # wide first poll emits, task parks in screening
+
+    # Screener is stalled (300s executor run); next poll re-returns the
+    # ticket with fresh activity before the cursor guard can save us.
+    mcp.call_tool = AsyncMock(return_value={
+        "issues": [{**issue, "updatedAt": "2026-05-28T10:02:00.000Z"}]
+    })
+    await p._poll_once()
+    await p._poll_once()  # and again — three sightings total
+
+    assert len(q.all()) == 1, "re-sightings must collapse, not triplicate"
+    assert len(screener_work) == 1  # screened once, not three times
+    [task] = q.all()
+    assert task.state == STATE_SCREENING
+    # Screener finally finishes and releases it — still just one task.
+    q.set_state(task.id, STATE_PENDING)
+    assert [t.id for t in q.pending()] == [task.id]
 
 
 # --- reply path ----------------------------------------------------------

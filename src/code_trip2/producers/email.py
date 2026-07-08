@@ -31,7 +31,7 @@ from code_trip2.config import Config
 from code_trip2.email_state import EmailState
 from code_trip2.producers.claude_mcp import ClaudeMCPClient, ClaudeMCPError
 from code_trip2.producers.slack import _previous_workday_5pm_unix
-from code_trip2.tasks import STATE_PENDING, Task, TaskQueue
+from code_trip2.tasks import Task, TaskQueue
 
 if TYPE_CHECKING:
     pass
@@ -105,23 +105,18 @@ class EmailProducer:
         queue: TaskQueue,
         mcp: ClaudeMCPClient | None = None,
         state: EmailState | None = None,
-        intake: Callable[[Task], None] | None = None,
+        submit: Callable[[Task], Task] | None = None,
     ) -> None:
         self._config = config
         self._queue = queue
         self._mcp = mcp
         self._state = state or EmailState()
-        # ``intake`` routes new tasks through the screener (or directly
-        # to the queue when no screener is configured). Thread-collapse
-        # updates skip the intake — they mutate an already-visible task
-        # in the user queue, so there's nothing to screen.
-        self._intake: Callable[[Task], None] = intake or queue.add
+        # ``submit`` is the pipeline entry point (main.py's screening
+        # gate). It lands the task via ``queue.upsert``, so a reply in
+        # a thread that already has a live task — including one still
+        # being screened — updates it in place instead of duplicating.
+        self._submit: Callable[[Task], Task] = submit or queue.upsert
         self._stop = asyncio.Event()
-        # Per-session dedup keyed by (thread_id, latest_message_id).
-        # Cross-restart dedup is the inbox itself: ``main.py`` drops
-        # replayed ``email_msg`` tasks and the first poll re-populates
-        # from the current inbox state.
-        self._recent_keys: set[str] = set()
         # First poll of the session uses a wide-window query (no
         # ``after:`` clause) so anything currently in the inbox
         # surfaces, regardless of when it arrived. Subsequent polls
@@ -204,16 +199,13 @@ class EmailProducer:
         for th in threads:
             ts = th.get("ts_unix") or 0
             thread_id = th.get("thread_id") or ""
-            msg_id = th.get("message_id") or thread_id
             if not thread_id or not ts:
                 continue
-            key = f"{thread_id}:{msg_id}"
-            if key in self._recent_keys:
-                skipped += 1
-                continue
-            # On incremental polls, the ``after:`` filter already
-            # excludes older messages — but the wide first poll has
-            # no time floor, so the cursor is purely advisory.
+            # Strict cursor guard: the ``after:`` operator is inclusive
+            # at the boundary, so the newest already-processed message
+            # comes back each incremental poll. (The wide first poll
+            # has no time floor; ``upsert`` collapse makes re-sightings
+            # harmless there.)
             if not wide_poll and last_ts and ts <= last_ts:
                 skipped += 1
                 continue
@@ -222,7 +214,6 @@ class EmailProducer:
                 emitted += 1
             except Exception:
                 logger.exception("Failed to emit email task for thread=%s", thread_id)
-            self._recent_keys.add(key)
             if ts > max_ts_seen:
                 max_ts_seen = ts
 
@@ -239,9 +230,6 @@ class EmailProducer:
         # no results, flip the flag so we don't keep paying the wider
         # cost on every interval.
         self._first_poll = False
-
-        if len(self._recent_keys) > 500:
-            self._recent_keys = set(sorted(self._recent_keys)[-250:])
 
     # Page size for the reconcile query. Generous so the whole
     # action-needed inbox fits in one page — reconcile only retracts when
@@ -279,7 +267,7 @@ class EmailProducer:
         if self._mcp is None or not self._mcp.enabled:
             return 0
         candidates = [
-            (t.id, (t.source or {}).get("thread_id"))
+            (t.source or {}).get("thread_id")
             for t in self._queue.pending()
             if t.kind == "email_msg" and (t.source or {}).get("thread_id")
         ]
@@ -308,16 +296,14 @@ class EmailProducer:
             return 0
         current = {th.get("thread_id") for th in threads if th.get("thread_id")}
         retired = 0
-        for task_id, thread_id in candidates:
+        for thread_id in candidates:
             if thread_id in current:
                 continue
-            # Re-check state: the user may have acted on it during the
-            # await, or it may have been retired by a concurrent path.
-            t = self._queue.get(task_id)
-            if t is None or t.state != STATE_PENDING:
-                continue
-            self._queue.mark_done(task_id)
-            retired += 1
+            # ``resolve_by_origin`` re-checks state, so a task the user
+            # activated (or that was retired by a concurrent path)
+            # during the await is left alone.
+            if self._queue.resolve_by_origin(_origin_key(thread_id)) is not None:
+                retired += 1
         if retired:
             logger.info(
                 "EmailProducer: reconcile retired %d task(s) whose thread "
@@ -496,20 +482,6 @@ class EmailProducer:
             "subject": subject,
         }
 
-        # Same thread-collapse rule as Slack: one pending task per thread.
-        # A reply in an existing thread updates the live task's body to
-        # the latest message rather than stacking duplicates.
-        existing = self._find_pending_thread_task(thread_id)
-        if existing is not None:
-            self._queue.update_task(
-                existing.id,
-                headline=headline,
-                body=body,
-                source=source,
-                created_at=time.time(),
-            )
-            return
-
         task = Task(
             kind="email_msg",
             topic=topic_key,
@@ -518,21 +490,16 @@ class EmailProducer:
             source=source,
             created_at=time.time(),
             subject_key=_detect_subject_key(sender_email, subject, snippet),
+            origin_key=_origin_key(thread_id),
         )
-        self._intake(task)
-
-    def _find_pending_thread_task(self, thread_id: str) -> Task | None:
-        if not thread_id:
-            return None
-        for task in self._queue.pending():
-            if task.kind != "email_msg":
-                continue
-            if (task.source or {}).get("thread_id") == thread_id:
-                return task
-        return None
+        self._submit(task)
 
 
 # --- helpers ----------------------------------------------------------------
+
+
+def _origin_key(thread_id: str) -> str:
+    return f"email:{thread_id}"
 
 
 def _parse_ts(raw) -> int:

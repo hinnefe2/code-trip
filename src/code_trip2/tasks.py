@@ -48,8 +48,16 @@ _PER_TOPIC_CAP = 5
 STATE_PENDING = "pending"
 STATE_ACTIVE = "active"
 STATE_SNOOZED = "snoozed"
+STATE_SCREENING = "screening"
 STATE_DONE = "done"
 STATE_DROPPED = "dropped"
+
+# States where the task is still "the" task for its real-world object:
+# a re-sighting of the same object updates it in place rather than
+# minting a sibling. Terminal states (done/dropped) are the complement.
+LIVE_STATES = frozenset(
+    {STATE_PENDING, STATE_ACTIVE, STATE_SNOOZED, STATE_SCREENING}
+)
 
 URGENCY_INTERRUPT = "interrupt"
 URGENCY_NORMAL = "normal"
@@ -78,15 +86,17 @@ class Task:
     # in the queue. The key is a free-form string by convention namespaced
     # as ``<system>:<identifier>``.
     subject_key: str | None = None
-    # Stable identity for suppressing re-emitted duplicates. Unlike
-    # ``id`` (a fresh uuid every time the task is minted), this is
-    # derived from durable content so the *same* logical task produces
-    # the *same* key across re-emits and restarts. :meth:`TaskQueue.add`
-    # drops a task whose ``dedup_key`` already exists in any state. Set
-    # for spawned ``meeting_followup`` tasks (the Gemini-notes archiver
-    # re-spawns one every time its parent email is re-screened); ``None``
-    # for everything else, which keeps ``add`` a no-op for them.
-    dedup_key: str | None = None
+    # Identity of the real-world object that produced this task —
+    # "which thing is this", where ``subject_key`` is "what is it
+    # about". Producer-owned and namespaced: ``email:<thread_id>``,
+    # ``slack:<channel_id>:<thread_ts>``, ``linear:<IDENTIFIER>``,
+    # ``claude:<window>``, ``followup:<thread_id>:<headline>``. Unlike
+    # ``id`` (a fresh uuid every mint) it is derived from durable
+    # content, so re-emits and restarts produce the same key.
+    # :meth:`TaskQueue.upsert` uses it to collapse re-sightings into
+    # the live task and to suppress or re-surface after a terminal
+    # one. ``None`` (manual notes) means singleton — never collapsed.
+    origin_key: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -102,7 +112,7 @@ class Task:
             "state": self.state,
             "parent_id": self.parent_id,
             "subject_key": self.subject_key,
-            "dedup_key": self.dedup_key,
+            "origin_key": self.origin_key,
         }
 
     @classmethod
@@ -120,7 +130,8 @@ class Task:
             state=d.get("state", STATE_PENDING),
             parent_id=d.get("parent_id"),
             subject_key=d.get("subject_key"),
-            dedup_key=d.get("dedup_key"),
+            # Legacy JSONL records wrote the field as ``dedup_key``.
+            origin_key=d.get("origin_key") or d.get("dedup_key"),
         )
 
 
@@ -239,6 +250,11 @@ class TaskQueue:
 
     def __init__(self) -> None:
         self._tasks: dict[str, Task] = {}
+        # origin_key -> id of the most recent task minted for that key.
+        # The single identity authority: producers resolve "is there
+        # already a task for this object?" through this index (via
+        # ``upsert`` / ``get_by_origin``) instead of scanning the queue.
+        self._origin: dict[str, str] = {}
         self._listeners: list = []
 
     def add_listener(self, fn) -> None:
@@ -253,32 +269,84 @@ class TaskQueue:
     # ----- mutations ------------------------------------------------------
 
     def add(self, task: Task) -> Task:
-        """Add a task, applying per-topic backpressure if needed.
+        """Add a task unconditionally, applying per-topic backpressure.
 
-        If the task carries a ``dedup_key`` and another task with the
-        same key already exists in *any* state (pending, done, dropped,
-        …), the add is suppressed and the existing task is returned
-        unchanged — no new entry, no ``add`` event. This stops a
-        re-emitted ``meeting_followup`` from resurrecting after the user
-        already filed it (ACT+YES → done) or dismissed it: the archiver
-        re-spawns a fresh follow-up (new uuid) every time its parent
-        email is re-screened, and matching the stable key catches it
-        even though the uuid differs. Durable kinds are replayed on
-        restart, so the done original is still present to match against.
+        No identity checks — callers that want collapse/suppression
+        semantics go through :meth:`upsert`. ``add`` still registers
+        the task's ``origin_key`` in the index so a later ``upsert``
+        for the same object finds it.
         """
-        if task.dedup_key is not None:
-            existing = self._find_by_dedup_key(task.dedup_key)
-            if existing is not None:
-                return existing
         self._tasks[task.id] = task
+        if task.origin_key:
+            self._origin[task.origin_key] = task.id
         self._enforce_topic_cap(task.topic)
         self._fire("add", task)
         return task
 
-    def _find_by_dedup_key(self, key: str) -> Task | None:
-        for t in self._tasks.values():
-            if t.dedup_key == key:
-                return t
+    def upsert(self, task: Task, *, if_terminal: str = "new") -> Task:
+        """Add ``task`` unless a task for the same ``origin_key`` exists.
+
+        The one collapse/suppress/re-surface rule for all producers:
+
+        - no ``origin_key`` → plain :meth:`add` (singleton).
+        - existing task is live (pending / active / snoozed /
+          screening) → update it in place (headline, body, source,
+          subject_key, created_at) and return it; never a sibling.
+          ``created_at`` deliberately refreshes: post-cursor-fix a
+          re-sighting means the object genuinely changed, so its age
+          resets.
+        - existing task is terminal (done / dropped):
+          ``if_terminal="new"`` mints a fresh task (the object came
+          back — e.g. a reopened ticket); ``if_terminal="skip"``
+          returns the terminal task unchanged, no event (a respawned
+          follow-up the user already filed or dismissed).
+
+        Returns the resident task — the caller can test ``result is
+        task`` to learn whether the passed task actually entered.
+        """
+        key = task.origin_key
+        if key is None:
+            return self.add(task)
+        existing_id = self._origin.get(key)
+        existing = self._tasks.get(existing_id) if existing_id else None
+        if existing is None:
+            return self.add(task)
+        if existing.state in LIVE_STATES:
+            existing.headline = task.headline
+            existing.body = task.body
+            existing.source = task.source
+            existing.subject_key = task.subject_key
+            existing.created_at = task.created_at
+            self._fire("update", existing)
+            return existing
+        if if_terminal == "skip":
+            return existing
+        return self.add(task)  # re-surface fresh; add() re-points the index
+
+    def get_by_origin(self, origin_key: str) -> Task | None:
+        """Most recent task minted for ``origin_key``, any state.
+
+        For producers whose update-in-place is richer than ``upsert``'s
+        field overwrite (Slack merges message histories) and need to
+        look before they merge.
+        """
+        task_id = self._origin.get(origin_key)
+        return self._tasks.get(task_id) if task_id else None
+
+    def resolve_by_origin(self, origin_key: str) -> Task | None:
+        """The source says the object is resolved — retire its task.
+
+        Marks done iff the task is pending or snoozed and returns it;
+        otherwise returns None. ACTIVE is deliberately untouched: if
+        the user is mid-conversation with a task whose object just
+        closed under them, yanking it away is worse than letting the
+        stale state linger until they finish. SCREENING is also left
+        alone — the screener will surface or retire it on its own.
+        """
+        t = self.get_by_origin(origin_key)
+        if t is not None and t.state in (STATE_PENDING, STATE_SNOOZED):
+            self.mark_done(t.id)
+            return t
         return None
 
     def _enforce_topic_cap(self, topic: str) -> None:
@@ -333,8 +401,14 @@ class TaskQueue:
         t = self._tasks.get(task_id)
         if t is None:
             return None
+        prior = t.state
         t.state = state
         self._fire("state", t)
+        # A task leaving screening only now counts toward its topic's
+        # pending cap — enforce on release or the cap can be exceeded
+        # by however many siblings were in screening at once.
+        if prior == STATE_SCREENING and state == STATE_PENDING:
+            self._enforce_topic_cap(t.topic)
         return t
 
     def mark_active(self, task_id: str) -> Task | None:
@@ -409,6 +483,16 @@ class TaskQueue:
     def load(self, tasks: Iterable[Task]) -> None:
         """Replace contents wholesale. Used by JSONL replay on startup."""
         self._tasks = {t.id: t for t in tasks}
+        # Rebuild the origin index. When a key maps to both a terminal
+        # record (kept for cross-restart follow-up suppression) and a
+        # live task, the live one wins.
+        self._origin = {}
+        for t in self._tasks.values():
+            if not t.origin_key:
+                continue
+            cur = self._tasks.get(self._origin.get(t.origin_key, ""))
+            if cur is None or cur.state not in LIVE_STATES:
+                self._origin[t.origin_key] = t.id
 
     # ----- listeners ------------------------------------------------------
 

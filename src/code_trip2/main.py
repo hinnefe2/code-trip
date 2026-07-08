@@ -34,6 +34,7 @@ from code_trip2.producers.mcp_batch import BatchedMCPClient, MCPBatcher
 from code_trip2.screener import (
     AutohandleLogEntry,
     ScreeningOutcome,
+    candidates_for,
     run_screener_loop,
 )
 from code_trip2.session_log import SessionLogger, default_session_path
@@ -41,7 +42,7 @@ from code_trip2.skills import load_skill_manifests
 from code_trip2.slack_state import SlackState
 from code_trip2.stt_client import STTClient, STTClientError
 from code_trip2.summarizer import Summarizer
-from code_trip2.tasks import Task, TaskQueue
+from code_trip2.tasks import STATE_SCREENING, Task, TaskQueue
 from code_trip2.tts_client import SilentTTSClient, TTSClient
 from code_trip2.tui import CodeTripApp, detect_tui_host_app
 
@@ -191,24 +192,24 @@ async def main_async(config: Config, *, tui: bool = False, silent: bool = False)
         agent_allowed_tools=agent_allowed_tools,
     )
 
-    # Task screener intake. Producers either call ``submit`` (= push
-    # through the screener) or fall back to ``queue.add`` directly,
-    # depending on autohandle config. The screener coroutine is only
-    # scheduled when autohandle is actually doing something — otherwise
-    # we save the loop the cost of a worker task that would just
-    # forward every task untouched.
+    # Task screener. Every producer routes new tasks through ``submit``
+    # below: screenable tasks land in the queue in the ``screening``
+    # state (resident, so re-sightings collapse into them) and their ids
+    # go onto the screener's work queue; everything else lands straight
+    # as ``pending``. The screener coroutine is only scheduled when
+    # autohandle is actually doing something — otherwise every task
+    # takes the pending path and the worker isn't needed.
     autohandle_active = (
         config.autohandle_enabled
         and config.autohandle_kinds
         and any(m.auto_handle for m in skill_manifests)
         and agent_mcp.enabled
     )
-    intake_q: "asyncio.Queue[Task]" = asyncio.Queue()
-    # Reconsider queue: producers push *already-queued* tasks here when
-    # something changes (e.g. SlackProducer when Henry replies in a
-    # tracked thread). The screener re-judges and, if a dismiss skill
-    # picks, marks the existing task done.
-    reconsider_q: "asyncio.Queue[Task]" = asyncio.Queue()
+    # Work items are ``(task_id, mode)``: "intake" for a task parked in
+    # the screening state, "reconsider" for an already-visible task the
+    # producer wants re-judged (e.g. SlackProducer when a tracked thread
+    # gets new activity). One queue — the screener is serial anyway.
+    screener_work: "asyncio.Queue[tuple[str, str]]" = asyncio.Queue()
     screener_stop = asyncio.Event()
 
     def _on_screener_outcome(outcome: ScreeningOutcome) -> None:
@@ -234,22 +235,41 @@ async def main_async(config: Config, *, tui: bool = False, silent: bool = False)
             error=outcome.error,
             dry_run_nominated=outcome.dry_run_nominated,
         )
-        # Handled tasks never enter ``queue`` and so don't appear in
-        # the queue log via the listener; record a synthetic entry so
-        # offline replay/analysis can attribute them.
-        if outcome.action == "handled":
-            queue_log.record("autohandle", outcome.task)
 
-    submit_to_reconsider: Callable[[Task], None] | None
-    if autohandle_active:
-        submit_to_intake: Callable[[Task], None] = intake_q.put_nowait
-        # Reconsider is gated by the same kinds list. SlackProducer
-        # only fires it when slack_msg is in autohandle_kinds.
-        submit_to_reconsider = (
-            reconsider_q.put_nowait
-            if "slack_msg" in config.autohandle_kinds
-            else None
+    # The single pipeline entry point for producer tasks. Screenable
+    # kinds park in the ``screening`` state; the rest go straight to
+    # ``pending``. Either way the task is resident in ``queue`` from
+    # the first moment, so identity checks (``upsert``) see it — no
+    # window where a task exists but is invisible, no matter how long
+    # ``claude --print`` takes. The screenability check is sync and
+    # pure (kind gate + manifest match), so unscreenable tasks skip the
+    # screener entirely instead of queueing behind a slow executor run.
+    allowed_kinds = frozenset(config.autohandle_kinds)
+
+    def submit(task: Task, *, if_terminal: str = "new") -> Task:
+        screenable = (
+            autohandle_active
+            and task.kind in allowed_kinds
+            and bool(candidates_for(task, skill_manifests))
         )
+        if screenable:
+            task.state = STATE_SCREENING
+        resident = queue.upsert(task, if_terminal=if_terminal)
+        # Only a task that actually entered needs screening; an upsert
+        # that collapsed into an existing task (screening or already
+        # user-visible) has nothing new to judge.
+        if screenable and resident is task:
+            screener_work.put_nowait((task.id, "intake"))
+        return resident
+
+    # Reconsider is gated by the same kinds list. SlackProducer only
+    # fires it when slack_msg is in autohandle_kinds.
+    submit_to_reconsider: Callable[[Task], None] | None = None
+    if autohandle_active and "slack_msg" in config.autohandle_kinds:
+        submit_to_reconsider = (
+            lambda t: screener_work.put_nowait((t.id, "reconsider"))
+        )
+    if autohandle_active:
         logger.info(
             "Autohandle ON: kinds=%s dry_run=%s (%d eligible skills)",
             list(config.autohandle_kinds),
@@ -257,8 +277,6 @@ async def main_async(config: Config, *, tui: bool = False, silent: bool = False)
             sum(1 for m in skill_manifests if m.auto_handle),
         )
     else:
-        submit_to_intake = queue.add
-        submit_to_reconsider = None
         logger.info(
             "Autohandle OFF (enabled=%s, kinds=%s, agent_mcp.enabled=%s)",
             config.autohandle_enabled,
@@ -267,19 +285,21 @@ async def main_async(config: Config, *, tui: bool = False, silent: bool = False)
         )
 
     supervisor = ProducerSupervisor()
-    supervisor.add(ClaudeProducer(config=config, queue=queue, summarizer=summarizer))
+    supervisor.add(ClaudeProducer(
+        config=config, queue=queue, summarizer=summarizer, submit=submit,
+    ))
     supervisor.add(SlackProducer(
         config=config, queue=queue, mcp=slack_mcp, state=SlackState(),
-        reconsider=submit_to_reconsider,
+        submit=submit, reconsider=submit_to_reconsider,
     ))
     email_producer = EmailProducer(
         config=config, queue=queue, mcp=email_mcp,
-        state=EmailState(), intake=submit_to_intake,
+        state=EmailState(), submit=submit,
     )
     supervisor.add(email_producer)
     supervisor.add(LinearProducer(
         config=config, queue=queue, mcp=linear_mcp,
-        state=LinearState(), intake=submit_to_intake,
+        state=LinearState(), submit=submit,
     ))
     supervisor.add(ManualProducer())
 
@@ -427,16 +447,19 @@ async def main_async(config: Config, *, tui: bool = False, silent: bool = False)
     if autohandle_active:
         screener_task = asyncio.create_task(
             run_screener_loop(
-                intake=intake_q,
+                work=screener_work,
+                queue=queue,
                 manifests=skill_manifests,
                 mcp=agent_mcp,
-                add_to_queue=queue.add,
                 on_outcome=_on_screener_outcome,
-                allowed_kinds=frozenset(config.autohandle_kinds),
+                allowed_kinds=allowed_kinds,
                 dry_run=config.autohandle_dry_run,
                 stop=screener_stop,
-                reconsider_intake=reconsider_q,
-                mark_existing_done=queue.mark_done,
+                # Follow-up spawns land terminal-suppressed: a
+                # respawned follow-up whose original was already filed
+                # or dismissed stays gone (terminal durable records
+                # are replayed for exactly this).
+                submit_follow_up=lambda t: submit(t, if_terminal="skip"),
             ),
             name="screener",
         )

@@ -37,13 +37,7 @@ from code_trip2._async_utils import event_or_timeout, next_tick_delay
 from code_trip2.config import Config
 from code_trip2.producers.claude_mcp import ClaudeMCPClient, ClaudeMCPError
 from code_trip2.slack_state import SlackState
-from code_trip2.tasks import (
-    STATE_ACTIVE,
-    STATE_PENDING,
-    STATE_SNOOZED,
-    Task,
-    TaskQueue,
-)
+from code_trip2.tasks import LIVE_STATES, Task, TaskQueue
 
 
 _USER_ID_RE = re.compile(r"User ID:\s*(U[A-Z0-9]+)", re.IGNORECASE)
@@ -159,12 +153,19 @@ class SlackProducer:
         queue: TaskQueue,
         mcp: ClaudeMCPClient | None = None,
         state: SlackState | None = None,
+        submit: Callable[[Task], Task] | None = None,
         reconsider: Callable[[Task], None] | None = None,
     ) -> None:
         self._config = config
         self._queue = queue
         self._mcp = mcp
         self._state = state or SlackState()
+        # ``submit`` is the pipeline entry point (main.py's screening
+        # gate) for NEW thread tasks. Existing-thread merges stay in
+        # this producer (they append to source["messages"], which is
+        # richer than upsert's field overwrite) but find the live task
+        # through the queue's origin index.
+        self._submit: Callable[[Task], Task] = submit or queue.upsert
         self._stop = asyncio.Event()
         self._user_id: str = ""
         # Tiny cache to suppress duplicates within a session (state file
@@ -470,10 +471,9 @@ class SlackProducer:
         lookup would risk cross-routing if the MCP ever returned mixed
         threads, and the new-task branch isn't applicable here.
         """
-        live = {STATE_PENDING, STATE_ACTIVE, STATE_SNOOZED}
         refreshes = []
         for task in self._queue.all():
-            if task.kind != "slack_msg" or task.state not in live:
+            if task.kind != "slack_msg" or task.state not in LIVE_STATES:
                 continue
             src = task.source or {}
             channel_id = src.get("channel_id") or ""
@@ -726,14 +726,16 @@ class SlackProducer:
         entry = {"sender": sender_name, "text": text, "ts": ts, "is_self": is_self}
 
         # Collapse multiple messages in the same thread into a single
-        # pending task: if there's already a pending slack task for this
-        # (channel_id, thread_ts), append the new message to its
-        # source["messages"] history instead of stacking N tasks. The
-        # body holds the latest message text (used by the read-body
-        # feature + screener); the TUI renders the full thread from
-        # source["messages"].
-        existing = self._find_pending_thread_task(channel_id, thread_ts)
-        if existing is not None:
+        # live task: if this (channel_id, thread_ts) already has a live
+        # task, append the new message to its source["messages"] history
+        # instead of stacking N tasks. The body holds the latest message
+        # text (used by the read-body feature + screener); the TUI
+        # renders the full thread from source["messages"]. DONE /
+        # DROPPED tasks are skipped so a finished conversation that
+        # revives later starts a fresh task.
+        origin_key = _origin_key(channel_id, thread_ts)
+        existing = self._queue.get_by_origin(origin_key)
+        if existing is not None and existing.state in LIVE_STATES:
             prior = existing.source or {}
             messages = list(prior.get("messages") or [])
             # The thread-replies poll and the mention search can both
@@ -791,31 +793,10 @@ class SlackProducer:
             body=text,
             source=source,
             created_at=time.time(),
+            origin_key=origin_key,
         )
-        self._queue.add(task)
+        self._submit(task)
 
-    def _find_pending_thread_task(self, channel_id: str, thread_ts: str) -> Task | None:
-        """Locate a live slack task for the same channel + thread.
 
-        "Live" means any state where the user might still want the
-        thread to grow under them: PENDING (queued), ACTIVE (currently
-        being viewed in the Current task panel — this is the case that
-        used to leak a sibling task into the queue), or SNOOZED
-        (deferred but will return). DONE / DROPPED tasks are skipped so
-        a finished conversation that revives later starts a fresh task.
-        """
-        if not channel_id or not thread_ts:
-            return None
-        live = {STATE_PENDING, STATE_ACTIVE, STATE_SNOOZED}
-        for task in self._queue.all():
-            if task.kind != "slack_msg":
-                continue
-            if task.state not in live:
-                continue
-            src = task.source or {}
-            if (
-                src.get("channel_id") == channel_id
-                and src.get("thread_ts") == thread_ts
-            ):
-                return task
-        return None
+def _origin_key(channel_id: str, thread_ts: str) -> str:
+    return f"slack:{channel_id}:{thread_ts}"

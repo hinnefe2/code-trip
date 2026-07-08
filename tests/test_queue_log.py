@@ -125,10 +125,50 @@ def test_replay_reads_files_older_than_yesterday_for_durable_tasks(tmp_path: Pat
     assert [t.id for t in tasks] == ["week-old"]
 
 
+def test_replay_returns_terminal_durable_records_with_origin_key(tmp_path: Path):
+    """A done meeting_followup that carries an origin_key comes back —
+    still terminal — so ``upsert(if_terminal="skip")`` can suppress a
+    respawned duplicate across restarts."""
+    last_week = datetime.now(timezone.utc) - timedelta(days=5)
+    rec_add = _stale_record("meeting_followup", task_id="filed-task")
+    rec_add["task"]["created_at"] = time.time() - 5 * 24 * 60 * 60
+    rec_add["task"]["origin_key"] = "followup:abc:send doc"
+    rec_done = json.loads(json.dumps(rec_add))  # deep copy
+    rec_done["event"] = "state"
+    rec_done["task"]["state"] = "done"
+    _write_log_for_date(tmp_path, last_week, [rec_add, rec_done])
+
+    log = QueueLog(dir_=tmp_path)
+    tasks = log.replay()
+    assert [t.id for t in tasks] == ["filed-task"]
+    assert tasks[0].state == STATE_DONE  # loaded terminal, never surfaces
+
+    # End-to-end: load into a queue and confirm the suppression works.
+    q = TaskQueue()
+    q.load(tasks)
+    assert q.pending() == []
+    dup = Task(headline="Send doc", origin_key="followup:abc:send doc")
+    assert q.upsert(dup, if_terminal="skip").id == "filed-task"
+
+
+def test_replay_demotes_screening_to_pending(tmp_path: Path):
+    """A task caught mid-screening at shutdown surfaces as pending on
+    the next boot. Re-screening on boot risks double side effects
+    (e.g. a second RSVP), so fail-safe is showing it to the user."""
+    rec = _stale_record("email_msg", task_id="mid-screen")
+    rec["task"]["created_at"] = time.time() - 60
+    rec["task"]["state"] = "screening"
+    _write_log_for_date(tmp_path, datetime.now(timezone.utc), [rec])
+
+    tasks = QueueLog(dir_=tmp_path).replay()
+    assert [t.id for t in tasks] == ["mid-screen"]
+    assert tasks[0].state == "pending"
+
+
 def test_replay_honors_terminal_state_in_older_files(tmp_path: Path):
-    """A meeting_followup created last week and marked done last week
-    should NOT come back — terminal state is honored even when reading
-    older files."""
+    """A key-less durable task (voice note shape) marked done last week
+    should NOT come back — without an origin_key there's nothing to
+    suppress against, so its terminal record is dead weight."""
     last_week = datetime.now(timezone.utc) - timedelta(days=5)
     rec_add = _stale_record("meeting_followup", task_id="done-task")
     rec_add["task"]["created_at"] = time.time() - 5 * 24 * 60 * 60

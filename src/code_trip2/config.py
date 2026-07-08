@@ -98,7 +98,10 @@ class Config:
     # auto-handle-eligible skills in ``.claude/skills/`` before it
     # reaches the user-facing queue. ``kinds`` is the whitelist of task
     # kinds eligible for screening — empty disables auto-handling even
-    # if ``enabled`` is true. ``dry_run`` runs the classifier but always
+    # if ``enabled`` is true. All producers route through the same
+    # gate, so listing ``slack_msg`` here enables both intake screening
+    # of new Slack tasks AND the reconsider (re-judge on thread
+    # activity) path. ``dry_run`` runs the classifier but always
     # forwards (useful for watching decisions before trusting them).
     autohandle_enabled: bool = False
     autohandle_dry_run: bool = False

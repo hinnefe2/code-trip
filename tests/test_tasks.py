@@ -7,9 +7,12 @@ import time
 import pytest
 
 from code_trip2.tasks import (
+    STATE_ACTIVE,
     STATE_DONE,
     STATE_DROPPED,
     STATE_PENDING,
+    STATE_SCREENING,
+    STATE_SNOOZED,
     URGENCY_BACKGROUND,
     URGENCY_INTERRUPT,
     RecentTopics,
@@ -34,7 +37,7 @@ def test_task_defaults_unique_ids():
 def test_task_roundtrip_dict():
     t = Task(
         kind="claude_reply", topic="ticket-42", headline="ready", body="ok",
-        dedup_key="followup:abc:ready",
+        origin_key="followup:abc:ready",
     )
     d = t.to_dict()
     back = Task.from_dict(d)
@@ -44,9 +47,16 @@ def test_task_roundtrip_dict():
     assert back.headline == "ready"
     assert back.body == "ok"
     assert back.state == STATE_PENDING
-    # dedup_key survives the log round-trip, so a done follow-up replayed on
+    # origin_key survives the log round-trip, so a done follow-up replayed on
     # restart can still suppress a re-emitted duplicate.
-    assert back.dedup_key == "followup:abc:ready"
+    assert back.origin_key == "followup:abc:ready"
+
+
+def test_task_from_dict_reads_legacy_dedup_key():
+    """Pre-refactor JSONL records wrote the identity field as
+    ``dedup_key`` — replay must still pick it up."""
+    back = Task.from_dict({"id": "x", "dedup_key": "followup:abc:ready"})
+    assert back.origin_key == "followup:abc:ready"
 
 
 # --- RecentTopics ------------------------------------------------------------
@@ -134,31 +144,188 @@ def test_queue_add_and_pending():
     assert q.pending() == [t]
 
 
-def test_queue_add_dedups_by_dedup_key_across_states():
-    """A re-emitted task with a known dedup_key is suppressed — even after
-    the original was marked done (the ACT+YES-filed-then-respawned bug)."""
+# --- upsert / origin_key -------------------------------------------------
+
+
+def test_upsert_without_origin_key_never_collapses():
+    """Tasks with no origin_key (manual notes) are singletons — added
+    unconditionally even when headline/topic collide."""
     q = TaskQueue()
-    first = q.add(Task(headline="Send doc to Anna", dedup_key="followup:abc:send doc"))
-    q.mark_done(first.id)  # filed via ACT+YES -> done
-
-    # Parent email re-screens and mints a fresh follow-up (new uuid, same key).
-    dup = Task(headline="Send doc to Anna", dedup_key="followup:abc:send doc")
-    returned = q.add(dup)
-
-    assert returned is first              # add returned the existing task
-    assert dup.id not in {t.id for t in q.all()}  # the duplicate never entered
-    assert len(q.all()) == 1
-    assert q.pending() == []              # original stays done; nothing resurfaced
-
-
-def test_queue_add_without_dedup_key_is_never_deduped():
-    """Tasks with no dedup_key (the default) are added unconditionally, even
-    when headline/topic collide — only an explicit key triggers suppression."""
-    q = TaskQueue()
-    a = q.add(Task(headline="same", topic="t"))
-    b = q.add(Task(headline="same", topic="t"))
+    a = q.upsert(Task(headline="same", topic="t"))
+    b = q.upsert(Task(headline="same", topic="t"))
     assert a.id != b.id
     assert len(q.all()) == 2
+
+
+def test_upsert_new_origin_key_adds():
+    q = TaskQueue()
+    t = q.upsert(Task(headline="x", origin_key="linear:AI-1"))
+    assert q.pending() == [t]
+
+
+def test_upsert_live_origin_key_updates_in_place():
+    """A re-sighting of the same object updates the live task's fields
+    (including created_at — the object genuinely changed) instead of
+    minting a sibling."""
+    q = TaskQueue()
+    events: list[str] = []
+    q.add_listener(lambda kind, _t: events.append(kind))
+    first = q.upsert(Task(
+        headline="old", body="old body", origin_key="linear:AI-1",
+        created_at=100.0,
+    ))
+    dup = Task(
+        headline="new", body="new body", origin_key="linear:AI-1",
+        source={"identifier": "AI-1"}, created_at=200.0,
+    )
+    returned = q.upsert(dup)
+    assert returned is first
+    assert len(q.all()) == 1
+    assert first.headline == "new"
+    assert first.body == "new body"
+    assert first.source == {"identifier": "AI-1"}
+    assert first.created_at == 200.0
+    assert events == ["add", "update"]
+
+
+@pytest.mark.parametrize(
+    "state", [STATE_PENDING, STATE_ACTIVE, STATE_SNOOZED, STATE_SCREENING],
+)
+def test_upsert_collapses_into_every_live_state(state: str):
+    """Live spans pending/active/snoozed AND screening — a task parked
+    in the screener's screening state still collapses re-sightings
+    (the TRI-240 duplication window)."""
+    q = TaskQueue()
+    first = q.upsert(Task(headline="a", origin_key="linear:AI-1"))
+    first.state = state
+    returned = q.upsert(Task(headline="b", origin_key="linear:AI-1"))
+    assert returned is first
+    assert len(q.all()) == 1
+    assert first.state == state  # collapse never disturbs state
+
+
+def test_upsert_terminal_default_resurfaces_fresh_task():
+    """A sighting after the task went terminal means the object came
+    back (e.g. reopened ticket) — mint a fresh task."""
+    q = TaskQueue()
+    first = q.upsert(Task(headline="a", origin_key="linear:AI-1"))
+    q.mark_done(first.id)
+    fresh = q.upsert(Task(headline="b", origin_key="linear:AI-1"))
+    assert fresh is not first
+    assert q.pending() == [fresh]
+    # The index re-points: a third sighting collapses into the fresh task.
+    third = q.upsert(Task(headline="c", origin_key="linear:AI-1"))
+    assert third is fresh
+
+
+def test_upsert_terminal_skip_suppresses():
+    """if_terminal="skip": a re-spawned follow-up whose original was
+    already filed (done) or dismissed stays gone — no new entry, no
+    event, nothing resurfaced."""
+    q = TaskQueue()
+    first = q.upsert(Task(
+        headline="Send doc to Anna", origin_key="followup:abc:send doc",
+    ))
+    q.mark_done(first.id)  # filed via ACT+YES -> done
+
+    dup = Task(headline="Send doc to Anna", origin_key="followup:abc:send doc")
+    returned = q.upsert(dup, if_terminal="skip")
+
+    assert returned is first
+    assert dup.id not in {t.id for t in q.all()}
+    assert len(q.all()) == 1
+    assert q.pending() == []
+
+
+def test_get_by_origin_returns_indexed_task_any_state():
+    q = TaskQueue()
+    t = q.upsert(Task(headline="a", origin_key="slack:C1:123"))
+    assert q.get_by_origin("slack:C1:123") is t
+    q.mark_done(t.id)
+    assert q.get_by_origin("slack:C1:123") is t
+    assert q.get_by_origin("slack:C1:999") is None
+
+
+# --- resolve_by_origin -----------------------------------------------------
+
+
+def test_resolve_by_origin_marks_pending_done():
+    q = TaskQueue()
+    t = q.upsert(Task(headline="a", origin_key="linear:AI-1"))
+    out = q.resolve_by_origin("linear:AI-1")
+    assert out is t
+    assert t.state == STATE_DONE
+
+
+def test_resolve_by_origin_marks_snoozed_done():
+    q = TaskQueue()
+    t = q.upsert(Task(headline="a", origin_key="linear:AI-1"))
+    q.set_state(t.id, STATE_SNOOZED)
+    assert q.resolve_by_origin("linear:AI-1") is t
+    assert t.state == STATE_DONE
+
+
+def test_resolve_by_origin_never_touches_active():
+    """The user is mid-conversation with the task — leave it alone even
+    though the source says the object is resolved."""
+    q = TaskQueue()
+    t = q.upsert(Task(headline="a", origin_key="linear:AI-1"))
+    q.mark_active(t.id)
+    assert q.resolve_by_origin("linear:AI-1") is None
+    assert t.state == STATE_ACTIVE
+
+
+def test_resolve_by_origin_unknown_key_is_noop():
+    q = TaskQueue()
+    assert q.resolve_by_origin("linear:AI-404") is None
+
+
+# --- screening state -------------------------------------------------------
+
+
+def test_screening_tasks_are_not_pending():
+    q = TaskQueue()
+    t = Task(headline="a", origin_key="email:T1", state=STATE_SCREENING)
+    q.add(t)
+    assert q.pending() == []
+    assert score(t, now=time.time(), recent=RecentTopics()) == float("-inf")
+    q.set_state(t.id, STATE_PENDING)
+    assert q.pending() == [t]
+
+
+def test_topic_cap_enforced_on_screening_release():
+    """Screening tasks don't count toward the per-topic pending cap, so
+    the cap re-runs when one is released to pending."""
+    q = TaskQueue()
+    for i in range(5):  # fill the cap (default 5)
+        q.add(Task(topic="t", headline=str(i), created_at=float(i)))
+    parked = Task(
+        topic="t", headline="parked", state=STATE_SCREENING, created_at=6.0,
+    )
+    q.add(parked)
+    assert len(q.pending()) == 5  # screening task not counted
+    q.set_state(parked.id, STATE_PENDING)
+    pending = q.pending()
+    assert len(pending) == 5  # cap re-enforced on release
+    assert sum(1 for t in q.all() if t.state == STATE_DROPPED) == 1
+
+
+def test_load_rebuilds_origin_index_live_wins_over_terminal():
+    """Replay can hand load() both a terminal durable record and a live
+    task for the same key — the live one must own the index entry."""
+    q = TaskQueue()
+    done = Task(headline="old", origin_key="followup:abc:x", state=STATE_DONE)
+    live = Task(headline="new", origin_key="followup:abc:x")
+    q.load([done, live])
+    assert q.get_by_origin("followup:abc:x") is live
+    # And a terminal-only key still resolves for if_terminal="skip".
+    q2 = TaskQueue()
+    q2.load([done])
+    assert q2.get_by_origin("followup:abc:x") is done
+    suppressed = q2.upsert(
+        Task(headline="dup", origin_key="followup:abc:x"), if_terminal="skip",
+    )
+    assert suppressed is done
 
 
 def test_queue_ranked_orders_by_score():
