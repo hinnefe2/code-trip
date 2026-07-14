@@ -130,7 +130,13 @@ class LinearProducer:
         skipped = 0
         retired = 0
         last_cursor = self._state.last_updated_at() or ""
-        max_ts_seen = last_cursor
+        # ``updatedAt`` of issues we definitively resolved this poll
+        # (emitted, or confirmed out-of-scope) vs. ones we could not
+        # (unknown status, emit failure). The cursor may advance past the
+        # former but must stay behind the latter — see the barrier logic
+        # below.
+        resolved_ts: list[str] = []
+        unresolved_ts: list[str] = []
         for issue in issues:
             identifier = issue.get("identifier") or ""
             status_type = issue.get("statusType") or ""
@@ -142,41 +148,76 @@ class LinearProducer:
             # guard (mirrors the email producer's ``ts <= last_ts``
             # check) so an unchanged re-return is never re-processed —
             # without this the boundary ticket's task gets its
-            # created_at refreshed each poll and never ages up.
+            # created_at refreshed each poll and never ages up. Safe
+            # because the cursor only ever reflects *resolved* work, so
+            # ``updated_at <= last_cursor`` really does mean "already
+            # handled" (not merely "already seen").
             if not wide_poll and last_cursor and updated_at and updated_at <= last_cursor:
                 skipped += 1
                 continue
-            # Track max ts even for filtered issues so the cursor
-            # advances past them and we don't keep re-pulling on
-            # incremental polls.
-            if updated_at > max_ts_seen:
-                max_ts_seen = updated_at
+            if not status_type:
+                # Status omitted from this response — happens for a
+                # freshly-created issue before Linear's list index
+                # settles (this is how TRI-279 was lost: filtered as
+                # "not allowed", which also burned the cursor to its
+                # updatedAt, after which the boundary guard skipped it
+                # forever). We can't tell if it's in scope, so treat it
+                # as UNRESOLVED: hold the cursor behind it so the next
+                # poll re-pulls and re-evaluates.
+                if updated_at:
+                    unresolved_ts.append(updated_at)
+                skipped += 1
+                continue
             if status_type not in allowed:
-                # Mid-session cleanup: a ticket that's now out of the
-                # active set (closed, canceled, moved to backlog) but
-                # has a pending queue task means the user just closed
-                # it in Linear. Linear has no push notification for
-                # status changes, so this incremental-poll sweep is
-                # the only way to retire the task without waiting for
-                # restart.
+                # Known terminal/inactive state (completed, canceled,
+                # backlog). Genuinely not our concern, so it's resolved —
+                # the cursor may advance past it. Mid-session cleanup: if
+                # we previously surfaced this ticket, the user just moved
+                # it out of the active set in Linear, so retire the task
+                # (Linear has no status-change push; this sweep is the
+                # only way to sync without a restart).
                 if self._mark_closed_task(identifier):
                     retired += 1
                 else:
                     skipped += 1
+                if updated_at:
+                    resolved_ts.append(updated_at)
                 continue
             try:
                 self._emit_task(issue)
                 emitted += 1
+                if updated_at:
+                    resolved_ts.append(updated_at)
             except Exception:
                 logger.exception("Failed to emit Linear task for %s", identifier)
+                # Emit failed — leave the cursor behind so we retry
+                # instead of stranding the ticket.
+                if updated_at:
+                    unresolved_ts.append(updated_at)
 
-        if max_ts_seen and max_ts_seen != (self._state.last_updated_at() or ""):
-            self._state.set_last_updated_at(max_ts_seen)
+        # Advance the cursor to the newest resolved issue, but never to or
+        # past the oldest unresolved one: the inclusive-boundary skip
+        # above would then drop the unresolved issue permanently (it may
+        # never get a newer ``updatedAt``). Re-pulling already-resolved
+        # issues above the barrier next poll is harmless — emits collapse
+        # via ``origin_key`` upsert, retires are idempotent.
+        candidate = last_cursor
+        for ts in resolved_ts:
+            if ts > candidate:
+                candidate = ts
+        if unresolved_ts:
+            barrier = min(unresolved_ts)
+            if candidate >= barrier:
+                below = [t for t in resolved_ts if t < barrier]
+                candidate = max(below) if below else last_cursor
+        if candidate and candidate != (self._state.last_updated_at() or ""):
+            self._state.set_last_updated_at(candidate)
 
         logger.info(
-            "LinearProducer: %s poll — %d issues (%d emitted, %d retired, %d filtered out)",
+            "LinearProducer: %s poll — %d issues (%d emitted, %d retired, "
+            "%d filtered out, %d held for retry)",
             "wide" if wide_poll else "incremental",
-            len(issues), emitted, retired, skipped,
+            len(issues), emitted, retired, skipped, len(unresolved_ts),
         )
 
         # Wide-poll only happens once per session. Even if it returned

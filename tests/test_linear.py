@@ -246,6 +246,78 @@ async def test_producer_cursor_advances_past_filtered_issues(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_producer_unknown_status_does_not_advance_cursor(tmp_path: Path):
+    """Regression (TRI-279): an issue returned with an empty/missing
+    statusType (Linear's list index lagging a fresh create) must NOT
+    burn the cursor. If it did, the inclusive-boundary guard would skip
+    the issue on every later poll — permanently losing an in-scope
+    ticket that never gets a newer updatedAt."""
+    p, _q, mcp, state = _producer(tmp_path, state_types=("unstarted",))
+    p._first_poll = False
+    state.set_last_updated_at("2026-05-28T10:00:00.000Z")
+    mcp.call_tool.return_value = {
+        "issues": [{
+            "id": "TRI-279",
+            "title": "brand new, status not yet indexed",
+            # statusType intentionally absent
+            "url": "u",
+            "updatedAt": "2026-05-28T12:00:00.000Z",
+        }]
+    }
+    await p._poll_once()
+    # Not emitted, and the cursor stayed put so the next poll re-pulls it.
+    assert _q.all() == []
+    assert state.last_updated_at() == "2026-05-28T10:00:00.000Z"
+
+    # Next poll: Linear now reports the real status → it emits.
+    mcp.call_tool.return_value = {
+        "issues": [{
+            "id": "TRI-279",
+            "title": "now indexed",
+            "statusType": "unstarted",
+            "url": "u",
+            "updatedAt": "2026-05-28T12:00:00.000Z",
+        }]
+    }
+    await p._poll_once()
+    [task] = _q.pending()
+    assert task.source["identifier"] == "TRI-279"
+    assert state.last_updated_at() == "2026-05-28T12:00:00.000Z"
+
+
+@pytest.mark.asyncio
+async def test_producer_cursor_held_below_oldest_unresolved_issue(tmp_path: Path):
+    """A newer resolved issue in the same poll must not drag the cursor
+    past an older unresolved one — otherwise the boundary guard would
+    strand the unresolved issue on the next poll."""
+    p, _q, mcp, state = _producer(tmp_path, state_types=("unstarted",))
+    p._first_poll = False
+    state.set_last_updated_at("2026-05-28T10:00:00.000Z")
+    mcp.call_tool.return_value = {
+        "issues": [
+            {   # older, unknown status → unresolved (barrier)
+                "id": "TRI-1",
+                "title": "unknown status",
+                "url": "u",
+                "updatedAt": "2026-05-28T11:00:00.000Z",
+            },
+            {   # newer, emits fine
+                "id": "TRI-2",
+                "title": "active",
+                "statusType": "unstarted",
+                "url": "u",
+                "updatedAt": "2026-05-28T13:00:00.000Z",
+            },
+        ]
+    }
+    await p._poll_once()
+    # TRI-2 emitted, but the cursor is held below TRI-1's 11:00 barrier so
+    # TRI-1 is re-pulled next poll rather than skipped.
+    assert [t.source["identifier"] for t in _q.pending()] == ["TRI-2"]
+    assert state.last_updated_at() == "2026-05-28T10:00:00.000Z"
+
+
+@pytest.mark.asyncio
 async def test_producer_retires_task_when_ticket_leaves_active_set(tmp_path: Path):
     """If a ticket the producer previously surfaced now returns with a
     non-allowed statusType (user closed/canceled it in Linear), the
