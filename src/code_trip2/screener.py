@@ -451,18 +451,25 @@ async def screen(
     mcp: ClaudeMCPClient,
     *,
     dry_run: bool = False,
+    classifier_mcp: ClaudeMCPClient | None = None,
 ) -> ScreeningOutcome:
     """Full screening pipeline on one task.
 
     Returns a new :class:`ScreeningOutcome`; does not mutate ``task``
     (the ``failed`` branch uses :func:`dataclasses.replace` to annotate
     the body of a copy).
+
+    ``classifier_mcp`` runs the skill-nomination step; the executor uses
+    ``mcp``. They're separate so classification can use a stronger model
+    than execution. Defaults to ``mcp`` when unset (single-model setups
+    and existing call sites are unaffected).
     """
+    classifier_mcp = classifier_mcp or mcp
     candidates = candidates_for(task, manifests)
     if not candidates:
         return ScreeningOutcome("forward", task)
 
-    chosen = await classify(task, candidates, mcp)
+    chosen = await classify(task, candidates, classifier_mcp)
     if chosen is None:
         return ScreeningOutcome("forward", task)
 
@@ -580,6 +587,7 @@ async def run_screener_loop(
     dry_run: bool,
     stop: asyncio.Event,
     submit_follow_up: Callable[[Task], None] | None = None,
+    classifier_mcp: ClaudeMCPClient | None = None,
 ) -> None:
     """Drain the work queue, screen each task, apply the state transition.
 
@@ -617,7 +625,10 @@ async def run_screener_loop(
             outcome = ScreeningOutcome("forward", task)
         else:
             try:
-                outcome = await screen(task, manifests, mcp, dry_run=dry_run)
+                outcome = await screen(
+                    task, manifests, mcp, dry_run=dry_run,
+                    classifier_mcp=classifier_mcp,
+                )
             except Exception:
                 logger.exception(
                     "Screener crashed on task %s; forwarding", task.id,

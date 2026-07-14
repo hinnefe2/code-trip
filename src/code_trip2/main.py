@@ -153,9 +153,14 @@ async def main_async(config: Config, *, tui: bool = False, silent: bool = False)
             "Linear MCP via claude CLI not available; Linear producer will "
             "stay idle. Install claude CLI to enable."
         )
-    # Free-form skill invocation (ACT+PTT) and auto-handle screener.
+    # Free-form skill invocation (ACT+PTT) and auto-handle executor.
     # ``server_id`` is unused — run_agent doesn't restrict to a single tool.
     agent_mcp = ClaudeMCPClient(server_id="agent")
+    # Classifier (skill-nomination) client — a stronger model than the
+    # executor so nuanced manifest descriptions are applied reliably.
+    classifier_mcp = ClaudeMCPClient(
+        server_id="agent", model=config.autohandle_classifier_model,
+    )
     # Skill manifests for both the ACT+PTT path (allowed-tools union)
     # and the screener (per-skill metadata: description, auto-handle
     # flags, kinds). Loaded once on startup. Resolves relative to CWD
@@ -451,6 +456,7 @@ async def main_async(config: Config, *, tui: bool = False, silent: bool = False)
                 queue=queue,
                 manifests=skill_manifests,
                 mcp=agent_mcp,
+                classifier_mcp=classifier_mcp,
                 on_outcome=_on_screener_outcome,
                 allowed_kinds=allowed_kinds,
                 dry_run=config.autohandle_dry_run,

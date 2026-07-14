@@ -102,3 +102,8 @@ batch_window = 2.0
 enabled = false
 dry_run = false
 kinds = []     # e.g. ["email_msg"]
+# Model for the skill-nomination (classifier) step only. Stronger than
+# the executor's Haiku because nomination hinges on nuanced manifest
+# descriptions (e.g. bot-authored comments) that a small model applies
+# unreliably. The executor stays cheap once a skill is chosen.
+classifier_model = "sonnet"

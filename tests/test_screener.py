@@ -1098,6 +1098,38 @@ async def test_screen_keeps_handled_for_clean_success_summary():
 
 
 @pytest.mark.asyncio
+async def test_screen_routes_classify_and_execute_to_separate_clients():
+    """Classification uses ``classifier_mcp``; execution uses ``mcp``.
+    Lets the nomination step run a stronger model than the executor."""
+    classifier_mcp = MagicMock(spec=ClaudeMCPClient)
+    classifier_mcp.run_agent = AsyncMock(return_value="HANDLE: accept-invite")
+    executor_mcp = MagicMock(spec=ClaudeMCPClient)
+    executor_mcp.run_agent = AsyncMock(
+        return_value="Accepted 'Standup' and archived the email.",
+    )
+    outcome = await screen(
+        _task("email_msg"), [_manifest("accept-invite")], executor_mcp,
+        classifier_mcp=classifier_mcp,
+    )
+    assert outcome.action == "handled"
+    classifier_mcp.run_agent.assert_awaited_once()
+    executor_mcp.run_agent.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_screen_defaults_classifier_to_executor_client():
+    """Omitting ``classifier_mcp`` keeps the single-client behavior."""
+    mcp = MagicMock(spec=ClaudeMCPClient)
+    mcp.run_agent = AsyncMock(side_effect=[
+        "HANDLE: accept-invite",
+        "Accepted 'Standup' and archived the email.",
+    ])
+    outcome = await screen(_task("email_msg"), [_manifest("accept-invite")], mcp)
+    assert outcome.action == "handled"
+    assert mcp.run_agent.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_loop_self_reported_failure_surfaces_task_to_user_queue():
     """Regression: the bug was that ``handled`` outcomes suppress the
     task. After the fix, a self-reported-failure summary should route
