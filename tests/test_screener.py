@@ -12,6 +12,7 @@ from code_trip2.producers.claude_mcp import ClaudeMCPClient, ClaudeMCPError
 from code_trip2.screener import (
     ScreeningOutcome,
     _next_or_stop,
+    _one_line,
     candidates_for,
     parse_classifier_reply,
     parse_follow_up_tasks,
@@ -1042,6 +1043,47 @@ async def test_screen_downgrades_handled_to_failed_when_summary_admits_failure()
     # this task reappeared instead of being silently archived.
     assert "auto-handle declined (accept-invite)" in (outcome.task.body or "")
     assert "Original body" in (outcome.task.body or "")
+
+
+def test_one_line_flattens_multiline_summary_preserving_status_reason():
+    # A real rate-limit decline: preamble + working note + trailing STATUS.
+    # The trailing reason is the diagnostic payload and must survive.
+    summary = (
+        "I'll find and execute the archive-gemini-meeting-notes skill.\n"
+        "I've hit a rate limit trying to fetch the email content.\n"
+        "STATUS: declined: Unable to fetch full email content due to rate limit."
+    )
+    out = _one_line(summary)
+    assert "\n" not in out
+    assert "STATUS: declined: Unable to fetch full email content" in out
+
+
+def test_one_line_caps_and_ellipsizes():
+    out = _one_line("word " * 400, limit=50)
+    assert len(out) == 50
+    assert out.endswith("…")
+    assert _one_line(None) == ""
+
+
+@pytest.mark.asyncio
+async def test_declined_body_annotation_is_single_line_with_reason():
+    """The queue-task annotation and log line must flatten newlines so
+    line-based tooling doesn't lose the trailing decline reason."""
+    mcp = MagicMock(spec=ClaudeMCPClient)
+    mcp.run_agent = AsyncMock(side_effect=[
+        "HANDLE: archive-gemini-meeting-notes",
+        "I'll execute the skill.\nI've hit a rate limit.\n"
+        "STATUS: declined: rate limit — could not extract action items.",
+    ])
+    parent = _task("email_msg", body="Original body")
+    outcome = await screen(
+        parent, [_manifest("archive-gemini-meeting-notes")], mcp,
+    )
+    assert outcome.action == "failed"
+    body = outcome.task.body or ""
+    annotation = body.split("[auto-handle declined", 1)[1]
+    assert "\n" not in annotation
+    assert "could not extract action items" in annotation
 
 
 @pytest.mark.asyncio

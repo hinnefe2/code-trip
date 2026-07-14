@@ -201,6 +201,22 @@ def summary_indicates_failure(summary: str | None) -> bool:
     return any(p.search(summary) for p in _FAILURE_INDICATORS)
 
 
+def _one_line(summary: str | None, limit: int = 600) -> str:
+    """Flatten an executor summary to a single capped line.
+
+    Executor summaries are multi-line: a preamble, some working notes,
+    and a trailing ``STATUS: declined: <reason>`` that carries the
+    actual reason. Logged or embedded raw, the embedded newlines split
+    the record across physical lines, so line-based tools (``grep`` /
+    ``tail``) capture only the preamble and drop the reason — which is
+    exactly what happened when a Gmail rate limit went undiagnosed.
+    Collapsing whitespace keeps the whole reason on one line; the cap is
+    generous enough to retain the trailing STATUS for typical summaries.
+    """
+    flat = " ".join((summary or "").split())
+    return flat if len(flat) <= limit else flat[: limit - 1] + "…"
+
+
 def parse_classifier_reply(
     text: str, candidates: list[SkillManifest]
 ) -> SkillManifest | None:
@@ -505,13 +521,13 @@ async def screen(
         logger.info(
             "Screener: %s returned a self-reported failure for task %s; "
             "forwarding to user. Summary: %s",
-            chosen.name, task.id, summary[:200],
+            chosen.name, task.id, _one_line(summary),
         )
         annotated = replace(
             task,
             body=(
                 f"{task.body or ''}\n"
-                f"[auto-handle declined ({chosen.name}): {summary.strip()[:200]}]"
+                f"[auto-handle declined ({chosen.name}): {_one_line(summary, 300)}]"
             ).strip(),
         )
         return ScreeningOutcome(
