@@ -2,6 +2,7 @@
 name: archive-gemini-meeting-notes
 description: Archive auto-generated meeting-notes emails produced by Google Meet's Gemini summarizer. These are noreply emails (typical senders include meet-recordings-noreply@google.com or noreply@google.com) whose subject contains phrasing like "Notes from your meeting with", "Meeting notes for", "Gemini notes for", or similar, and whose body is a machine-generated meeting summary, attendee list, transcript link, and bulleted action items. Pick this skill only when the entire body is auto-generated meeting-notes content — never for a human-authored email about meeting notes, follow-up emails from attendees, calendar invites (those go to accept-invite), or any email where someone has personally written commentary alongside the notes. When unsure whether the email is fully auto-generated or contains human commentary, forward to the user.
 auto-handle: true
+verify: left-inbox
 auto-handle-kinds:
   - email_msg
 allowed-tools:

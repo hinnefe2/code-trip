@@ -2,6 +2,7 @@
 name: archive-linear-status-change
 description: Archive Linear notification emails (sender notifications@linear.app) whose entire substance is routine issue status changes the user can already see in Linear's UI. Covers TWO shapes — (1) a single status-change notice ("changed status to Done/In Progress/In Review/Canceled/Backlog/Todo", "moved <ID> to <status>", "marked <ID> as Done/Canceled/Duplicate"), and (2) a digest/roundup email (subject like "You have N updates on Linear" / "N new updates") whose body is ENTIRELY status-change lines for one or more issues. Both are auto-generated state notices with no human-authored message directed at the user, so the email is redundant noise. Pick this skill when the email is from notifications@linear.app AND every item in it is a bare status transition with nothing else the user must act on. SKIP (so the user sees it) when the email — or, for a digest, ANY single item in it — is another kind of Linear notification: a human comment or reply on an issue, an @-mention of the user, a new assignment of an issue TO the user, a review/approval request, a due-date or SLA reminder, or any human-authored prose beyond the bare "X changed status to Y" auto-text. A digest that mixes even one comment/mention/assignment in with the status changes is NOT routine — forward the whole email. When unsure whether the sender is Linear's notification mailer, or whether the body carries anything beyond status transitions, forward to the user.
 auto-handle: true
+verify: left-inbox
 auto-handle-kinds:
   - email_msg
 allowed-tools:

@@ -42,6 +42,7 @@ def _manifest(
     kinds: tuple[str, ...] = ("email_msg",),
     tools: tuple[str, ...] = ("mcp__some__tool",),
     description: str = "test skill",
+    verify: str = "",
 ) -> SkillManifest:
     return SkillManifest(
         name=name,
@@ -49,6 +50,7 @@ def _manifest(
         allowed_tools=tools,
         auto_handle=auto_handle,
         auto_handle_kinds=frozenset(kinds),
+        verify=verify,
     )
 
 
@@ -1084,6 +1086,100 @@ async def test_declined_body_annotation_is_single_line_with_reason():
     annotation = body.split("[auto-handle declined", 1)[1]
     assert "\n" not in annotation
     assert "could not extract action items" in annotation
+
+
+async def _handling_mcp():
+    mcp = MagicMock(spec=ClaudeMCPClient)
+    mcp.run_agent = AsyncMock(side_effect=[
+        "HANDLE: archive-x",
+        "Archived the email. STATUS: handled",
+    ])
+    return mcp
+
+
+@pytest.mark.asyncio
+async def test_verify_false_surfaces_task_instead_of_closing():
+    """The skill reports success but the ground-truth check says the side
+    effect didn't happen → the task is surfaced (failed), not closed."""
+    mcp = await _handling_mcp()
+    calls = []
+
+    async def verify(task, verify_type):
+        calls.append((task.id, verify_type))
+        return False  # side effect NOT observed
+
+    outcome = await screen(
+        _task("email_msg"), [_manifest("archive-x", verify="left-inbox")], mcp,
+        verify_side_effect=verify,
+    )
+    assert outcome.action == "failed"
+    assert outcome.error == "unverified side-effect"
+    assert "unverified" in (outcome.task.body or "")
+    assert calls and calls[0][1] == "left-inbox"
+
+
+@pytest.mark.asyncio
+async def test_verify_true_keeps_handled():
+    mcp = await _handling_mcp()
+
+    async def verify(task, verify_type):
+        return True
+
+    outcome = await screen(
+        _task("email_msg"), [_manifest("archive-x", verify="left-inbox")], mcp,
+        verify_side_effect=verify,
+    )
+    assert outcome.action == "handled"
+
+
+@pytest.mark.asyncio
+async def test_verify_none_falls_back_to_trusting_skill():
+    """Inconclusive check (e.g. Gmail read failed) must not nag the user —
+    fall back to the skill's self-report."""
+    mcp = await _handling_mcp()
+
+    async def verify(task, verify_type):
+        return None
+
+    outcome = await screen(
+        _task("email_msg"), [_manifest("archive-x", verify="left-inbox")], mcp,
+        verify_side_effect=verify,
+    )
+    assert outcome.action == "handled"
+
+
+@pytest.mark.asyncio
+async def test_verify_exception_falls_back_to_handled():
+    mcp = await _handling_mcp()
+
+    async def verify(task, verify_type):
+        raise RuntimeError("gmail down")
+
+    outcome = await screen(
+        _task("email_msg"), [_manifest("archive-x", verify="left-inbox")], mcp,
+        verify_side_effect=verify,
+    )
+    assert outcome.action == "handled"
+
+
+@pytest.mark.asyncio
+async def test_verify_skipped_when_skill_declares_none():
+    """A skill with no ``verify`` never triggers the check, even when a
+    verifier is wired in."""
+    mcp = await _handling_mcp()
+    called = False
+
+    async def verify(task, verify_type):
+        nonlocal called
+        called = True
+        return False
+
+    outcome = await screen(
+        _task("email_msg"), [_manifest("archive-x", verify="")], mcp,
+        verify_side_effect=verify,
+    )
+    assert outcome.action == "handled"
+    assert called is False
 
 
 @pytest.mark.asyncio

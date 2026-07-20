@@ -34,7 +34,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, replace
-from typing import Callable, Iterable, Literal
+from typing import Awaitable, Callable, Iterable, Literal
 
 from code_trip2.producers.claude_mcp import ClaudeMCPClient, ClaudeMCPError
 from code_trip2.skills import SkillManifest
@@ -452,6 +452,7 @@ async def screen(
     *,
     dry_run: bool = False,
     classifier_mcp: ClaudeMCPClient | None = None,
+    verify_side_effect: "Callable[[Task, str], Awaitable[bool | None]] | None" = None,
 ) -> ScreeningOutcome:
     """Full screening pipeline on one task.
 
@@ -463,6 +464,13 @@ async def screen(
     ``mcp``. They're separate so classification can use a stronger model
     than execution. Defaults to ``mcp`` when unset (single-model setups
     and existing call sites are unaffected).
+
+    ``verify_side_effect`` is an optional ground-truth check run before a
+    ``handled`` outcome is trusted: given the task and the chosen skill's
+    declared ``verify`` type, it returns True (confirmed), False (the side
+    effect did NOT happen — surface the task instead of closing it), or
+    None (inconclusive — fall back to trusting the skill). Skills that
+    declare no ``verify`` are unaffected.
     """
     classifier_mcp = classifier_mcp or mcp
     candidates = candidates_for(task, manifests)
@@ -541,6 +549,40 @@ async def screen(
             "failed", annotated, skill=chosen.name, summary=summary,
             error="self-reported failure", follow_up_tasks=follow_ups,
         )
+    # Ground-truth gate: the skill said it succeeded, but self-reports are
+    # not trustworthy (observed: emails marked handled that were never
+    # archived). If the skill declares a check, confirm the side effect
+    # actually happened before closing the task. False = definitively not
+    # done → surface it; None = couldn't check → fall back to trusting the
+    # skill rather than nagging the user with a false alarm.
+    if chosen.verify and verify_side_effect is not None:
+        try:
+            verified = await verify_side_effect(task, chosen.verify)
+        except Exception:
+            logger.exception(
+                "Verification %r raised for task %s; trusting the skill",
+                chosen.verify, task.id,
+            )
+            verified = None
+        if verified is False:
+            logger.info(
+                "Screener: %s reported success but the %r check did not "
+                "confirm it for task %s; surfacing to user.",
+                chosen.name, chosen.verify, task.id,
+            )
+            annotated = replace(
+                task,
+                body=(
+                    f"{task.body or ''}\n"
+                    f"[auto-handle unverified ({chosen.name}): '{chosen.verify}' "
+                    f"check failed — skill reported success but the side effect "
+                    f"was not observed]"
+                ).strip(),
+            )
+            return ScreeningOutcome(
+                "failed", annotated, skill=chosen.name, summary=summary,
+                error="unverified side-effect", follow_up_tasks=follow_ups,
+            )
     return ScreeningOutcome(
         "handled", task, skill=chosen.name, summary=summary,
         follow_up_tasks=follow_ups,
@@ -588,6 +630,7 @@ async def run_screener_loop(
     stop: asyncio.Event,
     submit_follow_up: Callable[[Task], None] | None = None,
     classifier_mcp: ClaudeMCPClient | None = None,
+    verify_side_effect: "Callable[[Task, str], Awaitable[bool | None]] | None" = None,
 ) -> None:
     """Drain the work queue, screen each task, apply the state transition.
 
@@ -628,6 +671,7 @@ async def run_screener_loop(
                 outcome = await screen(
                     task, manifests, mcp, dry_run=dry_run,
                     classifier_mcp=classifier_mcp,
+                    verify_side_effect=verify_side_effect,
                 )
             except Exception:
                 logger.exception(

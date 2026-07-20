@@ -34,6 +34,10 @@ _FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*$", re.DOTALL | re.MULTILI
 _DESCRIPTION_RE = re.compile(r"^description\s*:\s*(.+?)\s*$", re.MULTILINE)
 _AUTO_HANDLE_RE = re.compile(r"^auto[-_]handle\s*:\s*(\S+)\s*$", re.MULTILINE)
 _DISMISS_RE = re.compile(r"^dismiss\s*:\s*(\S+)\s*$", re.MULTILINE)
+# Optional ground-truth check the screener runs before closing a handled
+# task — e.g. ``verify: left-inbox`` means "confirm the email actually
+# left the inbox before trusting the skill's self-reported success".
+_VERIFY_RE = re.compile(r"^verify\s*:\s*(\S+)\s*$", re.MULTILINE)
 # List blocks: a key followed by lines starting with whitespace + "-".
 _ALLOWED_TOOLS_BLOCK_RE = re.compile(
     r"^allowed[-_]tools\s*:\s*\n((?:[ \t]+-[ \t]*[^\n]+\n?)+)",
@@ -82,6 +86,10 @@ class SkillManifest:
     auto_handle_kinds: frozenset[str] = field(default_factory=frozenset)
     dismiss: bool = False
     dismiss_kinds: frozenset[str] = field(default_factory=frozenset)
+    # Ground-truth check to run before closing a handled task. Empty means
+    # trust the skill's self-report (legacy behavior). Currently the only
+    # value is ``left-inbox`` (the email was archived out of the inbox).
+    verify: str = ""
 
 
 # --- frontmatter parsers --------------------------------------------------
@@ -160,6 +168,7 @@ def _parse_manifest(path: Path, text: str) -> SkillManifest | None:
         auto_handle_kinds=_parse_auto_handle_kinds(fm),
         dismiss=_parse_bool(_DISMISS_RE, fm),
         dismiss_kinds=_parse_dismiss_kinds(fm),
+        verify=(_VERIFY_RE.search(fm).group(1).strip() if _VERIFY_RE.search(fm) else ""),
     )
 
 

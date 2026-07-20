@@ -247,19 +247,24 @@ async def test_no_tap_skips_task(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_yes_tap_submits_queue_input(monkeypatch):
-    """YES tap always submits the TUI input via queue_yes_tap."""
+    """YES tap submits the TUI input via queue_yes_tap; when consumed,
+    no fallback Enter is synthesized."""
     from code_trip2 import dispatch
     ctx = _real_ctx()
     submitted: list = []
 
     async def fake_yes_tap(c):
         submitted.append(c)
+        return True  # TUI consumed the tap
 
     monkeypatch.setattr(dispatch, "queue_yes_tap", fake_yes_tap)
+    sent: list = []
+    monkeypatch.setattr(window, "send_keystroke", AsyncMock(side_effect=lambda s: sent.append(s)))
 
     await chords.handle_tap(ctx, "yes")
 
     assert submitted == [ctx]
+    assert sent == []
 
 
 # --- chunked playback worker (integration with mocked tts) ----------------

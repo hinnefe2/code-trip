@@ -542,13 +542,15 @@ async def test_chord_ptt_speaks_active_app(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_tap_yes_submits_queue_input(monkeypatch):
-    """YES tap always submits the TUI input via queue_yes_tap."""
+    """YES tap submits the TUI input via queue_yes_tap; a consumed
+    submit means no fallback keystroke."""
     from code_trip2 import dispatch
     ctx = _ctx()
     submitted: list = []
 
     async def fake_yes_tap(c):
         submitted.append(c)
+        return True  # TUI input had text and consumed the tap
 
     monkeypatch.setattr(dispatch, "queue_yes_tap", fake_yes_tap)
     sent: list[KeyStroke] = []
@@ -557,6 +559,50 @@ async def test_tap_yes_submits_queue_input(monkeypatch):
     await chords.handle_tap(ctx, "yes")
     assert submitted == [ctx]
     assert sent == []  # no synthesized keystroke
+
+
+@pytest.mark.asyncio
+async def test_tap_yes_falls_back_to_enter_when_nothing_to_submit(monkeypatch):
+    """When the TUI has nothing to submit (empty Input / no TUI), YES
+    acts as Enter in the focused app — the local-STT transcript was
+    pasted wherever focus was, and YES should submit it there."""
+    from code_trip2 import dispatch
+    ctx = _ctx()
+
+    async def fake_yes_tap(_c):
+        return False  # nothing consumed
+
+    monkeypatch.setattr(dispatch, "queue_yes_tap", fake_yes_tap)
+    sent: list[KeyStroke] = []
+    monkeypatch.setattr(window, "send_keystroke", AsyncMock(side_effect=lambda s: sent.append(s)))
+
+    await chords.handle_tap(ctx, "yes")
+    assert len(sent) == 1
+    [stroke] = sent
+    [chord] = stroke.chords
+    assert chord.key == keyboard.Key.enter
+    assert chord.modifiers == ()
+
+
+@pytest.mark.asyncio
+async def test_tap_yes_fallback_suppressed_when_tui_host_frontmost(monkeypatch):
+    """The Enter fallback goes through _send_stroke, whose guard
+    swallows keystrokes aimed at the terminal hosting the TUI — a stray
+    Enter would scroll the dashboard's alternate screen."""
+    from code_trip2 import dispatch
+    ctx = _ctx()
+    ctx.tui_host_app = "kitty"
+
+    async def fake_yes_tap(_c):
+        return False
+
+    monkeypatch.setattr(dispatch, "queue_yes_tap", fake_yes_tap)
+    monkeypatch.setattr(window, "active_app", AsyncMock(return_value="kitty"))
+    sent: list[KeyStroke] = []
+    monkeypatch.setattr(window, "send_keystroke", AsyncMock(side_effect=lambda s: sent.append(s)))
+
+    await chords.handle_tap(ctx, "yes")
+    assert sent == []
 
 
 @pytest.mark.asyncio
@@ -847,6 +893,30 @@ async def test_chord_act_yes_on_meeting_followup_routes_to_linear_create(monkeyp
 
     create.assert_awaited_once()
     assert create.await_args.args[1] is ctx.current_task
+    assert opened == []  # browser path was NOT taken
+
+
+@pytest.mark.asyncio
+async def test_chord_act_yes_on_linear_issue_routes_to_start_ticket(monkeypatch):
+    """ACT+YES on a linear_issue kicks off the remote /do-ticket run, NOT
+    the browser opener (that's ACT+NAV)."""
+    from code_trip2 import dispatch as dispatch_module
+    from code_trip2.tasks import Task
+
+    opened = _patch_open_subprocess(monkeypatch)
+    start = AsyncMock()
+    monkeypatch.setattr(dispatch_module, "start_linear_ticket", start)
+
+    ctx = _ctx()
+    ctx.current_task = Task(
+        kind="linear_issue", topic="ai-1389", headline="AI-1389: thing",
+        source={"identifier": "AI-1389", "status": "Triage"},
+    )
+
+    await chords.handle_chord(ctx, "act+yes")
+
+    start.assert_awaited_once()
+    assert start.await_args.args[1] is ctx.current_task
     assert opened == []  # browser path was NOT taken
 
 

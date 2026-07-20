@@ -153,13 +153,18 @@ async def main_async(config: Config, *, tui: bool = False, silent: bool = False)
             "Linear MCP via claude CLI not available; Linear producer will "
             "stay idle. Install claude CLI to enable."
         )
-    # Free-form skill invocation (ACT+PTT) and auto-handle executor.
-    # ``server_id`` is unused — run_agent doesn't restrict to a single tool.
+    # Free-form skill invocation (ACT+PTT). ``server_id`` is unused —
+    # run_agent doesn't restrict to a single tool.
     agent_mcp = ClaudeMCPClient(server_id="agent")
-    # Classifier (skill-nomination) client — a stronger model than the
-    # executor so nuanced manifest descriptions are applied reliably.
+    # Screener classifier (skill nomination) and executor (skill running)
+    # clients. Both configurable; a weak model nominates the wrong skill
+    # and narrates side effects it never performed, so both default to a
+    # stronger model.
     classifier_mcp = ClaudeMCPClient(
         server_id="agent", model=config.autohandle_classifier_model,
+    )
+    executor_mcp = ClaudeMCPClient(
+        server_id="agent", model=config.autohandle_executor_model,
     )
     # Skill manifests for both the ACT+PTT path (allowed-tools union)
     # and the screener (per-skill metadata: description, auto-handle
@@ -448,6 +453,41 @@ async def main_async(config: Config, *, tui: bool = False, silent: bool = False)
     macropad.start()
     supervisor.start_all()
     consumer_task = asyncio.create_task(consumer.run(), name="consumer")
+
+    async def _verify_side_effect(task: Task, verify_type: str) -> bool | None:
+        """Ground-truth check that a handled skill's side effect happened.
+
+        ``left-inbox``: the skill was supposed to archive the email, so
+        confirm the thread no longer carries Gmail's ``INBOX`` label.
+        Returns None (inconclusive → trust the skill) for an unknown check
+        type, a task with no thread id, or a failed/empty Gmail read — we
+        only override a "handled" verdict on positive evidence it didn't
+        happen, never on an inability to check.
+        """
+        if verify_type != "left-inbox":
+            return None
+        thread_id = (task.source or {}).get("thread_id")
+        if not thread_id or not email_mcp.enabled:
+            return None
+        try:
+            result = await email_mcp.call_tool(
+                "get_thread",
+                {"threadId": thread_id, "messageFormat": "MINIMAL"},
+            )
+        except Exception:
+            logger.warning(
+                "verify left-inbox: get_thread failed for %s", thread_id,
+                exc_info=True,
+            )
+            return None
+        messages = (result or {}).get("messages") or []
+        if not messages:
+            return None
+        still_in_inbox = any(
+            "INBOX" in (m.get("labelIds") or []) for m in messages
+        )
+        return not still_in_inbox
+
     screener_task: asyncio.Task | None = None
     if autohandle_active:
         screener_task = asyncio.create_task(
@@ -455,8 +495,9 @@ async def main_async(config: Config, *, tui: bool = False, silent: bool = False)
                 work=screener_work,
                 queue=queue,
                 manifests=skill_manifests,
-                mcp=agent_mcp,
+                mcp=executor_mcp,
                 classifier_mcp=classifier_mcp,
+                verify_side_effect=_verify_side_effect,
                 on_outcome=_on_screener_outcome,
                 allowed_kinds=allowed_kinds,
                 dry_run=config.autohandle_dry_run,

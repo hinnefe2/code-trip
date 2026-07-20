@@ -106,13 +106,15 @@ class Config:
     autohandle_enabled: bool = False
     autohandle_dry_run: bool = False
     autohandle_kinds: tuple[str, ...] = ()
-    # Model for the classifier (skill nomination) step only. Sonnet over
-    # the executor's Haiku: nominating the right skill hinges on nuanced
-    # manifest descriptions (e.g. "a [bot]-posted comment is bot-authored
-    # even when its text quotes substantive prose"), which Haiku applies
-    # unreliably and defaults to NONE on. The executor stays cheap — once
-    # a skill is chosen it just follows the SKILL.md steps.
+    # Model for the classifier (skill nomination) step. Sonnet because
+    # nominating the right skill hinges on nuanced manifest descriptions
+    # (e.g. "a [bot]-posted comment is bot-authored even when its text
+    # quotes substantive prose"), which a small model applies unreliably.
     autohandle_classifier_model: str = "sonnet"
+    # Model for the executor (skill-running) step. Sonnet because a weak
+    # executor narrates a side effect as done without reliably making the
+    # tool call (observed: emails marked handled but never archived).
+    autohandle_executor_model: str = "sonnet"
 
 
 def _select(src: dict, *fields: str) -> dict:
@@ -237,6 +239,8 @@ def load_config(path: Path | str) -> Config:
         kw["autohandle_kinds"] = tuple(str(k) for k in autohandle_cfg["kinds"])
     if "classifier_model" in autohandle_cfg:
         kw["autohandle_classifier_model"] = str(autohandle_cfg["classifier_model"])
+    if "executor_model" in autohandle_cfg:
+        kw["autohandle_executor_model"] = str(autohandle_cfg["executor_model"])
 
     return Config(**kw)
 

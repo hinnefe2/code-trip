@@ -171,6 +171,28 @@ def test_load_skill_manifests_defaults_when_keys_absent(tmp_path: Path):
     assert m.allowed_tools == ("tool_x",)
 
 
+def test_load_skill_manifests_parses_verify(tmp_path: Path):
+    _write_skill(
+        tmp_path,
+        "archive-x",
+        "name: archive-x\n"
+        "description: Archive it.\n"
+        "auto-handle: true\n"
+        "verify: left-inbox\n",
+    )
+    [m] = load_skill_manifests(tmp_path)
+    assert m.verify == "left-inbox"
+
+
+def test_load_skill_manifests_verify_defaults_empty(tmp_path: Path):
+    _write_skill(
+        tmp_path, "no-verify",
+        "name: no-verify\ndescription: x\nauto-handle: true\n",
+    )
+    [m] = load_skill_manifests(tmp_path)
+    assert m.verify == ""
+
+
 def test_load_skill_manifests_inline_list_form(tmp_path: Path):
     """Inline ``[a, b]`` list form parses the same as block form."""
     _write_skill(

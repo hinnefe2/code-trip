@@ -622,6 +622,59 @@ def _build_followup_filing_prompt(task: Task) -> str:
     )
 
 
+async def start_linear_ticket(ctx: "Context", task: Task) -> None:
+    """ACT+YES on a ``linear_issue`` task: kick off the remote /do-ticket run.
+
+    Sends a single ``/do-ticket <ID>`` into the standing remote Claude
+    session — the same window talk-to-Claude replies go to
+    (``tmux_session:work_window``). That session runs its own
+    ``/do-ticket`` skill, which creates the worktree + per-ticket window
+    and owns the Linear status transition (→ In Progress).
+
+    We deliberately do **not** set the status to "Todo" ourselves.
+    "Todo" is the auto-handle trigger the ``trigger-remote-do-ticket``
+    skill gates on, so setting it here would re-arm the screener and
+    fire a *second* ``/do-ticket`` on the next Linear poll. Explicit
+    send is the single trigger; the remote owns status.
+
+    Fast remote round-trip (one ``tmux send-keys``), so — unlike the
+    ~90s ``meeting_followup`` filing — this runs inline and marks the
+    task done only once the send lands, mirroring ``_respond_claude``.
+    """
+    identifier = (task.source or {}).get("identifier") or ""
+    if not identifier:
+        await _speak(ctx, "Missing issue id for this task.")
+        return
+    host, opts = ctx.ssh
+    if not host:
+        await _speak(ctx, "SSH is not configured.")
+        return
+    successor = _ranked_successor(ctx, task)
+    try:
+        await remote.send(
+            host,
+            opts,
+            ctx.config.tmux_session,
+            ctx.config.work_window,
+            f"/do-ticket {identifier}",
+        )
+    except remote.RemoteError as exc:
+        await _speak(ctx, f"Could not reach Claude: {exc}")
+        return
+    ctx.queue.mark_done(task.id)
+    if ctx.current_task is task:
+        ctx.current_task = None
+    ctx.log.event(
+        "queue_turn",
+        task_id=task.id,
+        task_kind=task.kind,
+        topic=task.topic,
+        sent=f"/do-ticket {identifier}",
+    )
+    await _speak(ctx, f"Starting {identifier}.")
+    _advance_cursor_after_dismiss(ctx, successor)
+
+
 async def _respond_slack(ctx: "Context", task: Task, transcript: str) -> None:
     """Reply in the Slack thread the task came from via the Slack MCP."""
     mcp = ctx.slack_mcp
@@ -661,23 +714,28 @@ async def _respond_slack(ctx: "Context", task: Task, transcript: str) -> None:
 # --- macropad tap delegates (queue-mode YES/NO/ACT) -----------------------
 
 
-async def queue_yes_tap(ctx: "Context") -> None:
+async def queue_yes_tap(ctx: "Context") -> bool:
     """YES in queue mode: submit whatever's in the Input widget.
 
     Acts as the Enter key for the TUI's Input — lets the user paste a
-    PTT transcript, edit it, and submit on their schedule. If the
-    Input is empty (or there is no TUI), this is a no-op: auto-
-    advance takes care of the "I'm ready for the next task" case, and
-    expanding the current task's body is a voice-only command ("go
-    on" / "tell me more" / "expand").
+    PTT transcript, edit it, and submit on their schedule.
+
+    Returns True when the tap was consumed here (text submitted).
+    Returns False when there was nothing to submit — Input empty, or
+    no TUI at all — so the caller can fall back to treating YES as a
+    literal Enter in the focused app (the local-STT-pasted-elsewhere
+    case). A submit that *raises* reports True: the widget state is
+    unknown, and stacking a synthetic keystroke on top of a
+    half-completed submit is worse than doing nothing.
     """
     submit = ctx.submit_input
     if submit is None:
-        return
+        return False
     try:
-        submit()
+        return bool(submit())
     except Exception:
         logger.exception("queue_yes_tap: submit_input failed")
+        return True
 
 
 async def queue_no_tap(ctx: "Context") -> None:

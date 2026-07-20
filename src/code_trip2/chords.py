@@ -66,6 +66,12 @@ _SLACK_BACK_HISTORY = KeyStroke(
     chords=(Chord(modifiers=(keyboard.Key.cmd,), key="["),)
 )
 
+# YES-tap fallback when the TUI has nothing to submit: act as Enter in
+# the focused app. The macropad suppresses its raw keys at the OS event
+# tap, so this synthesized stroke is the only way a YES tap can reach
+# another app.
+_ENTER_STROKE = KeyStroke(chords=(Chord(key=keyboard.Key.enter),))
+
 
 APP_NAV: dict[str, tuple[KeyStroke, KeyStroke]] = {
     "kitty": (_KITTY_NEXT, _KITTY_PREV),
@@ -90,12 +96,15 @@ async def handle_chord(ctx: "Context", name: str) -> None:
         # Gmail thread.
         await dispatch.dismiss_current_task(ctx)
     elif name == "act+yes":
-        # ACT+YES is the per-kind "accept" action. Only ``meeting_followup``
-        # has one wired today (create a Linear backlog ticket assigned to
-        # the user); other kinds are a silent no-op. Open-in-app is ACT+NAV.
+        # ACT+YES is the per-kind "accept" action. ``meeting_followup``
+        # files a Linear backlog ticket assigned to the user;
+        # ``linear_issue`` kicks off the remote /do-ticket run for the
+        # ticket. Other kinds are a silent no-op. Open-in-app is ACT+NAV.
         task = ctx.current_task
         if task is not None and task.kind == "meeting_followup":
             await dispatch.create_linear_ticket_from_followup(ctx, task)
+        elif task is not None and task.kind == "linear_issue":
+            await dispatch.start_linear_ticket(ctx, task)
     elif name == "act+nav":
         # ACT+NAV opens the active task in its app — email_msg → Gmail
         # thread; linear_issue / slack_msg → source["url"];
@@ -207,7 +216,11 @@ async def handle_tap(ctx: "Context", name: str) -> None:
     - **NAV**: no-op on its own — NAV is only meaningful as a held
       modifier for the app-navigation chords.
     - **ACT**: stop TTS playback if speaking; otherwise a no-op.
-    - **YES/NO**: drive the queue (submit the TUI input / skip task).
+    - **YES**: submit the TUI input; when there's nothing to submit
+      (Input empty, or no TUI), fall back to a synthesized Enter in
+      the focused app — so YES still "presses Enter" when a local-STT
+      transcript was pasted into some other app.
+    - **NO**: skip the current queue task.
     - **PTT**: handled at the macropad layer, not here.
 
     Playback chunks auto-advance through ``_playback_loop``, so there's
@@ -225,7 +238,14 @@ async def handle_tap(ctx: "Context", name: str) -> None:
         return
 
     if name == "yes":
-        await dispatch.queue_yes_tap(ctx)
+        if not await dispatch.queue_yes_tap(ctx):
+            # Nothing for the TUI to consume — the text the user wants
+            # to submit lives in the focused app (local STT pasted the
+            # transcript wherever focus was), so YES acts as its Enter
+            # key. ``_send_stroke``'s guard still swallows the stroke
+            # when the TUI's own terminal is frontmost, where a stray
+            # Enter would scroll the dashboard.
+            await _send_stroke(ctx, _ENTER_STROKE)
         return
     if name == "no":
         await dispatch.queue_no_tap(ctx)

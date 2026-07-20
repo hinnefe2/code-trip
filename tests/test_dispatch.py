@@ -137,29 +137,43 @@ async def test_queue_voice_add_manual_creates_note_task():
 
 @pytest.mark.asyncio
 async def test_queue_yes_tap_calls_submit_input():
-    """YES in queue mode invokes ctx.submit_input."""
+    """YES in queue mode invokes ctx.submit_input; a consumed submit
+    reports True so the caller knows not to fall back."""
     ctx = _make_ctx()
     submit = MagicMock(return_value=True)
     ctx.submit_input = submit
-    await dispatch.queue_yes_tap(ctx)
+    assert await dispatch.queue_yes_tap(ctx) is True
     submit.assert_called_once_with()
 
 
 @pytest.mark.asyncio
-async def test_queue_yes_tap_without_submit_input_is_noop():
-    """No TUI (e.g. headless OpenAI-STT mode) — YES tap is a no-op."""
+async def test_queue_yes_tap_empty_input_reports_unconsumed():
+    """submit_input finding an empty Input returns False — the tap
+    wasn't consumed, so the caller may fall back to a focused-app
+    Enter."""
+    ctx = _make_ctx()
+    ctx.submit_input = MagicMock(return_value=False)
+    assert await dispatch.queue_yes_tap(ctx) is False
+
+
+@pytest.mark.asyncio
+async def test_queue_yes_tap_without_submit_input_reports_unconsumed():
+    """No TUI (e.g. headless OpenAI-STT mode) — nothing consumed the
+    tap, so the fallback path is available."""
     ctx = _make_ctx()
     ctx.submit_input = None
-    await dispatch.queue_yes_tap(ctx)  # no raise
+    assert await dispatch.queue_yes_tap(ctx) is False
 
 
 @pytest.mark.asyncio
 async def test_queue_yes_tap_swallows_submit_exceptions():
-    """A submit_input that raises shouldn't crash the chord handler."""
+    """A submit_input that raises shouldn't crash the chord handler —
+    and must report consumed, so the caller doesn't stack a synthetic
+    Enter on top of an unknown widget state."""
     ctx = _make_ctx()
     submit = MagicMock(side_effect=RuntimeError("widget gone"))
     ctx.submit_input = submit
-    await dispatch.queue_yes_tap(ctx)  # no raise
+    assert await dispatch.queue_yes_tap(ctx) is True  # no raise
 
 
 @pytest.mark.asyncio
@@ -650,3 +664,104 @@ async def test_create_linear_ticket_local_effect_precedes_agent_run():
     gate.set()
     await _flush_bg(ctx)
     ctx.tts.speak.assert_called_with("Filed in AI: x.")
+
+
+# --- ACT+YES: start_linear_ticket (remote /do-ticket) ----------------------
+
+
+def _linear_ctx():
+    """Context wired to reach the remote (non-empty ssh_host)."""
+    ctx = _make_ctx()
+    ctx.config.ssh_host = "coder.dec-8"
+    return ctx
+
+
+def _linear_task(ctx, identifier: str = "AI-1389"):
+    t = ctx.queue.add(Task(
+        kind="linear_issue",
+        topic=identifier.lower(),
+        headline=f"{identifier}: Do the thing",
+        source={"identifier": identifier, "status": "Triage"},
+    ))
+    ctx.current_task = t
+    return t
+
+
+@pytest.mark.asyncio
+async def test_start_linear_ticket_sends_do_ticket_and_marks_done():
+    ctx = _linear_ctx()
+    t = _linear_task(ctx)
+    with patch.object(dispatch.remote, "send", new=AsyncMock()) as send:
+        await dispatch.start_linear_ticket(ctx, t)
+    # One send-keys into the standing Claude window, exact command.
+    send.assert_awaited_once_with(
+        "coder.dec-8", (), "main", "work", "/do-ticket AI-1389",
+    )
+    assert ctx.queue.get(t.id).state == "done"
+    assert ctx.current_task is None
+    ctx.tts.speak.assert_called_with("Starting AI-1389.")
+
+
+@pytest.mark.asyncio
+async def test_start_linear_ticket_does_not_touch_linear_status():
+    """We never set the ticket to Todo — that would re-arm the auto-handle
+    and double-fire /do-ticket on the next poll. The remote owns status."""
+    ctx = _linear_ctx()
+    ctx.linear_mcp = create_autospec(ClaudeMCPClient, instance=True)
+    t = _linear_task(ctx)
+    with patch.object(dispatch.remote, "send", new=AsyncMock()):
+        await dispatch.start_linear_ticket(ctx, t)
+    ctx.linear_mcp.call_tool.assert_not_called()
+    # Source status left untouched — no local "Todo" write.
+    assert ctx.queue.get(t.id).source["status"] == "Triage"
+
+
+@pytest.mark.asyncio
+async def test_start_linear_ticket_remote_error_keeps_task():
+    ctx = _linear_ctx()
+    t = _linear_task(ctx)
+    with patch.object(
+        dispatch.remote, "send",
+        new=AsyncMock(side_effect=dispatch.remote.RemoteError("boom")),
+    ):
+        await dispatch.start_linear_ticket(ctx, t)
+    # Send failed → task stays pending so the user can retry.
+    assert ctx.queue.get(t.id).state == "pending"
+    assert ctx.current_task is t
+    ctx.tts.speak.assert_called_with("Could not reach Claude: boom")
+
+
+@pytest.mark.asyncio
+async def test_start_linear_ticket_without_ssh_speaks_error():
+    ctx = _make_ctx()  # ssh_host == ""
+    t = _linear_task(ctx)
+    with patch.object(dispatch.remote, "send", new=AsyncMock()) as send:
+        await dispatch.start_linear_ticket(ctx, t)
+    send.assert_not_awaited()
+    assert ctx.queue.get(t.id).state == "pending"
+    ctx.tts.speak.assert_called_with("SSH is not configured.")
+
+
+@pytest.mark.asyncio
+async def test_start_linear_ticket_missing_identifier_keeps_task():
+    ctx = _linear_ctx()
+    t = ctx.queue.add(Task(kind="linear_issue", topic="x", headline="x", source={}))
+    ctx.current_task = t
+    with patch.object(dispatch.remote, "send", new=AsyncMock()) as send:
+        await dispatch.start_linear_ticket(ctx, t)
+    send.assert_not_awaited()
+    assert ctx.queue.get(t.id).state == "pending"
+    ctx.tts.speak.assert_called_with("Missing issue id for this task.")
+
+
+@pytest.mark.asyncio
+async def test_start_linear_ticket_advances_cursor_to_successor():
+    ctx = _linear_ctx()
+    a, b, _c = _seed_three(ctx)
+    a.kind = "linear_issue"
+    a.source = {"identifier": "AI-1", "status": "Triage"}
+    ctx.current_task = a
+    with patch.object(dispatch.remote, "send", new=AsyncMock()), \
+            patch.object(modes, "speak_chunked"):
+        await dispatch.start_linear_ticket(ctx, a)
+    assert ctx.current_task is b
