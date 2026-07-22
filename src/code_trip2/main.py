@@ -79,10 +79,11 @@ async def main_async(config: Config, *, tui: bool = False, silent: bool = False)
     else:
         logger.info("STT provider=%s; bypassing OpenAI STT.", config.stt_provider)
     tts: TTSClient | SilentTTSClient
-    if silent:
+    if silent or config.audio_silent:
         tts = SilentTTSClient()
         earcon.set_silent(True)
-        logger.info("Silent mode: TTS + earcons disabled.")
+        source = "--silent" if silent else "[audio] silent"
+        logger.info("Silent mode (%s): TTS + earcons disabled.", source)
     else:
         tts = TTSClient(
             api_key=config.api_key,
@@ -559,7 +560,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--silent",
         action="store_true",
-        help="Disable all audio output (TTS speech + earcon beeps).",
+        help=(
+            "Disable all audio output (TTS speech + earcon beeps). "
+            "Same as [audio] silent = true in the config."
+        ),
     )
     parser.add_argument(
         "--after-hours",

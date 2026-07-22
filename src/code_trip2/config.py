@@ -29,6 +29,10 @@ class Config:
     # audio
     sample_rate: int = 16_000
     audio_device: int | str | None = None
+    # Mute all audio output (TTS + earcons) — the config-file twin of
+    # the ``--silent`` CLI flag. Everything else runs normally: tasks
+    # queue, the TUI updates, speak calls become no-ops.
+    audio_silent: bool = False
     # macropad — physical layout left-to-right: PTT, YES, NO, ACT, NAV
     ptt_key: str = "f13"
     yes_key: str = "f14"
@@ -162,6 +166,8 @@ def load_config(path: Path | str) -> Config:
         kw["sample_rate"] = audio["sample_rate"]
     if "device" in audio:
         kw["audio_device"] = audio["device"]
+    if "silent" in audio:
+        kw["audio_silent"] = bool(audio["silent"])
 
     # macropad — TOML keys match field names
     kw.update(_select(macropad, "ptt_key", "yes_key", "no_key", "act_key", "nav_key"))

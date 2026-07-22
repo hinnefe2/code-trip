@@ -16,6 +16,9 @@ window = "main"
 [audio]
 sample_rate = 16000
 # device = 2            # mic device index from `python -m sounddevice` (optional)
+# Mute all audio output (TTS speech + earcon beeps); same as the
+# --silent CLI flag. Tasks still queue and the TUI still updates.
+# silent = false
 
 [macropad]
 # Physical macropad layout, left-to-right: PTT, YES, NO, ACT, NAV.
