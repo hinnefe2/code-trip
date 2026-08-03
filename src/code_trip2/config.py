@@ -52,8 +52,11 @@ class Config:
     tts_model: str = "gpt-4o-mini-tts"
     tts_voice: str = "nova"
     tts_speed: float = 1.15
-    # claude
-    wait_timeout: float = 300.0
+    # remote ticket windows (WindowProducer). Plain ssh+tmux polls — no
+    # LLM billing — so they run around the clock, ungated by the
+    # active-hours window below.
+    window_poll_interval: float = 1.5
+    window_capture_lines: int = 350
     # summarizer (cloud LLM that turns raw Claude pane output into spoken text)
     summarizer_model: str = "gpt-4o-mini"
     summarizer_max_chars: int = 600
@@ -144,7 +147,6 @@ def load_config(path: Path | str) -> Config:
     stt = data.get("stt", {})
     stt_local = stt.get("local", {})
     openai_ = data.get("openai", {})
-    claude = data.get("claude", {})
 
     kw: dict[str, object] = {}
 
@@ -188,9 +190,11 @@ def load_config(path: Path | str) -> Config:
     if api_key:
         kw["api_key"] = api_key
 
-    # claude
-    if "wait_timeout" in claude:
-        kw["wait_timeout"] = claude["wait_timeout"]
+    windows_cfg = data.get("windows", {})
+    if "poll_interval" in windows_cfg:
+        kw["window_poll_interval"] = float(windows_cfg["poll_interval"])
+    if "capture_lines" in windows_cfg:
+        kw["window_capture_lines"] = int(windows_cfg["capture_lines"])
 
     summarizer = data.get("summarizer", {})
     if "model" in summarizer:

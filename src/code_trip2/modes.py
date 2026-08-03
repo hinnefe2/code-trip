@@ -56,8 +56,14 @@ class Context:
     queue_log: QueueLog | None = None
     recent_topics: RecentTopics = field(default_factory=RecentTopics)
     current_task: Task | None = None
+    # Live capture-pane text per remote ticket window (window name →
+    # raw ANSI text). Written by WindowProducer every poll tick; read by
+    # the TUI mirror panel. Deliberately NOT on Task.body — per-poll
+    # upserts would fire queue events and serialize ~350 lines into the
+    # JSONL queue log every couple of seconds.
+    window_mirrors: dict[str, str] = field(default_factory=dict)
     # Pane-output → spoken-English summarizer. Owned here so the TUI
-    # header can show its status; the ClaudeProducer holds its own.
+    # header can show its status.
     summarizer: Summarizer | None = None
     # Set when ``--tui`` is on. If the frontmost macOS app matches this
     # value, ``chords`` suppresses synthesized keystrokes so the

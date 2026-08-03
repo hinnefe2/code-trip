@@ -30,7 +30,7 @@ from rich.text import Text
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.widgets import Input, Static
 
@@ -192,7 +192,17 @@ def _current_task_panel(ctx: "Context") -> Panel:
     headline = Text(t.headline or "(no headline)", style="white")
     parts: list = [head, headline]
     slack_msgs = (t.source or {}).get("messages") if t.kind == "slack_msg" else None
-    if isinstance(slack_msgs, list) and slack_msgs:
+    if t.kind == "remote_window":
+        # Live mirror of the remote tmux pane. No line clip — the
+        # surrounding VerticalScroll owns the viewport (PageUp/PageDown,
+        # mouse wheel, sticky-bottom anchor).
+        window = (t.source or {}).get("window") or t.topic
+        raw = ctx.window_mirrors.get(window)
+        if raw:
+            parts.append(Text.from_ansi(raw.rstrip("\n")))
+        else:
+            parts.append(Text("(no capture yet)", style="dim italic"))
+    elif isinstance(slack_msgs, list) and slack_msgs:
         parts.extend(_render_slack_thread(slack_msgs))
     elif t.body:
         clipped, truncated = _clip_body(t.body, _CURRENT_TASK_BODY_MAX_LINES)
@@ -423,6 +433,9 @@ class CodeTripApp(App):
     #left {
         width: 1fr;
     }
+    #task_scroll {
+        height: 1fr;
+    }
     #right {
         width: 1fr;
     }
@@ -444,6 +457,11 @@ class CodeTripApp(App):
         # down itself, so we're not stealing a real edit affordance).
         Binding("up", "queue_prev", "Prev task", priority=True),
         Binding("down", "queue_next", "Next task", priority=True),
+        # Scroll the current-task mirror (remote tmux pane captures run
+        # to ~350 lines). Mouse wheel also works — MouseScroll events
+        # bubble from the Static into the VerticalScroll container.
+        Binding("pageup", "mirror_page_up", "Scroll up", priority=True),
+        Binding("pagedown", "mirror_page_down", "Scroll down", priority=True),
     ]
 
     def __init__(
@@ -462,12 +480,15 @@ class CodeTripApp(App):
         # set across edits so the user can tweak the pasted transcript
         # before submitting.
         self._pending_skill_mode = False
+        # Active-task change detection for the mirror scroll reset.
+        self._last_task_id: str | None = None
 
     def compose(self) -> ComposeResult:
         yield Static(_header(self.ctx), id="header")
         with Horizontal(id="body"):
             with Vertical(id="left"):
-                yield Static(_current_task_panel(self.ctx), id="current_task")
+                with VerticalScroll(id="task_scroll", can_focus=False):
+                    yield Static(_current_task_panel(self.ctx), id="current_task")
             with Vertical(id="right"):
                 yield Static(_queue_table(self.ctx), id="queue")
                 yield Static(_autohandle_panel(self.ctx), id="autohandle")
@@ -483,9 +504,41 @@ class CodeTripApp(App):
 
     def on_mount(self) -> None:
         self.set_interval(1.0 / _REFRESH_HZ, self._refresh_panels)
+        # First paint now rather than after the first tick, so the
+        # anchor/scroll state matches the current task immediately.
+        self._refresh_panels()
 
     def _refresh_panels(self) -> None:
         try:
+            scroll = self.query_one("#task_scroll", VerticalScroll)
+            t = self.ctx.current_task
+            # Sticky-bottom is terminal semantics and applies ONLY to the
+            # remote_window mirror. Every other kind reads top-down, so
+            # the anchor stays disarmed and the view sits at the top.
+            is_mirror = t is not None and t.kind == "remote_window"
+            task_id = t.id if t else None
+            if task_id != self._last_task_id:
+                self._last_task_id = task_id
+                if is_mirror:
+                    # The compositor re-snaps an anchored widget to the
+                    # content bottom on every reflow, so the 2 Hz
+                    # Static.update keeps showing the newest output.
+                    # User scrolling releases the anchor; returning to
+                    # the bottom re-arms it.
+                    scroll.anchor()
+                    scroll.scroll_end(animate=False)
+                else:
+                    scroll.anchor(False)
+                    scroll.scroll_home(animate=False)
+            elif (
+                is_mirror
+                and scroll._anchor_released
+                and scroll.scroll_y >= scroll.max_scroll_y
+            ):
+                # Scrolling down while already at the bottom releases the
+                # anchor without moving, so the position watcher never
+                # re-arms it. At-bottom means sticky; scroll_end re-arms.
+                scroll.scroll_end(animate=False)
             self.query_one("#header", Static).update(_header(self.ctx))
             self.query_one("#current_task", Static).update(_current_task_panel(self.ctx))
             self.query_one("#queue", Static).update(_queue_table(self.ctx))
@@ -569,6 +622,14 @@ class CodeTripApp(App):
 
     async def action_queue_next(self) -> None:
         await self._queue_arrow(+1)
+
+    def action_mirror_page_up(self) -> None:
+        # Releases the sticky-bottom anchor. animate=False so the jump
+        # can't race the 2 Hz panel refresh mid-animation.
+        self.query_one("#task_scroll", VerticalScroll).scroll_page_up(animate=False)
+
+    def action_mirror_page_down(self) -> None:
+        self.query_one("#task_scroll", VerticalScroll).scroll_page_down(animate=False)
 
     async def _queue_arrow(self, direction: int) -> None:
         """Forward up/down to dispatch.queue_navigate.

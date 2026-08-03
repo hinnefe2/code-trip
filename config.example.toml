@@ -50,8 +50,14 @@ tts_model = "gpt-4o-mini-tts"
 tts_voice = "nova"
 tts_speed = 1.15
 
-[claude]
-wait_timeout = 300.0
+[windows]
+# WindowProducer: polls the remote tmux session for ticket windows
+# (names matching ^[A-Z]+-\d+$, created by the remote /do-ticket skill).
+# A window whose Claude session is waiting for input becomes a queue
+# task; the TUI mirrors its pane content live. Plain ssh polls, no LLM
+# billing — runs regardless of the [poll] active-hours window.
+poll_interval = 1.5     # seconds between ssh polls
+capture_lines = 350     # scrollback lines captured for the mirror
 
 [email]
 # Polling cadence for the claude.ai Gmail MCP (seconds).

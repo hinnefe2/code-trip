@@ -1,8 +1,9 @@
 """SSH + tmux as free functions.
 
-Single done-detection strategy: poll for the Stop-hook signal file at
-/tmp/claude-done-<window>. ControlMaster multiplexing in ~/.ssh/config
-keeps the per-call overhead low.
+ControlMaster multiplexing in ~/.ssh/config keeps the per-call
+overhead low. Claude session state (running vs waiting) is detected
+from ``capture`` output by :mod:`code_trip2.claude_screen` — there is
+no hook or signal-file machinery on the remote.
 """
 
 from __future__ import annotations
@@ -11,14 +12,7 @@ import asyncio
 import shlex
 
 
-SIGNAL_PREFIX = "/tmp/claude-done-"
-
-
 class RemoteError(Exception):
-    pass
-
-
-class WaitTimeout(RemoteError):
     pass
 
 
@@ -82,9 +76,13 @@ async def capture(
     window: str,
     *,
     lines: int = 100,
+    ansi: bool = False,
 ) -> str:
+    """Capture the pane text. ``ansi=True`` keeps SGR escapes (-e) so the
+    TUI mirror can re-render colors via ``Text.from_ansi``."""
     target = shlex.quote(f"{session}:{window}")
-    return await _ssh(host, opts, f"tmux capture-pane -t {target} -p -S -{lines}")
+    flags = "-p -e" if ansi else "-p"
+    return await _ssh(host, opts, f"tmux capture-pane -t {target} {flags} -S -{lines}")
 
 
 async def list_windows(
@@ -118,37 +116,3 @@ async def select_window(
     await _ssh(host, opts, f"tmux select-window -t {target}", capture=False)
 
 
-def _signal_path(window: str) -> str:
-    return f"{SIGNAL_PREFIX}{window}"
-
-
-async def clear_signal(host: str, opts: tuple[str, ...], window: str) -> None:
-    path = shlex.quote(_signal_path(window))
-    try:
-        await _ssh(host, opts, f"rm -f {path}", capture=False)
-    except RemoteError:
-        pass
-
-
-async def wait_done(
-    host: str,
-    opts: tuple[str, ...],
-    window: str,
-    *,
-    timeout: float = 300.0,
-    poll: float = 1.0,
-) -> None:
-    """Poll for the Stop-hook signal file. Raises WaitTimeout on timeout."""
-    await clear_signal(host, opts, window)
-    path = shlex.quote(_signal_path(window))
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-    while loop.time() < deadline:
-        try:
-            await _ssh(host, opts, f"test -f {path}", capture=False)
-            await clear_signal(host, opts, window)
-            return
-        except RemoteError:
-            pass
-        await asyncio.sleep(poll)
-    raise WaitTimeout(f"Claude did not finish within {timeout}s in {window!r}")

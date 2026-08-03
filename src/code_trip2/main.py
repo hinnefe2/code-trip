@@ -22,12 +22,12 @@ from code_trip2.macropad import Macropad, resolve_key
 from code_trip2.modes import Context, stop_playback
 from code_trip2.producers import ProducerSupervisor
 from code_trip2.email_state import EmailState
-from code_trip2.producers.claude import ClaudeProducer
 from code_trip2.producers.email import EmailProducer
 from code_trip2.producers.linear import LinearProducer
 from code_trip2.producers.manual import ManualProducer
 from code_trip2.producers.reconcile import ReconcileProducer
 from code_trip2.producers.slack import SlackProducer
+from code_trip2.producers.windows import WindowProducer
 from code_trip2.queue_log import QueueLog
 from code_trip2.producers.claude_mcp import ClaudeMCPClient
 from code_trip2.producers.mcp_batch import BatchedMCPClient, MCPBatcher
@@ -296,8 +296,8 @@ async def main_async(config: Config, *, tui: bool = False, silent: bool = False)
         )
 
     supervisor = ProducerSupervisor()
-    supervisor.add(ClaudeProducer(
-        config=config, queue=queue, summarizer=summarizer, submit=submit,
+    supervisor.add(WindowProducer(
+        config=config, queue=queue, submit=submit, mirrors=ctx.window_mirrors,
     ))
     supervisor.add(SlackProducer(
         config=config, queue=queue, mcp=slack_mcp, state=SlackState(),

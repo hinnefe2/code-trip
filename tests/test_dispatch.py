@@ -57,9 +57,9 @@ async def test_handle_voice_empty_transcript_is_noop():
 @pytest.mark.asyncio
 async def test_queue_voice_status_announces_count():
     ctx = _make_ctx()
-    ctx.queue.add(Task(kind="claude_reply", topic="ticket-42", headline="ready"))
+    ctx.queue.add(Task(kind="remote_window", topic="ticket-42", headline="ready"))
     await dispatch.handle_voice(ctx, "status")
-    ctx.tts.speak.assert_called_with("1 pending. 1 claude reply.")
+    ctx.tts.speak.assert_called_with("1 pending. 1 remote window.")
 
 
 @pytest.mark.asyncio
@@ -72,7 +72,7 @@ async def test_queue_voice_unmatched_with_no_task_nudges():
 @pytest.mark.asyncio
 async def test_queue_voice_next_announces_top_task():
     ctx = _make_ctx()
-    t = Task(kind="claude_reply", topic="ticket-42", headline="ready")
+    t = Task(kind="remote_window", topic="ticket-42", headline="ready")
     ctx.queue.add(t)
     with patch.object(modes, "speak_chunked") as mocked:
         await dispatch.handle_voice(ctx, "next")

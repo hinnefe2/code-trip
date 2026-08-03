@@ -108,15 +108,45 @@ def test_current_task_idle_panel():
 def test_current_task_panel_with_active_task():
     ctx = _make_ctx()
     ctx.current_task = Task(
-        kind="claude_reply",
+        kind="note",
         topic="ticket-42",
         headline="replied to: run the tests",
         body="Tests passed in two files.",
     )
     out = _render(tui._current_task_panel(ctx))
-    assert "claude_reply" in out
+    assert "note" in out
     assert "ticket-42" in out
     assert "replied to: run the tests" in out
+
+
+def test_current_task_panel_remote_window_renders_mirror():
+    """A remote_window task shows the live capture from
+    ctx.window_mirrors, not the task body, and skips the 16-line clip."""
+    ctx = _make_ctx()
+    ctx.current_task = Task(
+        kind="remote_window",
+        topic="AI-42",
+        headline="waiting for input",
+        source={"window": "AI-42", "claude_state": "waiting_input"},
+    )
+    mirror = "\n".join(f"pane line {i}" for i in range(40))
+    ctx.window_mirrors["AI-42"] = mirror
+    out = _render(tui._current_task_panel(ctx))
+    assert "pane line 0" in out
+    assert "pane line 39" in out
+    assert "truncated" not in out
+
+
+def test_current_task_panel_remote_window_without_capture():
+    ctx = _make_ctx()
+    ctx.current_task = Task(
+        kind="remote_window",
+        topic="AI-42",
+        headline="waiting for input",
+        source={"window": "AI-42"},
+    )
+    out = _render(tui._current_task_panel(ctx))
+    assert "no capture yet" in out
 
 
 def test_current_task_panel_preserves_multiline_body():
@@ -234,7 +264,7 @@ def test_queue_table_empty():
 
 def test_queue_table_populated_shows_pending_count_and_top():
     ctx = _make_ctx()
-    ctx.queue.add(Task(kind="claude_reply", topic="ticket-42", headline="top item",
+    ctx.queue.add(Task(kind="remote_window", topic="ticket-42", headline="top item",
                        created_at=1.0))
     ctx.queue.add(Task(kind="slack_msg", topic="general", headline="alice pinged",
                        created_at=100.0))
@@ -266,7 +296,7 @@ def test_queue_table_marker_follows_cursor():
     visibly without reshuffling the queue."""
     ctx = _make_ctx()
     top = ctx.queue.add(
-        Task(kind="claude_reply", topic="t1", headline="top item", created_at=1.0)
+        Task(kind="remote_window", topic="t1", headline="top item", created_at=1.0)
     )
     second = ctx.queue.add(
         Task(kind="slack_msg", topic="t2", headline="second item", created_at=100.0)

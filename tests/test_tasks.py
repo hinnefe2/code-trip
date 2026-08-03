@@ -36,13 +36,13 @@ def test_task_defaults_unique_ids():
 
 def test_task_roundtrip_dict():
     t = Task(
-        kind="claude_reply", topic="ticket-42", headline="ready", body="ok",
+        kind="remote_window", topic="ticket-42", headline="ready", body="ok",
         origin_key="followup:abc:ready",
     )
     d = t.to_dict()
     back = Task.from_dict(d)
     assert back.id == t.id
-    assert back.kind == "claude_reply"
+    assert back.kind == "remote_window"
     assert back.topic == "ticket-42"
     assert back.headline == "ready"
     assert back.body == "ok"
@@ -462,7 +462,7 @@ def test_queue_load_replaces_state():
 
 def test_queue_count_by_kind_only_counts_pending():
     q = TaskQueue()
-    a = q.add(Task(kind="claude_reply"))
+    a = q.add(Task(kind="remote_window"))
     q.add(Task(kind="slack_msg"))
     q.mark_done(a.id)
     counts = q.count_by_kind()

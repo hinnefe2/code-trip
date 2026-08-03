@@ -312,8 +312,10 @@ async def _announce_body(ctx: "Context") -> None:
 
 
 def _kind_label(task: Task) -> str:
-    if task.kind == "claude_reply":
-        return f"Claude in {task.topic} replied"
+    if task.kind == "remote_window":
+        if (task.source or {}).get("claude_state") == "waiting_permission":
+            return f"Claude in {task.topic} needs permission"
+        return f"Claude in {task.topic} is waiting"
     if task.kind == "slack_msg":
         return f"Slack in {task.topic}"
     if task.kind == "email_msg":
@@ -337,7 +339,7 @@ def _kind_label(task: Task) -> str:
 
 async def _dispatch_task_response(ctx: "Context", task: Task, transcript: str) -> None:
     """Route a free-form PTT transcript to whatever makes sense for this task."""
-    if task.kind == "claude_reply":
+    if task.kind == "remote_window":
         await _respond_claude(ctx, task, transcript)
         return
     if task.kind == "slack_msg":
@@ -354,7 +356,7 @@ async def _dispatch_task_response(ctx: "Context", task: Task, transcript: str) -
 
 async def _respond_claude(ctx: "Context", task: Task, transcript: str) -> None:
     """Send the transcript to the source tmux window. Don't block — the
-    ClaudeProducer will surface the next reply as a new task when ready."""
+    WindowProducer re-mints the task when that window next stops running."""
     win = task.source.get("window") or task.topic
     host, opts = ctx.ssh
     try:
