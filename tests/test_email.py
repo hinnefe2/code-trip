@@ -243,6 +243,26 @@ def test_empty_always_include_leaves_base_query_untouched(tmp_path: Path):
     assert p._effective_query() == "in:inbox category:primary -from:me is:unread"
 
 
+@pytest.mark.asyncio
+async def test_poll_failures_feed_health_and_success_recovers(tmp_path: Path):
+    """A failure streak surfaces a producer_health task via the wired
+    PollHealth; the next good poll retires it."""
+    from code_trip2.poll_health import PollHealth
+
+    p, q, mcp, _state = _producer(tmp_path)
+    p._health = PollHealth(producer="email", queue=q, threshold=2)
+    mcp.call_tool.side_effect = ClaudeMCPError("claude exited 1")
+    await p._poll_once()
+    await p._poll_once()
+    health = q.get_by_origin("health:email")
+    assert health is not None and health.state == "pending"
+
+    mcp.call_tool.side_effect = None
+    mcp.call_tool.return_value = {"threads": []}
+    await p._poll_once()
+    assert q.get_by_origin("health:email").state == "done"
+
+
 def _email_task(thread_id: str, headline: str = "x") -> Task:
     return Task(kind="email_msg", topic="email-x", headline=headline,
                 source={"thread_id": thread_id},

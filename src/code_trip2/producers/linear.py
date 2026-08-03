@@ -32,6 +32,7 @@ from code_trip2 import config as config_mod
 from code_trip2._async_utils import event_or_timeout, next_tick_delay
 from code_trip2.config import Config
 from code_trip2.linear_state import LinearState
+from code_trip2.poll_health import PollHealth
 from code_trip2.producers.claude_mcp import ClaudeMCPClient, ClaudeMCPError
 from code_trip2.tasks import Task, TaskQueue
 
@@ -54,11 +55,13 @@ class LinearProducer:
         mcp: ClaudeMCPClient | None = None,
         state: LinearState | None = None,
         submit: Callable[[Task], Task] | None = None,
+        health: PollHealth | None = None,
     ) -> None:
         self._config = config
         self._queue = queue
         self._mcp = mcp
         self._state = state or LinearState()
+        self._health = health
         # ``submit`` is the pipeline entry point (main.py's screening
         # gate). It lands the task via ``queue.upsert``, so a
         # re-sighting of an issue that already has a live task —
@@ -125,7 +128,13 @@ class LinearProducer:
             # Transient MCP failure already logged inside the pull
             # helper. Don't burn the first-poll wide window — retry
             # next tick.
+            if self._health is not None:
+                self._health.record_failure(
+                    "list_issues call failed (see orchestrator.log)",
+                )
             return
+        if self._health is not None:
+            self._health.record_success()
         emitted = 0
         skipped = 0
         retired = 0

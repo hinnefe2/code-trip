@@ -29,6 +29,7 @@ from code_trip2 import config as config_mod
 from code_trip2._async_utils import event_or_timeout, next_tick_delay
 from code_trip2.config import Config
 from code_trip2.email_state import EmailState
+from code_trip2.poll_health import PollHealth
 from code_trip2.producers.claude_mcp import ClaudeMCPClient, ClaudeMCPError
 from code_trip2.producers.slack import _previous_workday_5pm_unix
 from code_trip2.tasks import Task, TaskQueue
@@ -106,11 +107,13 @@ class EmailProducer:
         mcp: ClaudeMCPClient | None = None,
         state: EmailState | None = None,
         submit: Callable[[Task], Task] | None = None,
+        health: PollHealth | None = None,
     ) -> None:
         self._config = config
         self._queue = queue
         self._mcp = mcp
         self._state = state or EmailState()
+        self._health = health
         # ``submit`` is the pipeline entry point (main.py's screening
         # gate). It lands the task via ``queue.upsert``, so a reply in
         # a thread that already has a live task — including one still
@@ -206,11 +209,15 @@ class EmailProducer:
             )
         except ClaudeMCPError as exc:
             logger.warning("EmailProducer: search call failed: %s", exc)
+            if self._health is not None:
+                self._health.record_failure(str(exc))
             # Don't burn the first-poll wide window on a transient
             # failure — retry on the next tick.
             return
         finally:
             self.is_polling = False
+        if self._health is not None:
+            self._health.record_success()
 
         threads = self._extract_threads(result)
         emitted = 0

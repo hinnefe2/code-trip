@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Callable
 from code_trip2 import config as config_mod
 from code_trip2._async_utils import event_or_timeout, next_tick_delay
 from code_trip2.config import Config
+from code_trip2.poll_health import PollHealth
 from code_trip2.producers.claude_mcp import ClaudeMCPClient, ClaudeMCPError
 from code_trip2.slack_state import SlackState
 from code_trip2.tasks import LIVE_STATES, Task, TaskQueue
@@ -155,11 +156,13 @@ class SlackProducer:
         state: SlackState | None = None,
         submit: Callable[[Task], Task] | None = None,
         reconsider: Callable[[Task], None] | None = None,
+        health: PollHealth | None = None,
     ) -> None:
         self._config = config
         self._queue = queue
         self._mcp = mcp
         self._state = state or SlackState()
+        self._health = health
         # ``submit`` is the pipeline entry point (main.py's screening
         # gate) for NEW thread tasks. Existing-thread merges stay in
         # this producer (they append to source["messages"], which is
@@ -354,7 +357,14 @@ class SlackProducer:
             )
         except ClaudeMCPError as exc:
             logger.warning("SlackProducer: search call failed: %s", exc)
+            # The mention search is the producer's heartbeat — the
+            # watched-channel and thread-reply polls ride the same MCP,
+            # so its streak stands in for all of them.
+            if self._health is not None:
+                self._health.record_failure(str(exc))
             return
+        if self._health is not None:
+            self._health.record_success()
 
         messages = self._extract_messages(result)
         # The claude.ai Slack MCP's search treats ``<@U…>`` as a fuzzy

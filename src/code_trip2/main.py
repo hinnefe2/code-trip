@@ -20,6 +20,7 @@ from code_trip2.dispatch import QueueConsumer, handle_skill, handle_voice
 from code_trip2.linear_state import LinearState
 from code_trip2.macropad import Macropad, resolve_key
 from code_trip2.modes import Context, stop_playback
+from code_trip2.poll_health import PollHealth
 from code_trip2.producers import ProducerSupervisor
 from code_trip2.email_state import EmailState
 from code_trip2.producers.email import EmailProducer
@@ -295,6 +296,16 @@ async def main_async(config: Config, *, tui: bool = False, silent: bool = False)
             agent_mcp.enabled,
         )
 
+    # Consecutive-failure surfacing for the MCP pollers: a dead
+    # pipeline becomes a queue task instead of a silent WARNING streak
+    # (a 10-day Gmail outage went unnoticed before this existed).
+    # Threshold 0 disables.
+    def _health(producer: str) -> PollHealth | None:
+        threshold = int(config.poll_failure_alert_threshold)
+        if threshold <= 0:
+            return None
+        return PollHealth(producer=producer, queue=queue, threshold=threshold)
+
     supervisor = ProducerSupervisor()
     supervisor.add(WindowProducer(
         config=config, queue=queue, submit=submit, mirrors=ctx.window_mirrors,
@@ -302,15 +313,16 @@ async def main_async(config: Config, *, tui: bool = False, silent: bool = False)
     supervisor.add(SlackProducer(
         config=config, queue=queue, mcp=slack_mcp, state=SlackState(),
         submit=submit, reconsider=submit_to_reconsider,
+        health=_health("slack"),
     ))
     email_producer = EmailProducer(
         config=config, queue=queue, mcp=email_mcp,
-        state=EmailState(), submit=submit,
+        state=EmailState(), submit=submit, health=_health("email"),
     )
     supervisor.add(email_producer)
     supervisor.add(LinearProducer(
         config=config, queue=queue, mcp=linear_mcp,
-        state=LinearState(), submit=submit,
+        state=LinearState(), submit=submit, health=_health("linear"),
     ))
     supervisor.add(ManualProducer())
 

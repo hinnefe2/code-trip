@@ -99,6 +99,12 @@ class Config:
     poll_start_hour: int = 7
     poll_end_hour: int = 19
     mcp_batch_window: float = 2.0
+    # Consecutive poll failures before a producer surfaces a
+    # ``producer_health`` task (see poll_health.py). At the 2-minute
+    # email interval the default is ~20 minutes of outage — slow enough
+    # to ride out transients, fast enough that a dead pipeline can't go
+    # unnoticed for days again. 0 disables surfacing.
+    poll_failure_alert_threshold: int = 10
     # reconcile: how often (seconds) the ReconcileProducer re-checks
     # already-queued tasks against their source and retires ones handled
     # elsewhere (e.g. an email archived/read in Gmail). Independent of the
@@ -246,6 +252,8 @@ def load_config(path: Path | str) -> Config:
         kw["poll_end_hour"] = int(poll_cfg["end_hour"])
     if "batch_window" in poll_cfg:
         kw["mcp_batch_window"] = float(poll_cfg["batch_window"])
+    if "failure_alert_threshold" in poll_cfg:
+        kw["poll_failure_alert_threshold"] = int(poll_cfg["failure_alert_threshold"])
 
     reconcile_cfg = data.get("reconcile", {})
     if "interval" in reconcile_cfg:
