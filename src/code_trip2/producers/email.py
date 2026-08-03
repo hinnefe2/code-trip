@@ -161,9 +161,29 @@ class EmailProducer:
             if await event_or_timeout(self._stop, delay):
                 return
 
+    def _effective_query(self) -> str:
+        """The configured search query, OR-combined with the always-include
+        clause (Gmail's ``{a b}`` any-of syntax).
+
+        The always-include clause exists for meeting-notes emails: reading
+        one shouldn't cost the user its extracted follow-ups, so that
+        clause carries no ``is:unread``. Trailing ``after:`` clauses (see
+        ``_poll_once``) AND against the whole group, so incremental polls
+        stay incremental for both branches.
+        """
+        base = (self._config.email_search_query or "").strip()
+        extra = (
+            getattr(self._config, "email_always_include_query", "") or ""
+        ).strip()
+        if not extra:
+            return base
+        if not base:
+            return extra
+        return f"{{({base}) ({extra})}}"
+
     async def _poll_once(self) -> None:
         last_ts = self._state.last_message_ts()
-        base_query = (self._config.email_search_query or "").strip()
+        base_query = self._effective_query()
         wide_poll = self._first_poll
         if wide_poll:
             # Fresh-pull on startup: no ``after:`` clause. Inbox-state
@@ -273,7 +293,9 @@ class EmailProducer:
         ]
         if not candidates:
             return 0
-        query = (self._config.email_search_query or "").strip()
+        # Same combined query as the poll path — a read-but-still-inboxed
+        # meeting-notes email must not be mistaken for handled-elsewhere.
+        query = self._effective_query()
         self.is_polling = True
         try:
             result = await self._mcp.call_tool(

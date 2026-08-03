@@ -72,6 +72,15 @@ class Config:
     # poll. Defaults to "unread Primary inbox, not from me" which approximates
     # an action-needed view (excludes Promotions/Updates/Social/Forums tabs).
     email_search_query: str = "in:inbox category:primary -from:me is:unread"
+    # OR-ed into the search query on every poll (and reconcile). Meeting-notes
+    # emails must surface even when already read — the extracted follow-ups,
+    # not the unread badge, are the value — so this clause drops ``is:unread``
+    # and ``category:primary`` for the Meet/Gemini notes senders. ``in:inbox``
+    # stays: archiving (the screener skill's job, or a manual archive) is
+    # still the "processed" marker. Empty string disables.
+    email_always_include_query: str = (
+        "in:inbox from:(gemini-notes@google.com OR meet-recordings-noreply@google.com)"
+    )
     email_max_results: int = 20
     # linear (via the claude.ai Linear MCP — auth piggy-backs on claude CLI)
     linear_poll_interval: float = 180.0
@@ -215,6 +224,8 @@ def load_config(path: Path | str) -> Config:
         kw["email_poll_interval"] = float(email_cfg["poll_interval"])
     if "search_query" in email_cfg:
         kw["email_search_query"] = str(email_cfg["search_query"])
+    if "always_include_query" in email_cfg:
+        kw["email_always_include_query"] = str(email_cfg["always_include_query"])
     if "max_results" in email_cfg:
         kw["email_max_results"] = int(email_cfg["max_results"])
 

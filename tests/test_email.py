@@ -141,10 +141,11 @@ def test_detect_subject_key_empty_inputs_returns_none():
 # --- EmailProducer -------------------------------------------------------
 
 
-def _producer(tmp_path: Path, *, poll_interval=120.0, search_query="in:inbox category:primary -from:me is:unread", max_results=20):
+def _producer(tmp_path: Path, *, poll_interval=120.0, search_query="in:inbox category:primary -from:me is:unread", always_include="", max_results=20):
     cfg = SimpleNamespace(
         email_poll_interval=poll_interval,
         email_search_query=search_query,
+        email_always_include_query=always_include,
         email_max_results=max_results,
     )
     state = EmailState(path=tmp_path / "email-state.json")
@@ -206,6 +207,42 @@ async def test_producer_first_poll_flag_flips_after_one_call(tmp_path: Path):
     assert "after:" in second_call.args[1]["query"]
 
 
+@pytest.mark.asyncio
+async def test_always_include_query_is_or_combined(tmp_path: Path):
+    """The always-include clause joins the base query in an any-of group,
+    so meeting-notes emails match without ``is:unread``."""
+    p, _q, mcp, _state = _producer(
+        tmp_path, always_include="in:inbox from:gemini-notes@google.com",
+    )
+    mcp.call_tool.return_value = {"threads": []}
+    await p._poll_once()
+    query = mcp.call_tool.call_args.args[1]["query"]
+    assert query == (
+        "{(in:inbox category:primary -from:me is:unread) "
+        "(in:inbox from:gemini-notes@google.com)}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_always_include_query_incremental_appends_after_outside_group(tmp_path: Path):
+    """``after:`` ANDs against the whole any-of group on incremental polls."""
+    p, _q, mcp, state = _producer(
+        tmp_path, always_include="from:gemini-notes@google.com",
+    )
+    state.set_last_message_ts(1716000000)
+    p._first_poll = False
+    mcp.call_tool.return_value = {"threads": []}
+    await p._poll_once()
+    query = mcp.call_tool.call_args.args[1]["query"]
+    assert query.endswith("} after:1716000000")
+    assert query.startswith("{(")
+
+
+def test_empty_always_include_leaves_base_query_untouched(tmp_path: Path):
+    p, _q, _mcp, _state = _producer(tmp_path, always_include="")
+    assert p._effective_query() == "in:inbox category:primary -from:me is:unread"
+
+
 def _email_task(thread_id: str, headline: str = "x") -> Task:
     return Task(kind="email_msg", topic="email-x", headline=headline,
                 source={"thread_id": thread_id},
@@ -227,6 +264,23 @@ async def test_reconcile_retires_threads_no_longer_in_inbox(tmp_path: Path):
     assert retired == 1
     assert q.get(kept.id).state == "pending"
     assert q.get(gone.id).state == "done"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_uses_combined_query(tmp_path: Path):
+    """Reconcile must see always-include matches too — a read-but-inboxed
+    notes email is not handled-elsewhere."""
+    p, q, mcp, _state = _producer(
+        tmp_path, always_include="in:inbox from:gemini-notes@google.com",
+    )
+    q.add(_email_task("T1"))
+    mcp.call_tool.return_value = {"threads": [{"id": "T1"}]}
+
+    await p.reconcile_inbox()
+
+    query = mcp.call_tool.call_args.args[1]["query"]
+    assert "(in:inbox from:gemini-notes@google.com)" in query
+    assert query.startswith("{(")
     # Uses the configured action-needed query, no after: floor.
     call = mcp.call_tool.call_args
     assert call.args[0] == "search_threads"
