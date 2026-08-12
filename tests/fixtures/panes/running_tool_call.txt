@@ -1,0 +1,14 @@
+  22  each pane lives in its own subdirectory
+  23  the shared filter bar is not wired into the forecast pane
+
+● Running frontend TypeScript check in main checkout · 42s
+  ⎿  $ cd ~/example && yarn workspace app test:types 2>&1 | tail -25 (41s)
+     (ctrl+b ctrl+b (twice) to run in background)
+
+✻ Quantumizing… (10m 0s · ↓ 30.0k tokens)
+
+──────────────────────────────────────────────── example-branch-name ──
+❯
+────────────────────────────────────────────────────────────────────────
+  Fable 5 · effort: high · ~/example-worktree
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent

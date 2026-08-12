@@ -1,0 +1,19 @@
+  The case for leaving it as is: partially persuasive.
+
+  What I would actually do, in order:
+
+  1. Land the change now. The fix is real, verified, and covers the important surfaces.
+  2. Delete the legacy predicates from the nine affected files, in this PR or immediately after.
+
+  Where the framing is off
+
+  Two things. First, the sharpest example is understated: the derived column computes its date from a
+  different source than the docs claim.
+
+  1. Attributes — real, but joining for name and status is a lookup, not a blocker.
+  2. Missing timestamps for two enum values — a real constraint. The upstream team owns it.
+
+✻ Sautéed for 4m 17s
+
+❯ delete the legacy predicates in this PR
+  ⏵⏵ auto mode on (shift+tab to cycle) · PR #101 · ← 1 agent

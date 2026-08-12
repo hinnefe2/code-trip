@@ -1,0 +1,12 @@
+  That digest is byte-identical to the staging one, so both environments run the same build.
+
+  Still outstanding
+
+  The three env vars remain on the running pods, because the chart comes from the other repo. A second
+  roll will drop them when CI applies.
+
+✻ Brewed for 2m 58s · 1 monitor still running
+
+❯ go ahead and put up the .gitignore fix
+  Opus 5 (1M context) · effort: high · ~/example
+  ⏵⏵ auto mode on · 1 monitor · ← 1 agent

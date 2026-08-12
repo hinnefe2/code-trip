@@ -1,0 +1,33 @@
+  One thing the overlap check surfaced: the linked file isn't on master yet. My version is a superset, so
+  whichever merges second needs a trivial rebase. The PR description flags this.
+
+  Loose ends, in order: live QA on a dev slot must confirm the sandbox allows the write and that the hook
+  registers exactly once; then after the release, the one-time manual dashboard steps.
+
+✻ Worked for 1h 13m 21s
+
+❯ /deep-review --post-comments --approve
+
+  Read 4 files, ran 4 shell commands
+
+● Running 3 agents…
+   ├ Correctness pass PR 15793 · 3 tool uses · 107.8k tokens
+   │ ⎿  Reading 2 files…
+   ├ Safety pass PR 15793 · 4 tool uses · 125.7k tokens
+   │ ⎿  Bash: Extract threat model section
+   └ Completeness pass PR 15793 · 0 tool uses
+     ⎿  Initializing…
+     (ctrl+b ctrl+b (twice) to run in background)
+
+· Musing… (3m 38s · ↓ 11.4k tokens)
+
+──────────────────────────────────────────────── example-branch-name ──
+❯
+────────────────────────────────────────────────────────────────────────
+  Fable 5 · effort: high · ~/example-worktree
+  ⏵⏵ auto mode on (shift+tab to cycle) · PR #15793 · ← 1 agent
+
+  ● main
+  ◯ general-purpose  Correctness pass PR 15793
+  ◯ general-purpose  Safety pass PR 15793
+  ◯ general-purpose  Completeness pass PR 15793
