@@ -34,8 +34,11 @@ import json
 import logging
 import re
 import shutil
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
+
+from code_trip2 import cost
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +53,10 @@ async def _run_subprocess(
     """Run ``cmd`` async with text I/O. Returns (stdout, stderr, returncode).
 
     Raises :class:`ClaudeMCPError` on timeout (kills the process first).
+
+    Every claude invocation in the orchestrator lands here, so this is
+    also where the session's billed cost is booked into
+    :mod:`code_trip2.cost` for the TUI's run-spend display.
     """
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -73,7 +80,79 @@ async def _run_subprocess(
         raise ClaudeMCPError(f"{what} timed out after {timeout}s") from exc
     stdout = (stdout_b or b"").decode("utf-8", errors="replace")
     stderr = (stderr_b or b"").decode("utf-8", errors="replace")
+    # A nonzero exit still gets booked: claude bills for the tokens it
+    # burned before failing, and a budget-capped run is exactly the case
+    # worth seeing in the spend display.
+    cost.record_stream(stdout, what=what)
     return stdout, stderr, proc.returncode or 0
+
+
+@dataclass
+class ResumableSession:
+    """Keeps one ``claude`` conversation warm across calls.
+
+    Every fresh ``claude --print`` pays a 1-hour cache **write** for
+    the prompt prefix it can't find cached — measured at ~7.7k tokens
+    (~$0.015 on Haiku) on a call whose actual question was nine
+    tokens. Resuming the same session finds that prefix and writes
+    almost nothing: measured $0.0147 → $0.0076 → $0.0035 over three
+    turns, against ~$0.018 for each equivalent fresh session.
+
+    The trade is that resumed turns carry their predecessors: read
+    tokens grew 22.5k → 30.6k over those three turns. Reads are cheap
+    (0.1× base) but not free, and a session left running forever
+    eventually costs more than restarting. ``max_turns`` bounds that;
+    the session recycles to a new id and pays one cold write again.
+
+    Recycling also bounds a *behavioral* risk: a resumed classifier
+    sees its own earlier verdicts, and shouldn't be allowed to
+    accumulate an unbounded pattern to anchor on.
+
+    Stateful by necessity (an id and a counter that must survive
+    across calls), so this is a class rather than the frozen-dataclass
+    style used elsewhere. The lock enforces the one-caller-at-a-time
+    rule that resuming requires: two concurrent resumes of the same id
+    would interleave turns into one conversation.
+    """
+
+    max_turns: int = 10
+    _session_id: str | None = field(default=None, init=False, repr=False)
+    _turns: int = 0
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
+
+    @property
+    def lock(self) -> asyncio.Lock:
+        return self._lock
+
+    def next_flags(self) -> list[str]:
+        """CLI flags for the next call: open a session, or resume it.
+
+        Recycles first when the turn budget is spent, so the caller
+        never has to think about it.
+        """
+        if self._session_id is not None and self._turns >= self.max_turns:
+            self.reset("turn budget reached")
+        if self._session_id is None:
+            self._session_id = str(uuid.uuid4())
+            logger.info(
+                "Opening resumable claude session %s (max %d turns)",
+                self._session_id, self.max_turns,
+            )
+            return ["--session-id", self._session_id]
+        return ["--resume", self._session_id]
+
+    def note_success(self) -> None:
+        self._turns += 1
+
+    def reset(self, why: str) -> None:
+        """Drop the session so the next call opens a fresh one."""
+        if self._session_id is not None:
+            logger.info(
+                "Recycling claude session %s after %d turns (%s)",
+                self._session_id, self._turns, why,
+            )
+        self._session_id = None
+        self._turns = 0
 
 
 @dataclass
@@ -153,7 +232,7 @@ class ClaudeMCPClient:
             tool_id,
         ]
         stdout, stderr, returncode = await _run_subprocess(
-            cmd, input_=prompt, timeout=self.timeout, what="claude",
+            cmd, input_=prompt, timeout=self.timeout, what=f"tool:{tool_name}",
         )
 
         # Try to parse the tool_result regardless of returncode. Claude can
@@ -178,6 +257,8 @@ class ClaudeMCPClient:
         timeout: float | None = None,
         max_budget_usd: float | None = None,
         transcript: bool = False,
+        label: str = "agent",
+        session: "ResumableSession | None" = None,
     ) -> str:
         """Free-form Claude invocation: no single-tool constraint.
 
@@ -197,6 +278,15 @@ class ClaudeMCPClient:
         ``--permission-mode bypassPermissions`` skips interactive
         prompts. Budget cap defaults higher than :meth:`call_tool`
         because skill flows tend to make several tool calls.
+
+        ``label`` names this call in the run-spend accounting (see
+        :mod:`code_trip2.cost`) — free-form agent runs are the
+        expensive ones, so it matters which caller they came from.
+
+        ``session`` reuses a warm :class:`ResumableSession` instead of
+        starting a cold one, which avoids re-writing the prompt prefix
+        to cache on every call. The caller must hold ``session.lock``
+        for the duration — resuming is single-writer.
 
         ``transcript=True`` returns all assistant text blocks joined by
         newlines — the screener needs this to recover structured output
@@ -225,26 +315,40 @@ class ClaudeMCPClient:
             "--verbose",
             "--model",
             self.model,
-            "--no-session-persistence",
             "--disable-slash-commands",
             "--permission-mode",
             "bypassPermissions",
             "--max-budget-usd",
             str(budget),
         ]
+        if session is None:
+            # No warm session to reuse: don't leave a transcript behind.
+            cmd.append("--no-session-persistence")
+        else:
+            # Persistence must stay ON for the session to be resumable,
+            # so ``--no-session-persistence`` is omitted above.
+            cmd += session.next_flags()
         if allowed_tools:
             # ``--allowedTools`` is variadic; must come last so the variadic
             # capture doesn't swallow a subsequent flag. Prompt goes on
             # stdin (same reason as :meth:`call_tool`).
             cmd += ["--allowedTools", *allowed_tools]
         stdout, stderr, returncode = await _run_subprocess(
-            cmd, input_=prompt, timeout=deadline, what="claude",
+            cmd, input_=prompt, timeout=deadline, what=label,
         )
         if returncode != 0:
+            if session is not None:
+                # A resume can fail for reasons the next call would hit
+                # again — transcript pruned, id rejected, session
+                # wedged. Drop it so the retry opens a clean one rather
+                # than failing identically forever.
+                session.reset(f"exit {returncode}")
             raise ClaudeMCPError(
                 f"claude exited {returncode}: "
                 f"{stderr[:500].strip() or '(no stderr)'}"
             )
+        if session is not None:
+            session.note_success()
         return self._extract_assistant_text(stdout, transcript=transcript)
 
     @staticmethod

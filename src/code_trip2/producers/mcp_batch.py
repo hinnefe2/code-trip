@@ -233,7 +233,7 @@ class MCPBatcher:
         timeout = self.base_timeout + self.per_call_timeout * n
         try:
             stdout, _stderr, _rc = await _run_subprocess(
-                cmd, input_=prompt, timeout=timeout, what="claude (batch)",
+                cmd, input_=prompt, timeout=timeout, what=f"batch:{n}",
             )
             completed = _collect_tool_calls(stdout)
         except ClaudeMCPError as exc:

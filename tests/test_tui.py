@@ -10,6 +10,7 @@ when the user is looking at the TUI host terminal.
 from __future__ import annotations
 
 import io
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -18,7 +19,7 @@ import pytest
 from rich.console import Console
 from rich.panel import Panel
 
-from code_trip2 import chords, modes, tui
+from code_trip2 import chords, cost, modes, tui
 from code_trip2.producers import ProducerSupervisor
 from code_trip2.tasks import Task
 from code_trip2.window import Chord, KeyStroke
@@ -97,6 +98,31 @@ def test_header_summarizer_off_when_disabled():
     ctx = _make_ctx(summarizer_enabled=False)
     out = _render(tui._header(ctx))
     assert "off" in out
+
+
+def test_header_shows_run_spend():
+    cost.reset()
+    try:
+        cost.record(0.0135)
+        cost.record(0.0265)
+        out = _render(tui._header(_make_ctx()))
+        assert "$0.040" in out
+        assert "2 calls" in out
+    finally:
+        cost.reset()
+
+
+def test_spend_hides_hourly_rate_until_the_run_has_legs():
+    """A rate extrapolated from the first seconds is startup noise."""
+    young = cost.CostSnapshot(total_usd=0.5, calls=4, started_at=time.time() - 10)
+    assert "/h" not in _render(tui._spend_text(young))
+    old = cost.CostSnapshot(total_usd=0.5, calls=4, started_at=time.time() - 3600)
+    assert "$0.500/h" in _render(tui._spend_text(old))
+
+
+def test_format_usd_precision_switches_at_a_dollar():
+    assert tui._format_usd(0.0136) == "$0.014"
+    assert tui._format_usd(2.5) == "$2.50"
 
 
 def test_current_task_idle_panel():

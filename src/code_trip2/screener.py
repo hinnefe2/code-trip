@@ -10,8 +10,11 @@ a duplicate. For each ``(task_id, mode)`` work item the loop:
 1. Filters skill manifests to those declaring ``auto-handle: true`` and
    listing this task's ``kind`` under ``auto-handle-kinds``. No
    candidates → release to ``pending`` (no LLM cost).
-2. Asks Claude (Haiku, no tools) which candidate, if any, can fully
-   handle the task. Unsure → ``NONE`` → release to ``pending``.
+2. Asks Claude (no tools) which candidate, if any, can fully handle
+   the task. Unsure → ``NONE`` → release to ``pending``. Tasks that
+   arrive together are classified in ONE session — the per-session
+   context load dwarfs the per-task tokens, so N tasks in one prompt
+   costs about what one task alone used to.
 3. If a skill was named, runs it via ``run_agent`` with that skill's
    tool list. The outcome becomes a state transition on the resident
    task: handled → done, dismissed → dropped, forward/failed →
@@ -36,7 +39,11 @@ import re
 from dataclasses import dataclass, replace
 from typing import Awaitable, Callable, Iterable, Literal
 
-from code_trip2.producers.claude_mcp import ClaudeMCPClient, ClaudeMCPError
+from code_trip2.producers.claude_mcp import (
+    ClaudeMCPClient,
+    ClaudeMCPError,
+    ResumableSession,
+)
 from code_trip2.skills import SkillManifest
 from code_trip2.tasks import (
     STATE_DONE,
@@ -308,20 +315,38 @@ def parse_follow_up_tasks(summary: str | None) -> tuple[Task, ...]:
     return tuple(out)
 
 
+class _Unmatched:
+    """Sentinel: the batched reply carried no usable line for a task.
+
+    Distinct from ``None``, which is a real decision (the classifier
+    said NONE — forward to the user). Only UNMATCHED triggers the
+    single-task fallback.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "UNMATCHED"
+
+
+UNMATCHED = _Unmatched()
+
+
+def _purpose_tag(c: SkillManifest) -> str:
+    if c.auto_handle and c.dismiss:
+        return "[handle or dismiss]"
+    if c.auto_handle:
+        return "[handle]"
+    if c.dismiss:
+        return "[dismiss]"
+    return "[?]"
+
+
 def build_classifier_prompt(
     task: Task, candidates: list[SkillManifest]
 ) -> str:
-    def _purpose(c: SkillManifest) -> str:
-        if c.auto_handle and c.dismiss:
-            return "[handle or dismiss]"
-        if c.auto_handle:
-            return "[handle]"
-        if c.dismiss:
-            return "[dismiss]"
-        return "[?]"
-
     skills_block = "\n".join(
-        f"- {c.name} {_purpose(c)}: {c.description}" for c in candidates
+        f"- {c.name} {_purpose_tag(c)}: {c.description}" for c in candidates
     )
     try:
         source_json = json.dumps(task.source, default=str)
@@ -355,6 +380,124 @@ def build_classifier_prompt(
         "applies unambiguously. When unsure, reply NONE — the user "
         "can handle it."
     )
+
+
+# Batched classification. Every ``claude --print`` session reloads
+# ~30k tokens of context (system prompt + CLAUDE.md + tool catalog)
+# before reading a single word of the task, so N single-task
+# classifier sessions pay that N times. One session classifying N
+# tasks pays it once — measured at ~$0.02 of fixed overhead per
+# Sonnet session, that is the difference between $0.02 and $0.02×N
+# for the same decisions.
+#
+# Batches are packed by count AND by prompt size: task bodies are
+# never truncated (a clipped body changes the decision), so a batch
+# closes early when the next task would push it past the character
+# budget. An oversized task simply rides alone in its own batch.
+
+
+def build_batch_classifier_prompt(
+    items: list[tuple[Task, list[SkillManifest]]],
+) -> str:
+    """One classifier prompt covering ``items``, numbered 1..N.
+
+    Each task carries its own candidate list — different kinds have
+    different eligible skills, so the skills block is per-task rather
+    than shared.
+    """
+    blocks: list[str] = []
+    for i, (task, candidates) in enumerate(items, start=1):
+        skills_block = "\n".join(
+            f"    - {c.name} {_purpose_tag(c)}: {c.description}" for c in candidates
+        )
+        try:
+            source_json = json.dumps(task.source, default=str)
+        except (TypeError, ValueError):
+            source_json = "{}"
+        blocks.append(
+            f"### Task {i}\n"
+            f"  kind: {task.kind}\n"
+            f"  topic: {task.topic}\n"
+            f"  headline: {task.headline}\n"
+            f"  body: {task.body or '(empty)'}\n"
+            f"  source: {source_json}\n"
+            f"  Applicable skills:\n{skills_block}"
+        )
+    joined = "\n\n".join(blocks)
+    n = len(items)
+    return (
+        "You are a router for a voice-driven inbox. "
+        f"{n} tasks just arrived. For EACH task independently, decide "
+        "whether any of that task's listed skills applies. Skills "
+        "tagged [handle] DO something on the user's behalf (RSVP, "
+        "draft a reply, archive, etc.). Skills tagged [dismiss] mark "
+        "the task as not worth surfacing — the user doesn't need to "
+        "see or respond to it.\n"
+        "\n"
+        "Judge each task only against the skills listed under that "
+        "task. Tasks are unrelated to each other; a decision on one "
+        "must not influence another.\n"
+        "\n"
+        f"{joined}\n"
+        "\n"
+        f"Reply with EXACTLY {n} lines, one per task, in order, each "
+        "in one of these formats:\n"
+        "  <n>. HANDLE: <skill-name>     (skill will act on the task)\n"
+        "  <n>. DISMISS: <skill-name>    (skill says this isn't worth surfacing)\n"
+        "  <n>. NONE                     (user should see this task)\n"
+        "\n"
+        "The reply prefix must match the skill's purpose tag. Only "
+        "reply HANDLE or DISMISS if you are confident the named skill "
+        "applies unambiguously. When unsure, reply NONE — the user "
+        "can handle it. Output nothing but the numbered lines."
+    )
+
+
+# ``3. HANDLE: archive-vendor-updates`` — tolerant of ``3)``, ``3:``,
+# bullet prefixes, and code-fence wrapping, the same way the other
+# reply parsers here are. A line whose index is out of range or whose
+# skill name isn't a candidate for that task is dropped, which sends
+# the task to the single-task fallback rather than to a wrong skill.
+_BATCH_PICK_RE = re.compile(
+    r"^\s*`*\s*[-*]?\s*(\d+)\s*[.):]?\s*`*\s*"
+    r"(?:(HANDLE|DISMISS)\s*[:= ]\s*([A-Za-z0-9_\-]+)|(NONE))\b",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def parse_batch_classifier_reply(
+    text: str, items: list[tuple[Task, list[SkillManifest]]]
+) -> list[SkillManifest | None | _Unmatched]:
+    """Map a batched reply back onto ``items``, positionally.
+
+    Returns one entry per item: a :class:`SkillManifest` (skill
+    nominated), ``None`` (explicit NONE — forward to the user), or
+    :data:`UNMATCHED` when the reply carried no usable line for that
+    position. The caller re-runs UNMATCHED items individually rather
+    than guessing — a dropped line must not silently become a
+    decision.
+    """
+    picks: list[SkillManifest | None | _Unmatched] = [UNMATCHED] * len(items)
+    if not text:
+        return picks
+    for m in _BATCH_PICK_RE.finditer(text):
+        idx = int(m.group(1)) - 1
+        if not 0 <= idx < len(items):
+            continue
+        if picks[idx] is not UNMATCHED:
+            # First line for a position wins; a model that repeats
+            # itself (or quotes the prompt) can't overwrite a decision.
+            continue
+        if m.group(4):  # NONE
+            picks[idx] = None
+            continue
+        name = (m.group(3) or "").strip()
+        by_name = {c.name: c for c in items[idx][1]}
+        chosen = by_name.get(name)
+        # A name that isn't a candidate for THIS task is not a
+        # decision — leave it UNMATCHED so the fallback re-asks.
+        picks[idx] = chosen if chosen is not None else UNMATCHED
+    return picks
 
 
 def build_executor_prompt(task: Task, skill: SkillManifest) -> str:
@@ -392,6 +535,7 @@ async def classify(
     task: Task,
     candidates: list[SkillManifest],
     mcp: ClaudeMCPClient,
+    session: "ResumableSession | None" = None,
 ) -> SkillManifest | None:
     """Ask Claude to pick a skill, or decline.
 
@@ -412,11 +556,116 @@ async def classify(
             prompt=prompt,
             allowed_tools=(),     # classifier shouldn't call any tool
             max_budget_usd=0.10,
+            label="classifier",
+            session=session,
         )
     except ClaudeMCPError as exc:
         logger.warning("Screener classifier failed: %s", exc)
         return None
     return parse_classifier_reply(reply, candidates)
+
+
+# Packing limits for one batched classifier session. The count cap
+# keeps any single reply short enough that the model doesn't drift or
+# renumber; the character budget keeps a burst of long email bodies
+# from building a prompt that costs more than the sessions it saves.
+# A single task larger than the budget still gets its own batch.
+BATCH_MAX_TASKS = 6
+BATCH_MAX_CHARS = 24_000
+
+
+def pack_batches(
+    items: list[tuple[Task, list[SkillManifest]]],
+    *,
+    max_tasks: int = BATCH_MAX_TASKS,
+    max_chars: int = BATCH_MAX_CHARS,
+) -> list[list[tuple[Task, list[SkillManifest]]]]:
+    """Split ``items`` into batches by count and approximate prompt size.
+
+    Pure and order-preserving: task N always lands before task N+1, so
+    a burst is screened in arrival order regardless of how it packs.
+    """
+    batches: list[list[tuple[Task, list[SkillManifest]]]] = []
+    current: list[tuple[Task, list[SkillManifest]]] = []
+    used = 0
+    for item in items:
+        task = item[0]
+        size = len(task.headline or "") + len(task.body or "")
+        if current and (len(current) >= max_tasks or used + size > max_chars):
+            batches.append(current)
+            current, used = [], 0
+        current.append(item)
+        used += size
+    if current:
+        batches.append(current)
+    return batches
+
+
+async def classify_batch(
+    items: list[tuple[Task, list[SkillManifest]]],
+    mcp: ClaudeMCPClient,
+    session: "ResumableSession | None" = None,
+) -> list[SkillManifest | None]:
+    """Classify several tasks in one session; fall back per task.
+
+    Returns one decision per item, in order. Any position the batched
+    reply didn't answer — and every position if the session itself
+    failed — is re-asked with the proven single-task
+    :func:`classify` call, so a flaky batch degrades to the old cost
+    profile rather than to wrong decisions.
+
+    ``session``, when supplied, keeps the classifier's claude
+    conversation warm across calls (see
+    :class:`~code_trip2.producers.claude_mcp.ResumableSession`). Its
+    lock is held across the batch *and* any single-task fallbacks, so
+    the whole classification of one burst is one conversation's worth
+    of turns and never interleaves with another caller.
+    """
+    if not items:
+        return []
+    if session is None:
+        return await _classify_batch_inner(items, mcp, None)
+    async with session.lock:
+        return await _classify_batch_inner(items, mcp, session)
+
+
+async def _classify_batch_inner(
+    items: list[tuple[Task, list[SkillManifest]]],
+    mcp: ClaudeMCPClient,
+    session: "ResumableSession | None",
+) -> list[SkillManifest | None]:
+    if len(items) == 1:
+        task, candidates = items[0]
+        return [await classify(task, candidates, mcp, session)]
+
+    prompt = build_batch_classifier_prompt(items)
+    try:
+        reply = await mcp.run_agent(
+            prompt=prompt,
+            allowed_tools=(),  # classifier shouldn't call any tool
+            # Budget covers the one context load plus per-task output.
+            max_budget_usd=0.10 + 0.03 * len(items),
+            label=f"classifier-batch:{len(items)}",
+            session=session,
+        )
+    except ClaudeMCPError as exc:
+        logger.warning(
+            "Screener: batched classifier of %d failed (%s); "
+            "falling back to single calls", len(items), exc,
+        )
+        reply = ""
+
+    picks = parse_batch_classifier_reply(reply, items)
+    misses = [i for i, p in enumerate(picks) if p is UNMATCHED]
+    if misses:
+        logger.warning(
+            "Screener: batched classifier left %d/%d tasks unanswered; "
+            "re-asking individually", len(misses), len(items),
+        )
+        for i in misses:
+            task, candidates = items[i]
+            picks[i] = await classify(task, candidates, mcp, session)
+    return [None if p is UNMATCHED else p for p in picks]  # type: ignore[misc]
 
 
 async def execute(
@@ -439,6 +688,7 @@ async def execute(
         prompt=prompt,
         allowed_tools=skill.allowed_tools,
         transcript=True,
+        label=f"executor:{skill.name}",
     )
 
 
@@ -478,6 +728,26 @@ async def screen(
         return ScreeningOutcome("forward", task)
 
     chosen = await classify(task, candidates, classifier_mcp)
+    return await screen_with_choice(
+        task, chosen, mcp,
+        dry_run=dry_run, verify_side_effect=verify_side_effect,
+    )
+
+
+async def screen_with_choice(
+    task: Task,
+    chosen: SkillManifest | None,
+    mcp: ClaudeMCPClient,
+    *,
+    dry_run: bool = False,
+    verify_side_effect: "Callable[[Task, str], Awaitable[bool | None]] | None" = None,
+) -> ScreeningOutcome:
+    """Everything :func:`screen` does *after* the classifier has spoken.
+
+    Split out so the runtime loop can classify a burst of tasks in one
+    session (:func:`classify_batch`) and still run each task's executor
+    stage through the same code path as the single-task flow.
+    """
     if chosen is None:
         return ScreeningOutcome("forward", task)
 
@@ -618,6 +888,57 @@ async def _next_or_stop(
                 t.cancel()
 
 
+async def _collect_burst(
+    work: "asyncio.Queue[tuple[str, str]]",
+    stop: asyncio.Event,
+    *,
+    window_s: float,
+    max_items: int,
+) -> list[tuple[str, str]]:
+    """Block for one work item, then sweep up whatever arrives beside it.
+
+    The submit gate enqueues every screenable task from a producer
+    tick in one synchronous pass, so by the time this coroutine wakes
+    on the first item its tick-mates are already sitting in the queue
+    — draining with ``get_nowait`` collects the whole burst without
+    waiting for anything.
+
+    ``window_s`` is therefore an opt-in extra wait (default off): it
+    only buys anything for a producer that interleaves awaits between
+    submits, and it is pure added latency on a task that arrives
+    alone. Set it if a future producer trickles work in.
+
+    The sweep uses ``get_nowait`` rather than a timeout on ``get``
+    because a cancelled ``get`` can consume an item as it is
+    cancelled, and a lost work item is a task stuck in ``screening``
+    forever.
+    """
+    first = await _next_or_stop(work, stop)
+    if first is None:
+        return []
+    burst = [first]
+    if max_items <= 1:
+        return burst
+
+    def _drain() -> None:
+        while len(burst) < max_items:
+            try:
+                burst.append(work.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+
+    _drain()
+    if window_s > 0 and len(burst) < max_items:
+        try:
+            # Stop firing mid-window ends the wait early; we keep what
+            # we have and screen it — dropping it would strand tasks.
+            await asyncio.wait_for(stop.wait(), timeout=window_s)
+        except asyncio.TimeoutError:
+            pass
+        _drain()
+    return burst
+
+
 async def run_screener_loop(
     *,
     work: "asyncio.Queue[tuple[str, str]]",
@@ -631,6 +952,9 @@ async def run_screener_loop(
     submit_follow_up: Callable[[Task], None] | None = None,
     classifier_mcp: ClaudeMCPClient | None = None,
     verify_side_effect: "Callable[[Task, str], Awaitable[bool | None]] | None" = None,
+    batch_window_s: float = 0.0,
+    batch_max_tasks: int = BATCH_MAX_TASKS,
+    classifier_session_turns: int = 0,
 ) -> None:
     """Drain the work queue, screen each task, apply the state transition.
 
@@ -639,12 +963,28 @@ async def run_screener_loop(
     ``screening`` state (put there by the submit gate), reconsider items
     in whatever user-visible state they hold.
 
-    Serial: one in-flight screen at a time. Producer poll intervals are
-    much longer than a single classify+execute round, so this is
-    fine. If a screen run blocks (slow MCP), work items queue up; that's
-    backpressure, not data loss — and because the tasks are resident,
-    re-sightings during the backlog collapse into them instead of
-    duplicating.
+    Work is picked up in bursts: the loop sweeps up every item queued
+    alongside the first and classifies up to ``batch_max_tasks`` of
+    them in one session (:func:`classify_batch`), because the
+    per-session context load dominates classifier cost. Executors
+    still run one at a time, in arrival order — they make real side
+    effects and shouldn't interleave. Set ``batch_max_tasks=1`` for
+    the old task-at-a-time behavior; ``batch_window_s`` is an opt-in
+    extra wait for stragglers (see :func:`_collect_burst`).
+
+    ``classifier_session_turns`` > 0 keeps the classifier's claude
+    conversation warm for that many turns before recycling it, so
+    successive classifications stop re-writing the prompt prefix to
+    cache. Off by default — see
+    :class:`~code_trip2.producers.claude_mcp.ResumableSession` for the
+    cost measurements and the accumulating-history trade-off.
+
+    Serial: one in-flight executor at a time. Producer poll intervals
+    are much longer than a single classify+execute round, so this is
+    fine. If a screen run blocks (slow MCP), work items queue up;
+    that's backpressure, not data loss — and because the tasks are
+    resident, re-sightings during the backlog collapse into them
+    instead of duplicating.
 
     ``allowed_kinds`` is a config gate. ``None`` means "no extra
     restriction beyond what manifests opt into"; a frozenset further
@@ -655,67 +995,149 @@ async def run_screener_loop(
     — if some other path retired it mid-screen (user action, a resolve
     sweep), the verdict is stale and dropped.
     """
+    classifier = classifier_mcp or mcp
+    # Opt-in warm session for the classifier only. It is the right
+    # (and only safe) candidate: its tool set never varies, so the
+    # cached prefix always matches, and it makes no side effects, so a
+    # replayed or wedged session can't do damage — unlike the
+    # executor, whose --allowedTools differs per skill and whose turns
+    # archive mail and file tickets.
+    classifier_session = (
+        ResumableSession(max_turns=classifier_session_turns)
+        if classifier_session_turns > 0 else None
+    )
     while not stop.is_set():
-        nxt = await _next_or_stop(work, stop)
-        if nxt is None:
+        burst = await _collect_burst(
+            work, stop,
+            window_s=batch_window_s, max_items=batch_max_tasks,
+        )
+        if not burst:
             return
-        task_id, mode = nxt
-        task = queue.get(task_id)
-        if task is None:
-            logger.warning("Screener: task %s vanished before screening", task_id)
-            continue
-        if allowed_kinds is not None and task.kind not in allowed_kinds:
-            outcome = ScreeningOutcome("forward", task)
-        else:
-            try:
-                outcome = await screen(
-                    task, manifests, mcp, dry_run=dry_run,
-                    classifier_mcp=classifier_mcp,
-                    verify_side_effect=verify_side_effect,
+        # Resolve each work item to a live task and decide up front
+        # which ones the classifier even needs to see. Gated kinds and
+        # tasks with no eligible skill forward for free — keeping them
+        # out of the batch keeps the prompt (and its cost) to the
+        # tasks that are actually being judged.
+        pending: list[tuple[str, str, Task]] = []
+        needs_classify: list[tuple[Task, list[SkillManifest]]] = []
+        classify_at: list[int] = []
+        for task_id, mode in burst:
+            task = queue.get(task_id)
+            if task is None:
+                logger.warning(
+                    "Screener: task %s vanished before screening", task_id,
                 )
-            except Exception:
-                logger.exception(
-                    "Screener crashed on task %s; forwarding", task.id,
-                )
-                outcome = ScreeningOutcome(
-                    "forward", task, error="screener-crash",
-                )
+                continue
+            gated = allowed_kinds is not None and task.kind not in allowed_kinds
+            candidates = [] if gated else candidates_for(task, manifests)
+            pending.append((task_id, mode, task))
+            if candidates:
+                classify_at.append(len(pending) - 1)
+                needs_classify.append((task, candidates))
+
+        # ``None`` = forward (no candidates, or gated). Filled in below
+        # for the positions that went to the classifier.
+        choices: list[SkillManifest | None] = [None] * len(pending)
+        if needs_classify:
+            picked: list[SkillManifest | None] = []
+            for batch in pack_batches(
+                needs_classify, max_tasks=batch_max_tasks,
+            ):
+                try:
+                    picked.extend(await classify_batch(
+                        batch, classifier, classifier_session,
+                    ))
+                except Exception:
+                    logger.exception(
+                        "Screener: classifier batch of %d crashed; forwarding",
+                        len(batch),
+                    )
+                    picked.extend([None] * len(batch))
+            for pos, choice in zip(classify_at, picked):
+                choices[pos] = choice
+
+        for (task_id, mode, task), chosen in zip(pending, choices):
+            await _apply_screening(
+                task_id=task_id,
+                mode=mode,
+                task=task,
+                chosen=chosen,
+                queue=queue,
+                mcp=mcp,
+                on_outcome=on_outcome,
+                dry_run=dry_run,
+                verify_side_effect=verify_side_effect,
+                submit_follow_up=submit_follow_up,
+            )
+
+
+async def _apply_screening(
+    *,
+    task_id: str,
+    mode: str,
+    task: Task,
+    chosen: SkillManifest | None,
+    queue: TaskQueue,
+    mcp: ClaudeMCPClient,
+    on_outcome: Callable[[ScreeningOutcome], None],
+    dry_run: bool,
+    verify_side_effect: "Callable[[Task, str], Awaitable[bool | None]] | None",
+    submit_follow_up: Callable[[Task], None] | None,
+) -> None:
+    """Run one task's executor stage and apply its state transition.
+
+    The body of what used to be the loop, unchanged except that the
+    classifier's pick arrives as an argument instead of being fetched
+    here.
+    """
+    try:
+        outcome = await screen_with_choice(
+            task, chosen, mcp,
+            dry_run=dry_run, verify_side_effect=verify_side_effect,
+        )
+    except Exception:
+        logger.exception(
+            "Screener crashed on task %s; forwarding", task.id,
+        )
+        outcome = ScreeningOutcome(
+            "forward", task, error="screener-crash",
+        )
+    try:
+        on_outcome(outcome)
+    except Exception:
+        logger.exception("on_outcome callback raised; continuing")
+    if mode == "reconsider":
+        # Reconsider mode: the task is already user-visible. Only
+        # ``dismissed`` does anything — mark the existing task
+        # done. Everything else (forward, handled, failed) leaves
+        # the task where it is.
+        if outcome.action == "dismissed":
+            queue.mark_done(task_id)
+    else:
+        current = queue.get(task_id)
+        if current is not None and current.state == STATE_SCREENING:
+            if outcome.action == "failed":
+                # ``screen`` annotated a copy's body (it never
+                # mutates its input); copy the annotation onto the
+                # resident task before releasing it.
+                queue.update_task(task_id, body=outcome.task.body)
+                queue.set_state(task_id, STATE_PENDING)
+            elif outcome.action == "forward":
+                queue.set_state(task_id, STATE_PENDING)
+            elif outcome.action == "handled":
+                queue.set_state(task_id, STATE_DONE)
+            elif outcome.action == "dismissed":
+                queue.set_state(task_id, STATE_DROPPED)
+    # Follow-up tasks ride along independently — a handled
+    # meeting-notes email can still spawn a meeting_followup the
+    # user needs to see. Same applies in reconsider mode.
+    for ft in outcome.follow_up_tasks:
         try:
-            on_outcome(outcome)
+            if submit_follow_up is not None:
+                submit_follow_up(ft)
+            else:
+                queue.upsert(ft, if_terminal="skip")
         except Exception:
-            logger.exception("on_outcome callback raised; continuing")
-        if mode == "reconsider":
-            # Reconsider mode: the task is already user-visible. Only
-            # ``dismissed`` does anything — mark the existing task
-            # done. Everything else (forward, handled, failed) leaves
-            # the task where it is.
-            if outcome.action == "dismissed":
-                queue.mark_done(task_id)
-        else:
-            current = queue.get(task_id)
-            if current is not None and current.state == STATE_SCREENING:
-                if outcome.action == "failed":
-                    # ``screen`` annotated a copy's body (it never
-                    # mutates its input); copy the annotation onto the
-                    # resident task before releasing it.
-                    queue.update_task(task_id, body=outcome.task.body)
-                    queue.set_state(task_id, STATE_PENDING)
-                elif outcome.action == "forward":
-                    queue.set_state(task_id, STATE_PENDING)
-                elif outcome.action == "handled":
-                    queue.set_state(task_id, STATE_DONE)
-                elif outcome.action == "dismissed":
-                    queue.set_state(task_id, STATE_DROPPED)
-        # Follow-up tasks ride along independently — a handled
-        # meeting-notes email can still spawn a meeting_followup the
-        # user needs to see. Same applies in reconsider mode.
-        for ft in outcome.follow_up_tasks:
-            try:
-                if submit_follow_up is not None:
-                    submit_follow_up(ft)
-                else:
-                    queue.upsert(ft, if_terminal="skip")
-            except Exception:
-                logger.exception(
-                    "follow-up submit failed for task %s", ft.id,
-                )
+            logger.exception(
+                "follow-up submit failed for task %s", ft.id,
+            )

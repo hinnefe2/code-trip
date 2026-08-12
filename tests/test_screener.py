@@ -8,12 +8,21 @@ from unittest.mock import AsyncMock, MagicMock, create_autospec
 
 import pytest
 
-from code_trip2.producers.claude_mcp import ClaudeMCPClient, ClaudeMCPError
+from code_trip2.producers.claude_mcp import (
+    ClaudeMCPClient,
+    ClaudeMCPError,
+    ResumableSession,
+)
 from code_trip2.screener import (
+    UNMATCHED,
     ScreeningOutcome,
     _next_or_stop,
     _one_line,
+    build_batch_classifier_prompt,
     candidates_for,
+    classify_batch,
+    pack_batches,
+    parse_batch_classifier_reply,
     parse_classifier_reply,
     parse_follow_up_tasks,
     parse_skill_status,
@@ -1407,3 +1416,421 @@ async def test_screen_status_handled_coexists_with_followup_task():
     assert outcome.action == "handled"
     assert len(outcome.follow_up_tasks) == 1
     assert outcome.follow_up_tasks[0].headline == "Draft retention doc"
+
+
+# --- batched classification -----------------------------------------------
+
+
+def _batch_items(n: int = 3):
+    """``n`` (task, candidates) pairs, each with its own eligible skill."""
+    return [
+        (_task(headline=f"headline {i}"), [_manifest(f"skill-{i}")])
+        for i in range(1, n + 1)
+    ]
+
+
+def test_batch_prompt_numbers_tasks_and_scopes_skills():
+    items = _batch_items(2)
+    prompt = build_batch_classifier_prompt(items)
+    assert "### Task 1" in prompt and "### Task 2" in prompt
+    assert "headline 1" in prompt and "headline 2" in prompt
+    # Each task's skills are listed under that task, not pooled.
+    task1, task2 = prompt.split("### Task 2")
+    assert "skill-1" in task1 and "skill-2" not in task1
+    assert "skill-2" in task2
+    assert "EXACTLY 2 lines" in prompt
+
+
+def test_parse_batch_reply_maps_lines_to_positions():
+    items = _batch_items(3)
+    reply = "1. HANDLE: skill-1\n2. NONE\n3. DISMISS: skill-3"
+    picks = parse_batch_classifier_reply(reply, items)
+    assert picks[0] is items[0][1][0]
+    assert picks[1] is None            # explicit NONE — a real decision
+    assert picks[2] is items[2][1][0]
+
+
+def test_parse_batch_reply_tolerates_formatting_noise():
+    items = _batch_items(2)
+    reply = "Here you go:\n\n- 1) HANDLE:skill-1\n`2.` NONE\n"
+    picks = parse_batch_classifier_reply(reply, items)
+    assert picks[0] is items[0][1][0]
+    assert picks[1] is None
+
+
+def test_parse_batch_reply_marks_missing_and_bogus_lines_unmatched():
+    items = _batch_items(3)
+    # Line 2 absent; line 3 names a skill that isn't a candidate for it.
+    reply = "1. HANDLE: skill-1\n3. HANDLE: skill-1"
+    picks = parse_batch_classifier_reply(reply, items)
+    assert picks[0] is items[0][1][0]
+    assert picks[1] is UNMATCHED
+    assert picks[2] is UNMATCHED       # wrong-task skill is not a decision
+
+
+def test_parse_batch_reply_ignores_out_of_range_and_repeat_lines():
+    items = _batch_items(1)
+    reply = "1. HANDLE: skill-1\n1. NONE\n7. HANDLE: skill-1"
+    picks = parse_batch_classifier_reply(reply, items)
+    assert picks == [items[0][1][0]]   # first line for a position wins
+
+
+def test_pack_batches_splits_on_count_and_size():
+    items = _batch_items(7)
+    assert [len(b) for b in pack_batches(items, max_tasks=3)] == [3, 3, 1]
+    # A body over the char budget rides alone rather than being clipped.
+    big = (_task(body="x" * 5000), [_manifest("skill-big")])
+    packed = pack_batches([items[0], big, items[1]], max_tasks=6, max_chars=1000)
+    assert [len(b) for b in packed] == [1, 1, 1]
+    # Order is preserved across the split.
+    assert [b[0][0].headline for b in packed] == [
+        items[0][0].headline, big[0].headline, items[1][0].headline,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_classify_batch_uses_one_session_for_many_tasks():
+    items = _batch_items(3)
+    mcp = _mcp(agent_reply="1. HANDLE: skill-1\n2. NONE\n3. HANDLE: skill-3")
+    picks = await classify_batch(items, mcp)
+    assert mcp.run_agent.await_count == 1
+    assert [p.name if p else None for p in picks] == ["skill-1", None, "skill-3"]
+    # Labeled so the cost accounting can attribute the session.
+    assert mcp.run_agent.await_args.kwargs["label"] == "classifier-batch:3"
+
+
+@pytest.mark.asyncio
+async def test_classify_batch_falls_back_per_task_on_missing_lines():
+    """An unanswered position is re-asked individually — never guessed."""
+    items = _batch_items(2)
+    mcp = create_autospec(ClaudeMCPClient, instance=True)
+    mcp.run_agent = AsyncMock(side_effect=[
+        "1. HANDLE: skill-1",          # batch reply omits task 2
+        "HANDLE: skill-2",             # single-task fallback for task 2
+    ])
+    picks = await classify_batch(items, mcp)
+    assert [p.name for p in picks] == ["skill-1", "skill-2"]
+    assert mcp.run_agent.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_classify_batch_falls_back_entirely_when_session_fails():
+    items = _batch_items(2)
+    mcp = create_autospec(ClaudeMCPClient, instance=True)
+    mcp.run_agent = AsyncMock(side_effect=[
+        ClaudeMCPError("boom"),
+        "HANDLE: skill-1",
+        "NONE",
+    ])
+    picks = await classify_batch(items, mcp)
+    assert [p.name if p else None for p in picks] == ["skill-1", None]
+    assert mcp.run_agent.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_classify_batch_of_one_uses_the_single_task_path():
+    items = _batch_items(1)
+    mcp = _mcp(agent_reply="HANDLE: skill-1")
+    picks = await classify_batch(items, mcp)
+    assert [p.name for p in picks] == ["skill-1"]
+    assert mcp.run_agent.await_args.kwargs["label"] == "classifier"
+
+
+@pytest.mark.asyncio
+async def test_loop_classifies_a_burst_in_one_session():
+    """Three co-queued tasks cost one classifier session, not three."""
+    tasks = [_task(headline=f"h{i}") for i in range(3)]
+    work, q = _loop_env(*tasks)
+    outcomes: list[ScreeningOutcome] = []
+    stop = asyncio.Event()
+
+    classifier = _mcp(agent_reply="1. NONE\n2. NONE\n3. NONE")
+    executor = _mcp(agent_reply="")
+
+    async def driver() -> None:
+        while len(outcomes) < 3:
+            await asyncio.sleep(0)
+        stop.set()
+
+    loop_task = asyncio.create_task(
+        run_screener_loop(
+            work=work,
+            queue=q,
+            manifests=(_manifest("skill-a"),),
+            mcp=executor,
+            classifier_mcp=classifier,
+            on_outcome=outcomes.append,
+            allowed_kinds=None,
+            dry_run=False,
+            stop=stop,
+        )
+    )
+    await asyncio.wait_for(asyncio.gather(driver(), loop_task), timeout=2.0)
+    assert classifier.run_agent.await_count == 1
+    assert [o.action for o in outcomes] == ["forward"] * 3
+    assert len(q.pending()) == 3
+
+
+@pytest.mark.asyncio
+async def test_loop_keeps_gated_and_candidateless_tasks_out_of_the_batch():
+    """Only tasks with an eligible skill reach the classifier prompt."""
+    screenable = _task("email_msg", headline="screen me")
+    no_candidates = _task("note", headline="no skill applies")
+    work, q = _loop_env(screenable, no_candidates)
+    outcomes: list[ScreeningOutcome] = []
+    stop = asyncio.Event()
+
+    classifier = _mcp(agent_reply="1. NONE")
+    executor = _mcp(agent_reply="")
+
+    async def driver() -> None:
+        while len(outcomes) < 2:
+            await asyncio.sleep(0)
+        stop.set()
+
+    loop_task = asyncio.create_task(
+        run_screener_loop(
+            work=work,
+            queue=q,
+            manifests=(_manifest("skill-a", kinds=("email_msg",)),),
+            mcp=executor,
+            classifier_mcp=classifier,
+            on_outcome=outcomes.append,
+            allowed_kinds=None,
+            dry_run=False,
+            stop=stop,
+        )
+    )
+    await asyncio.wait_for(asyncio.gather(driver(), loop_task), timeout=2.0)
+    prompt = classifier.run_agent.await_args.kwargs["prompt"]
+    assert "screen me" in prompt
+    assert "no skill applies" not in prompt
+    assert [o.action for o in outcomes] == ["forward", "forward"]
+
+
+@pytest.mark.asyncio
+async def test_loop_executes_each_task_in_the_burst_serially():
+    """Batched classification, but one executor at a time, in order."""
+    tasks = [_task(headline=f"h{i}") for i in range(2)]
+    work, q = _loop_env(*tasks)
+    outcomes: list[ScreeningOutcome] = []
+    stop = asyncio.Event()
+
+    classifier = _mcp(agent_reply="1. HANDLE: skill-a\n2. HANDLE: skill-a")
+    in_flight = 0
+    peak = 0
+
+    async def _execute(**kwargs):
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0)
+        in_flight -= 1
+        return "did the thing"
+
+    executor = create_autospec(ClaudeMCPClient, instance=True)
+    executor.run_agent = AsyncMock(side_effect=_execute)
+
+    async def driver() -> None:
+        while len(outcomes) < 2:
+            await asyncio.sleep(0)
+        stop.set()
+
+    loop_task = asyncio.create_task(
+        run_screener_loop(
+            work=work,
+            queue=q,
+            manifests=(_manifest("skill-a"),),
+            mcp=executor,
+            classifier_mcp=classifier,
+            on_outcome=outcomes.append,
+            allowed_kinds=None,
+            dry_run=False,
+            stop=stop,
+        )
+    )
+    await asyncio.wait_for(asyncio.gather(driver(), loop_task), timeout=2.0)
+    assert peak == 1
+    assert executor.run_agent.await_count == 2
+    assert [o.action for o in outcomes] == ["handled", "handled"]
+    assert [q.get(t.id).state for t in tasks] == [STATE_DONE, STATE_DONE]
+
+
+# --- warm classifier session ----------------------------------------------
+
+
+def test_resumable_session_opens_then_resumes_then_recycles():
+    s = ResumableSession(max_turns=2)
+    first = s.next_flags()
+    assert first[0] == "--session-id"
+    sid = first[1]
+    s.note_success()
+    assert s.next_flags() == ["--resume", sid]
+    s.note_success()
+    # Turn budget spent: a fresh id, not another resume.
+    recycled = s.next_flags()
+    assert recycled[0] == "--session-id" and recycled[1] != sid
+
+
+def test_resumable_session_reset_drops_the_id():
+    s = ResumableSession(max_turns=10)
+    sid = s.next_flags()[1]
+    s.note_success()
+    s.reset("exit 1")
+    fresh = s.next_flags()
+    assert fresh[0] == "--session-id" and fresh[1] != sid
+
+
+@pytest.mark.asyncio
+async def test_run_agent_resumes_and_drops_no_session_persistence(monkeypatch):
+    """A warm session must not pass --no-session-persistence — that flag
+    is what makes the transcript unresumable in the first place."""
+    calls: list[list[str]] = []
+
+    async def fake_run(cmd, *, input_, timeout, what):
+        calls.append(cmd)
+        return ("", "", 0)
+
+    monkeypatch.setattr(
+        "code_trip2.producers.claude_mcp._run_subprocess", fake_run,
+    )
+    client = ClaudeMCPClient()
+    client._available = True
+    session = ResumableSession(max_turns=5)
+
+    await client.run_agent(prompt="p1", session=session)
+    await client.run_agent(prompt="p2", session=session)
+
+    assert "--no-session-persistence" not in calls[0]
+    assert "--session-id" in calls[0]
+    assert "--resume" in calls[1]
+    # Same conversation across both calls.
+    assert calls[1][calls[1].index("--resume") + 1] == (
+        calls[0][calls[0].index("--session-id") + 1]
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_agent_without_session_keeps_persistence_off(monkeypatch):
+    calls: list[list[str]] = []
+
+    async def fake_run(cmd, *, input_, timeout, what):
+        calls.append(cmd)
+        return ("", "", 0)
+
+    monkeypatch.setattr(
+        "code_trip2.producers.claude_mcp._run_subprocess", fake_run,
+    )
+    client = ClaudeMCPClient()
+    client._available = True
+    await client.run_agent(prompt="p")
+    assert "--no-session-persistence" in calls[0]
+    assert "--resume" not in calls[0] and "--session-id" not in calls[0]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_recycles_session_after_a_failed_resume(monkeypatch):
+    """A wedged session must not be retried forever — the next call
+    opens a clean one instead of failing identically."""
+    calls: list[list[str]] = []
+
+    async def fake_run(cmd, *, input_, timeout, what):
+        calls.append(cmd)
+        # Second call (the resume) fails; third should be a fresh open.
+        return ("", "boom", 0 if len(calls) != 2 else 1)
+
+    monkeypatch.setattr(
+        "code_trip2.producers.claude_mcp._run_subprocess", fake_run,
+    )
+    client = ClaudeMCPClient()
+    client._available = True
+    session = ResumableSession(max_turns=10)
+
+    await client.run_agent(prompt="p1", session=session)
+    with pytest.raises(ClaudeMCPError):
+        await client.run_agent(prompt="p2", session=session)
+    await client.run_agent(prompt="p3", session=session)
+
+    assert "--session-id" in calls[0]
+    assert "--resume" in calls[1]
+    assert "--session-id" in calls[2]   # recycled, not resumed again
+    assert calls[2][calls[2].index("--session-id") + 1] != (
+        calls[0][calls[0].index("--session-id") + 1]
+    )
+
+
+@pytest.mark.asyncio
+async def test_loop_reuses_one_classifier_session_across_bursts():
+    """Successive bursts continue the same conversation, so only the
+    first pays the cold prefix write."""
+    tasks = [_task(headline=f"h{i}") for i in range(2)]
+    work, q = _loop_env(*tasks)
+    outcomes: list[ScreeningOutcome] = []
+    stop = asyncio.Event()
+    seen_flags: list[list[str]] = []
+
+    async def fake_run_agent(**kwargs):
+        session = kwargs.get("session")
+        assert session is not None, "classifier should carry the warm session"
+        seen_flags.append(session.next_flags())
+        session.note_success()
+        return "NONE"
+
+    classifier = create_autospec(ClaudeMCPClient, instance=True)
+    classifier.run_agent = AsyncMock(side_effect=fake_run_agent)
+
+    async def driver() -> None:
+        while len(outcomes) < 2:
+            await asyncio.sleep(0)
+        stop.set()
+
+    loop_task = asyncio.create_task(
+        run_screener_loop(
+            work=work,
+            queue=q,
+            manifests=(_manifest("skill-a"),),
+            mcp=_mcp(agent_reply=""),
+            classifier_mcp=classifier,
+            on_outcome=outcomes.append,
+            allowed_kinds=None,
+            dry_run=False,
+            stop=stop,
+            batch_max_tasks=1,          # force one classifier call per task
+            classifier_session_turns=10,
+        )
+    )
+    await asyncio.wait_for(asyncio.gather(driver(), loop_task), timeout=2.0)
+    assert seen_flags[0][0] == "--session-id"
+    assert seen_flags[1][0] == "--resume"
+
+
+@pytest.mark.asyncio
+async def test_loop_without_session_turns_passes_no_session():
+    """Default stays cold-per-call — the warm path is opt-in."""
+    task = _task()
+    work, q = _loop_env(task)
+    outcomes: list[ScreeningOutcome] = []
+    stop = asyncio.Event()
+
+    classifier = _mcp(agent_reply="NONE")
+
+    async def driver() -> None:
+        while not outcomes:
+            await asyncio.sleep(0)
+        stop.set()
+
+    loop_task = asyncio.create_task(
+        run_screener_loop(
+            work=work,
+            queue=q,
+            manifests=(_manifest("skill-a"),),
+            mcp=_mcp(agent_reply=""),
+            classifier_mcp=classifier,
+            on_outcome=outcomes.append,
+            allowed_kinds=None,
+            dry_run=False,
+            stop=stop,
+        )
+    )
+    await asyncio.wait_for(asyncio.gather(driver(), loop_task), timeout=2.0)
+    assert classifier.run_agent.await_args.kwargs["session"] is None

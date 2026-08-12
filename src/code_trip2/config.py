@@ -137,6 +137,26 @@ class Config:
     # executor narrates a side effect as done without reliably making the
     # tool call (observed: emails marked handled but never archived).
     autohandle_executor_model: str = "sonnet"
+    # Classifier batching. Each ``claude --print`` session reloads ~30k
+    # tokens of context before reading the task, so the fixed overhead
+    # — not the decision — dominates classifier cost. The screener
+    # classifies up to ``batch_size`` co-queued tasks in one session.
+    # ``batch_size = 1`` restores task-at-a-time behavior.
+    # ``batch_window`` is an opt-in extra wait for stragglers; a
+    # producer tick's tasks are already queued together, so 0 (off) is
+    # right unless a producer starts trickling work in.
+    autohandle_batch_size: int = 6
+    autohandle_batch_window: float = 0.0
+    # Warm-session reuse for the classifier (prototype, off by
+    # default). > 0 resumes one claude conversation for that many
+    # turns before recycling it, so successive classifications stop
+    # paying the 1-hour cache write for a prefix they could have
+    # found cached — measured $0.018/call cold vs $0.0035 warm.
+    # Resumed turns carry their predecessors, which grows read tokens
+    # and lets the classifier see its own earlier verdicts; the turn
+    # cap bounds both. Classifier only — the executor's tool set
+    # varies per skill and its turns make real side effects.
+    autohandle_classifier_session_turns: int = 0
 
 
 def _select(src: dict, *fields: str) -> dict:
@@ -270,6 +290,14 @@ def load_config(path: Path | str) -> Config:
         kw["autohandle_classifier_model"] = str(autohandle_cfg["classifier_model"])
     if "executor_model" in autohandle_cfg:
         kw["autohandle_executor_model"] = str(autohandle_cfg["executor_model"])
+    if "batch_size" in autohandle_cfg:
+        kw["autohandle_batch_size"] = max(1, int(autohandle_cfg["batch_size"]))
+    if "batch_window" in autohandle_cfg:
+        kw["autohandle_batch_window"] = float(autohandle_cfg["batch_window"])
+    if "classifier_session_turns" in autohandle_cfg:
+        kw["autohandle_classifier_session_turns"] = max(
+            0, int(autohandle_cfg["classifier_session_turns"])
+        )
 
     return Config(**kw)
 

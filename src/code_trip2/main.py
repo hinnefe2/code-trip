@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from code_trip2 import audio_out, earcon
+from code_trip2 import audio_out, cost, earcon
 from code_trip2.chords import handle_chord, handle_tap
 from code_trip2.config import Config, load_config
 from code_trip2.dispatch import QueueConsumer, handle_skill, handle_voice
@@ -61,6 +61,11 @@ async def main_async(config: Config, *, tui: bool = False, silent: bool = False)
             "the Textual Input widget is the only path that accepts "
             "pasted transcripts now that the stdin reader has been removed."
         )
+
+    # Zero the run's spend counter before anything can bill against it —
+    # the module-level default is import time, which is close but not
+    # the same instant, and tests may have recorded into it.
+    cost.reset()
 
     log = SessionLogger(default_session_path())
     log.event("session_start", config={
@@ -515,6 +520,11 @@ async def main_async(config: Config, *, tui: bool = False, silent: bool = False)
                 allowed_kinds=allowed_kinds,
                 dry_run=config.autohandle_dry_run,
                 stop=screener_stop,
+                batch_window_s=config.autohandle_batch_window,
+                batch_max_tasks=config.autohandle_batch_size,
+                classifier_session_turns=(
+                    config.autohandle_classifier_session_turns
+                ),
                 # Follow-up spawns land terminal-suppressed: a
                 # respawned follow-up whose original was already filed
                 # or dismissed stays gone (terminal durable records
@@ -557,6 +567,24 @@ async def main_async(config: Config, *, tui: bool = False, silent: bool = False)
         # the device pinned at our sample rate — leaving it open is
         # what makes the *next* app's first sound get clipped.
         audio_out.shutdown()
+        # Final tally to the log + session record, so spend is
+        # comparable across runs after the TUI is gone.
+        spend = cost.snapshot()
+        logger.info(
+            "Run spend: $%.4f over %d claude calls (%.1f min) — %s",
+            spend.total_usd, spend.calls, spend.elapsed_s / 60.0,
+            cost.format_breakdown(spend) or "(nothing billed)",
+        )
+        log.event(
+            "session_cost",
+            total_usd=round(spend.total_usd, 6),
+            calls=spend.calls,
+            elapsed_s=round(spend.elapsed_s, 1),
+            by_label={
+                label: {"usd": round(usd, 6), "calls": calls}
+                for label, (usd, calls) in spend.by_label.items()
+            },
+        )
         log.close()
 
 

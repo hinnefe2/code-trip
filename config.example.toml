@@ -117,3 +117,32 @@ kinds = []     # e.g. ["email_msg"]
 # — so both default to a stronger model.
 classifier_model = "sonnet"
 executor_model = "sonnet"
+# Classifier batching. Every ``claude --print`` session reloads ~30k
+# tokens of context (system prompt, CLAUDE.md, MCP tool catalog) before
+# it reads a single word of the task, so that fixed overhead — not the
+# decision — dominates classifier cost. Tasks queued together (a
+# producer tick emits its whole batch at once) are classified in one
+# session instead of one each. Set ``batch_size = 1`` to go back to
+# task-at-a-time. Executors always run one at a time regardless.
+batch_size = 6
+# Extra wait for stragglers before classifying, in seconds. 0 (off) is
+# right today: a tick's tasks are already queued together, so this only
+# adds latency. Raise it if a producer starts trickling work in.
+batch_window = 0.0
+# Warm-session reuse for the classifier (prototype, 0 = off). Every
+# cold `claude --print` re-writes its ~30k-token prompt prefix to the
+# 1-hour cache; resuming one conversation finds it already there.
+# Measured on Haiku: $0.018 per cold call vs $0.0147 → $0.0076 →
+# $0.0035 over three resumed turns.
+#
+# The catch is that resumed turns carry their predecessors: read
+# tokens grew 22.5k → 30.6k across those three turns, and the
+# classifier can see its own earlier verdicts. This number is how many
+# turns to reuse before recycling to a fresh session — low enough to
+# bound both, high enough to amortize the cold write. Try 10.
+#
+# Classifier only. The executor is deliberately excluded: its
+# --allowedTools set varies per skill (so the cached prefix wouldn't
+# match anyway) and its turns archive mail and file tickets, which is
+# not something to replay into a resumed conversation.
+classifier_session_turns = 0

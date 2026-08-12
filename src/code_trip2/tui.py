@@ -34,6 +34,8 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.widgets import Input, Static
 
+from code_trip2 import cost
+
 if TYPE_CHECKING:
     from code_trip2.modes import Context
     from code_trip2.producers import ProducerSupervisor
@@ -107,6 +109,33 @@ _STATE_COLOR = {
 # --- panel builders (pure Rich; used by Static widgets) -------------------
 
 
+def _format_usd(usd: float) -> str:
+    """Dollars at a precision that stays readable across a run.
+
+    Poll-driven spend accumulates in ~$0.01 steps, so sub-dollar totals
+    need three decimals to visibly move; past a dollar, cents are enough.
+    """
+    return f"${usd:.2f}" if usd >= 1 else f"${usd:.3f}"
+
+
+# Below this much elapsed time the extrapolated hourly rate says more
+# about startup burst than about the run, so it stays hidden.
+_RATE_MIN_ELAPSED_S = 300.0
+
+
+def _spend_text(snap: "cost.CostSnapshot") -> Text:
+    """``claude $0.412 (31 calls, $1.24/h)`` — the run's inference bill."""
+    parts = [
+        Text("claude ", style="dim"),
+        Text(_format_usd(snap.total_usd), style="bold yellow"),
+        Text(f"  ({snap.calls} calls", style="dim"),
+    ]
+    if snap.elapsed_s >= _RATE_MIN_ELAPSED_S and snap.total_usd > 0:
+        parts.append(Text(f", {_format_usd(snap.usd_per_hour)}/h", style="dim"))
+    parts.append(Text(")", style="dim"))
+    return Text.assemble(*parts)
+
+
 def _header(ctx: "Context") -> Panel:
     win_str = Text(ctx.active_window or "(no window)", style="white")
     summ_ok = ctx.summarizer is not None and ctx.summarizer.enabled
@@ -114,7 +143,8 @@ def _header(ctx: "Context") -> Panel:
     summ_model = getattr(ctx.summarizer, "_model", "off") if summ_ok else "off"
     summ_str = Text(summ_model, style=summ_color)
     line = Text.assemble(
-        "window ",
+        _spend_text(cost.snapshot()),
+        "   window ",
         win_str,
         "   summarizer ",
         summ_str,

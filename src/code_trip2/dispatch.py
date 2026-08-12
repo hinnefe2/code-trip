@@ -74,6 +74,7 @@ async def handle_skill(ctx: "Context", transcript: str) -> None:
             summary = await mcp.run_agent(
                 prompt=prompt,
                 allowed_tools=ctx.agent_allowed_tools,
+                label="skill-mode",
             )
         except Exception as exc:
             logger.exception("Skill invocation failed")
@@ -576,6 +577,7 @@ async def _file_followup_bg(ctx: "Context", task: Task) -> None:
             summary = await ctx.agent_mcp.run_agent(
                 prompt=prompt,
                 allowed_tools=ctx.agent_allowed_tools,
+                label="file-followup",
             )
         except Exception as exc:
             logger.exception("Linear follow-up filing failed")
